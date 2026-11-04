@@ -1,0 +1,53 @@
+# Local secrets and environment files
+.env
+.env.*
+!.env.example
+
+# Cloud credentials, signing material, and local infrastructure state
+*.pem
+*.key
+*.p12
+*.pfx
+*.jks
+*.keystore
+id_rsa*
+id_ed25519*
+.aws/
+.azure/
+.kube/
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfvars
+*.tfvars.json
+*.auto.tfvars
+*.auto.tfvars.json
+*.tfplan
+crash.log
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Test and runtime output
+.pytest_cache/
+coverage/
+*.log
+*.db
+*.sqlite
+*.sqlite3
+.local-replication/
+# Local deployment notes
+docs/*.local.md
+tmp/
+
+# Experiment output: retain a documented sample only when intentionally committed.
+experiments/runs/
+
+# IDE and operating-system files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
