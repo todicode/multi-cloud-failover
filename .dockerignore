@@ -1,0 +1,23 @@
+# Git and local Python environment
+.git
+.venv
+venv
+**/__pycache__
+**/*.py[cod]
+.pytest_cache
+
+# Local configuration and runtime output
+.env
+.env.*
+*.pem
+*.key
+.local-replication
+**/*.log
+
+# Documentation, tests and editor settings
+docs
+images
+tests
+experiments
+.vscode
+.idea

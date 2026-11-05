@@ -13,7 +13,8 @@ The current implementation runs a complete local environment: two FastAPI instan
 | Shared URL and write-aware routing | Validated locally |
 | Switchover, failover, rejoin, and failback | Validated locally |
 | Local watcher and read/write probes | Validated locally |
-| Container image pipeline and AWS/Azure deployment | Planned |
+| Linux AMD64 application image and two containerized web instances | Validated locally |
+| CI image pipeline, registry publication and AWS/Azure deployment | Planned |
 
 Cloud infrastructure and deployment automation are not part of the current implementation. The [roadmap](docs/ROADMAP.md) describes the remaining milestones.
 
@@ -39,6 +40,8 @@ flowchart LR
 ```
 
 The AWS and Azure labels identify simulated environments running on one development machine. Database containers communicate through a Docker network; application processes connect through published localhost ports. The proxy changes its destination only after the new writer has been verified.
+
+The [container packaging guide](docs/instruction/giaidoan2_docker_hoa_ungdung.md) also runs the application as two containers from the same image, using host ports 8280 and 8281 and connecting directly to the database services over `mcf-todicode_default`. This validates packaging and replication through the containerized application; the shared proxy above belongs to the Stage 1 recovery lab.
 
 ## Quick start
 
@@ -82,9 +85,13 @@ $env:TASKFLOW_DB_TESTS = '1'
 
 The local test suite passed **19 tests**. The lifecycle check passed repeated switchover/failback cycles, interrupted recovery, standby write rejection, retry handling, data/history comparisons, and watcher-triggered failover after an abrupt database stop. Lifecycle checks use an isolated Docker project and separate ports.
 
+The application image was built for Linux AMD64 and run as `appuser` in two containers using the same image ID. Local checks confirmed HTTP endpoints, primary/standby connectivity, and manual issue/comment replication through the containerized web instances.
+
 ## Documentation
 
 - [Stage 1: local application and database instructions](docs/instruction/giaidoan1_ungdung_database_local.md)
+- [Stage 2: application container packaging](docs/instruction/giaidoan2_docker_hoa_ungdung.md)
+- [Stage 3: CI and container registry instructions (in progress)](docs/instruction/giaidoan3_ci_va_container_registry.md)
 - [Architecture and consistency model](docs/ARCHITECTURE.md)
 - [Local setup and operations](docs/LOCAL_DEVELOPMENT.md)
 - [Failover and recovery runbook](docs/DISASTER_RECOVERY.md)

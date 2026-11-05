@@ -16,11 +16,18 @@ The project progresses from local recovery validation to deployment and measurem
 - [x] Stop/restart validation with persistent data.
 - [x] Reproducible [Stage 1 installation and validation instructions](instruction/giaidoan1_ungdung_database_local.md).
 
+## Completed: application container packaging
+
+- [x] Linux AMD64 application image with an unprivileged runtime user.
+- [x] Two application containers using the same image ID and separate runtime configuration.
+- [x] HTTP checks and direct connectivity to the primary and standby over the lab Docker network.
+- [x] Manual issue/comment replication checks through the containerized web instances.
+- [x] Reproducible [Stage 2 container packaging instructions](instruction/giaidoan2_docker_hoa_ungdung.md).
+
 ## Planned milestones
 
 | Phase | Deliverable | Acceptance evidence |
 |---|---|---|
-| Container packaging | Linux AMD64 application image | Runtime identity, health checks, and database-backed API checks |
 | CI and registry | Test/build/publish workflow and immutable image digest | Successful workflow run and clean pull of the selected digest |
 | Infrastructure | Independent AWS and Azure compute, networking, IPs, and storage | Reviewed Terraform plan and inventory for the selected accounts |
 | Cluster and workload | Two K3s environments, PostgreSQL, application, and WireGuard | Node/pod readiness, tunnel connectivity, role checks, and replayed business data |
@@ -30,6 +37,8 @@ The project progresses from local recovery validation to deployment and measurem
 | Cloud recovery | Manual failover, rejoin, and controlled failback | A single writer throughout; verified data after both transitions |
 | Automatic failover | Optional Azure-hosted watcher | Confirmed fencing before promotion and observable failure handling |
 | Evaluation | Repeated failure exercises and operational analysis | Raw measurements for downtime, latency, errors, data loss, and cost |
+
+The [Stage 3 guide](instruction/giaidoan3_ci_va_container_registry.md) is being developed incrementally. CI and publication are not validated until a complete workflow has run successfully on GitHub.
 
 ## Evaluation goals
 
