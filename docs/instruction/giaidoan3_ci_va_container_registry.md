@@ -6,7 +6,7 @@ Tự động kiểm thử và đóng gói ứng dụng bằng GitHub Actions, ph
 
 Tham chiếu bước chuẩn bị: [Giai đoạn 2 — Docker hóa ứng dụng](giaidoan2_docker_hoa_ungdung.md).
 
-Tài liệu được bổ sung theo từng bước. Hiện tại đã hướng dẫn job kiểm thử API/database với Python 3.12, PostgreSQL 17 và cách push để kiểm chứng trên GitHub. Job chưa được xác nhận chạy thành công; các phần build/publish image và kiểm tra pull theo digest sẽ được bổ sung sau.
+Tài liệu được bổ sung theo từng bước. Job kiểm thử API/database với Python 3.12 và PostgreSQL 17 đã chạy thành công trên GitHub Actions. Phần dưới hướng dẫn bổ sung job build image; build trên CI, phát hành GHCR và kiểm tra pull theo digest chưa được nghiệm thu.
 
 Điều kiện nghiệm thu khi kết thúc toàn bộ giai đoạn:
 
@@ -395,15 +395,83 @@ Nếu Git từ chối push do remote có commit mới, lấy và đối chiếu 
 
 Lưu link lượt chạy thành công cùng commit SHA làm bằng chứng kiểm thử. Chỉ phần job test được nghiệm thu ở bước này; tiếp theo mới bổ sung build image và phát hành GHCR.
 
-## 9. Theo dõi tiến độ
+## 9. Build image sau khi test đạt
 
-- [ ] Tạo file và hiểu tên workflow, sự kiện kích hoạt, quyền đọc source.
-- [ ] Bổ sung job Linux và checkout source.
-- [ ] Chuẩn bị Python runtime và dependency.
-- [ ] Cấu hình PostgreSQL service và chạy test.
+Sau khi job `test` chạy thành công trên GitHub, bổ sung job `container` bên dưới job đó trong `.github/workflows/container.yml`:
+
+```yaml
+  container:
+    needs: test
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7
+
+      - name: Build application image
+        run: docker build --platform linux/amd64 -t multi-cloud-failover:ci .
+```
+
+`container:` thụt lề hai khoảng trắng, cùng cấp với `test:` bên dưới `jobs:`. Không đặt nó bên trong `steps` của job test và không tạo thêm khóa `jobs` thứ hai.
+
+| Thành phần | Ý nghĩa |
+|---|---|
+| `container` | ID của job đóng gói ứng dụng; tên này không có nghĩa job sử dụng cấu hình job container |
+| `needs: test` | Chờ job `test` thành công; nếu test lỗi hoặc bị skip, job này cũng bị skip theo cấu hình mặc định |
+| `runs-on: ubuntu-latest` | Thực hiện build trên runner Ubuntu của job này |
+| Checkout | Lấy source vào workspace của runner mới |
+| `docker build` | Build Dockerfile và context đã commit trong repository |
+| `multi-cloud-failover:ci` | Tag image trong Docker image store của runner build |
+
+Hai job GitHub-hosted sử dụng môi trường runner riêng. Source, thư viện Python và PostgreSQL của job `test` không tự chuyển sang job `container`, nên cần checkout lần nữa. Bước build không cần setup Python trên runner: Python và dependency ứng dụng được chuẩn bị bên trong image theo Dockerfile.
+
+Luồng hiện tại:
+
+```text
+test: PostgreSQL → checkout → Python → dependency → pytest
+                                                       ↓ Chỉ khi đạt
+container: checkout → docker build Linux AMD64
+```
+
+Image `:ci` mới tồn tại trên runner build và chưa được phát hành. Khi runner được dọn, không thể pull image này từ máy cá nhân nếu chưa push lên registry. Tag này cũng không thay đổi image `:local` của lab trên Windows.
+
+Kiểm tra nội dung đã lưu:
+
+```bash
+cat .github/workflows/container.yml
+```
+
+Phần tiếp theo kiểm tra cấu trúc file rồi commit/push để chạy cả hai job. Sau khi build trên CI đạt mới bổ sung đăng nhập và phát hành GHCR. Không cần thêm PostgreSQL service vào job build vì Dockerfile không kết nối database trong lúc build.
+
+### 9.1. Commit và kiểm chứng job build
+
+Sau khi kiểm tra YAML có hai job `test` và `container`, trong đó job `container` có `needs: test`, chạy từ thư mục gốc repository:
+
+```bash
+git add -- .github/workflows/container.yml README.md docs/ROADMAP.md docs/instruction/giaidoan3_ci_va_container_registry.md
+git diff --cached --check
+```
+
+Khi kiểm tra không báo lỗi, lưu và push:
+
+```bash
+git commit -m "ci: build application image after tests pass"
+git push origin main
+```
+
+Mở Actions và chọn lượt chạy mới. Job `test` cần thành công trước, sau đó job `container` mới chạy. Mở `container` → `Build application image` để xem log Docker build và xác nhận bước kết thúc thành công. Cả hai job cần xanh; trường hợp `container` bị skip vì test lỗi không được tính là build đạt.
+
+Lượt chạy này xác nhận source đã commit có thể build image trên runner Linux độc lập với máy phát triển. Nó chưa kiểm tra khởi động image, chưa push GHCR và chưa triển khai AWS/Azure. Sau khi job build đạt, phần tiếp theo bổ sung phát hành image lên registry.
+
+## 10. Theo dõi tiến độ
+
+- [x] Tạo file và hiểu tên workflow, sự kiện kích hoạt, quyền đọc source.
+- [x] Bổ sung job Linux và checkout source.
+- [x] Chuẩn bị Python runtime và dependency.
+- [x] Cấu hình PostgreSQL service và chạy test trên GitHub.
 - [ ] Cấu hình build image sau khi test đạt.
 - [ ] Phát hành GHCR và lưu digest/commit.
 - [ ] Pull image bằng digest và xác nhận runtime.
-- [ ] Xác nhận lượt chạy GitHub Actions thành công.
+- [ ] Xác nhận pipeline đầy đủ test/build/publish/kiểm tra runtime thành công.
 
 Hướng dẫn cho các phần chưa thực hành sẽ được bổ sung theo tiến độ. Checklist không thay thế kết quả chạy workflow.

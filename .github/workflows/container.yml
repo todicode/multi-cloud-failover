@@ -46,3 +46,13 @@ jobs:
 
       - name: Run API and database tests
         run: python -m pytest -q
+  container:
+    needs: test
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7
+
+      - name: Build application image
+        run: docker build --platform linux/amd64 -t multi-cloud-failover:ci .

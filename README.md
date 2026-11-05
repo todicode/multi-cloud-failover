@@ -14,7 +14,8 @@ The current implementation runs a complete local environment: two FastAPI instan
 | Switchover, failover, rejoin, and failback | Validated locally |
 | Local watcher and read/write probes | Validated locally |
 | Linux AMD64 application image and two containerized web instances | Validated locally |
-| CI image pipeline, registry publication and AWS/Azure deployment | Planned |
+| API and PostgreSQL tests on GitHub Actions | Validated |
+| CI image build, registry publication and AWS/Azure deployment | Planned |
 
 Cloud infrastructure and deployment automation are not part of the current implementation. The [roadmap](docs/ROADMAP.md) describes the remaining milestones.
 

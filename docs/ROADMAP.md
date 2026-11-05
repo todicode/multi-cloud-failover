@@ -38,7 +38,7 @@ The project progresses from local recovery validation to deployment and measurem
 | Automatic failover | Optional Azure-hosted watcher | Confirmed fencing before promotion and observable failure handling |
 | Evaluation | Repeated failure exercises and operational analysis | Raw measurements for downtime, latency, errors, data loss, and cost |
 
-The [Stage 3 guide](instruction/giaidoan3_ci_va_container_registry.md) is being developed incrementally. CI and publication are not validated until a complete workflow has run successfully on GitHub.
+The [Stage 3 guide](instruction/giaidoan3_ci_va_container_registry.md) is being developed incrementally. The API/PostgreSQL test job has run successfully on GitHub Actions. Image build, registry publication and clean-pull verification remain to be validated.
 
 ## Evaluation goals
 
