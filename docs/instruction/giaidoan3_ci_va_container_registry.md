@@ -6,7 +6,7 @@ Tự động kiểm thử và đóng gói ứng dụng bằng GitHub Actions, ph
 
 Tham chiếu bước chuẩn bị: [Giai đoạn 2 — Docker hóa ứng dụng](giaidoan2_docker_hoa_ungdung.md).
 
-Tài liệu được bổ sung theo từng bước. Job kiểm thử API/database với Python 3.12 và PostgreSQL 17 đã chạy thành công trên GitHub Actions. Phần dưới hướng dẫn bổ sung job build image; build trên CI, phát hành GHCR và kiểm tra pull theo digest chưa được nghiệm thu.
+Tài liệu được bổ sung theo từng bước. Job kiểm thử API/database và job build image Linux AMD64 đã chạy thành công trên GitHub Actions. Phần dưới hướng dẫn tên image, quyền, đăng nhập, tag và push GHCR; phát hành thực tế và kiểm tra pull theo digest chưa được nghiệm thu.
 
 Điều kiện nghiệm thu khi kết thúc toàn bộ giai đoạn:
 
@@ -463,13 +463,297 @@ Mở Actions và chọn lượt chạy mới. Job `test` cần thành công trư
 
 Lượt chạy này xác nhận source đã commit có thể build image trên runner Linux độc lập với máy phát triển. Nó chưa kiểm tra khởi động image, chưa push GHCR và chưa triển khai AWS/Azure. Sau khi job build đạt, phần tiếp theo bổ sung phát hành image lên registry.
 
-## 10. Theo dõi tiến độ
+## 10. Chuẩn bị tên image và quyền phát hành GHCR
+
+GHCR là GitHub Container Registry, registry lưu image tại `ghcr.io`. Sau khi image được phát hành, các máy khác có quyền truy cập có thể pull image thay vì tự build lại source.
+
+### 10.1. Đặt tên image dùng trong workflow
+
+Thêm khối sau ở cấp workflow, sau `permissions` và trước `jobs`:
+
+```yaml
+env:
+  IMAGE_NAME: ghcr.io/${{ github.repository }}
+```
+
+`github.repository` là context do GitHub cung cấp, có dạng `owner/repository`. Với repository này, giá trị là `todicode/multi-cloud-failover`, nên `IMAGE_NAME` trở thành:
+
+```text
+ghcr.io/todicode/multi-cloud-failover
+```
+
+Đây là tên image, chưa có tag hoặc digest. `IMAGE_NAME` là tên biến do workflow quy định. Các job kế thừa biến cấp workflow; khi dùng trong lệnh shell trên runner có thể tham chiếu bằng `$IMAGE_NAME`.
+
+Chỉ thêm một khối `env` ở cấp workflow. Giữ khối `env` bên trong job `test` cho `TASKFLOW_DB_TESTS` và `DATABASE_URL`; hai phạm vi này khác nhau.
+
+### 10.2. Cấp quyền cho job container
+
+Trong job `container`, thêm khối sau dưới `runs-on`, trước `steps`:
+
+```yaml
+    permissions:
+      contents: read
+      packages: write
+```
+
+`contents: read` cho phép checkout source. `packages: write` cho phép token của job phát hành package/image gắn với repository lên GHCR. Quyền này chỉ được khai báo cho job `container`; giữ quyền cấp workflow là `contents: read`.
+
+GitHub tự cấp `GITHUB_TOKEN` cho workflow run. Khi bổ sung bước đăng nhập GHCR sẽ dùng token này; không cần tạo token cá nhân cho bước publish image của chính repository.
+
+Khung job sau khi thêm quyền, với các bước hiện có được giữ nguyên:
+
+```yaml
+  container:
+    needs: test
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7
+
+      - name: Build application image
+        run: docker build --platform linux/amd64 -t multi-cloud-failover:ci .
+```
+
+Ở bước này lệnh build vẫn dùng tag local trên runner `multi-cloud-failover:ci`. Thêm biến và quyền chưa đổi tên image đang build, chưa đăng nhập và chưa push lên GHCR. Bước tiếp theo sẽ thêm đăng nhập cùng điều kiện chỉ phát hành từ push vào nhánh `main`; pull request tiếp tục chỉ test/build.
+
+Kiểm tra vị trí các khối:
+
+```bash
+cat .github/workflows/container.yml
+```
+
+Không cần tạo package GHCR thủ công trước bước này; package được tạo khi lần publish đầu tiên thành công. Hoàn thiện đăng nhập/tag/push trước lượt chạy kiểm chứng phần registry.
+
+## 11. Đăng nhập GHCR trong job container
+
+### 11.1. Kiểm tra phạm vi permissions
+
+Trước khi thêm login, kiểm tra khối sau nằm trong `jobs.container`, không nằm trong `jobs.test`:
+
+```yaml
+    permissions:
+      contents: read
+      packages: write
+```
+
+Nếu đã đặt nhầm trong job `test`, chuyển nguyên khối sang job `container`, ngay dưới `runs-on` và trước `steps`. Job `test` dùng quyền đọc kế thừa từ workflow; job `container` cần quyền ghi package cho bước phát hành.
+
+### 11.2. Thêm bước login
+
+Trong danh sách `steps` của job `container`, thêm sau checkout và trước `Build application image`:
+
+```yaml
+      - name: Log in to GHCR
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+```
+
+| Cấu hình | Vai trò |
+|---|---|
+| `if` | Chỉ thực hiện login khi sự kiện là push và nhánh là `main` |
+| `docker/login-action@v4` | Action đăng nhập Docker registry trên runner của job |
+| `registry: ghcr.io` | Chọn GitHub Container Registry |
+| `github.actor` | Tài khoản gắn với người hoặc ứng dụng kích hoạt workflow run |
+| `secrets.GITHUB_TOKEN` | Token tự động của workflow run; không phải mật khẩu tài khoản GitHub |
+
+Các biểu thức `${{ ... }}` được GitHub xử lý khi chuẩn bị workflow. Không thay chúng bằng token thật và không tạo secret thủ công tên `GITHUB_TOKEN`.
+
+Điều kiện `if` ở đây chỉ áp dụng cho step login. Pull request vẫn thực hiện job test và build, nhưng bỏ qua login. Bước push image sau này cũng cần cùng điều kiện để chỉ phát hành từ push vào `main`.
+
+Job `container` sau bước này:
+
+```yaml
+  container:
+    needs: test
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7
+
+      - name: Log in to GHCR
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build application image
+        run: docker build --platform linux/amd64 -t multi-cloud-failover:ci .
+```
+
+Login chỉ xác thực Docker client trên runner với registry. Image vẫn dùng tag `multi-cloud-failover:ci` và chưa được push. Không cần chạy `docker login` trên Windows cho workflow; runner thực hiện việc đăng nhập riêng.
+
+Kiểm tra file sau khi lưu:
+
+```bash
+cat .github/workflows/container.yml
+```
+
+Bước tiếp theo đổi tag của image sang tên GHCR và bổ sung push có điều kiện. Sau khi hoàn thiện các phần đó mới commit/push để kiểm chứng phát hành.
+
+## 12. Đặt tag GHCR và push image
+
+### 12.1. Đổi bước build
+
+Trong job `container`, thay bước `Build application image` hiện tại bằng:
+
+```yaml
+      - name: Build application image
+        run: |
+          docker build --platform linux/amd64 \
+            --label "org.opencontainers.image.source=https://github.com/${GITHUB_REPOSITORY}" \
+            --label "org.opencontainers.image.revision=${GITHUB_SHA}" \
+            -t "${IMAGE_NAME}:sha-${GITHUB_SHA}" \
+            -t "${IMAGE_NAME}:main" .
+```
+
+`run: |` giữ các dòng của shell script; dấu `\` cuối dòng nối các phần thành một lệnh Docker build. Không thêm khoảng trắng sau dấu `\`.
+
+Các biến dùng trong shell:
+
+- `IMAGE_NAME`: biến cấp workflow đã đặt là `ghcr.io/${{ github.repository }}`.
+- `GITHUB_SHA`: biến GitHub cấp cho commit được workflow build.
+- `GITHUB_REPOSITORY`: biến GitHub cấp có dạng `owner/repository`.
+
+Image được build một lần với hai tag:
+
+```text
+ghcr.io/todicode/multi-cloud-failover:sha-<full-commit-sha>
+ghcr.io/todicode/multi-cloud-failover:main
+```
+
+Tag `sha-...` giúp tra cứu image theo commit. Tag `main` là tên tiện dụng và có thể trỏ tới image mới sau lần publish khác; nó không cố định nội dung. Phần tiếp theo sẽ lưu digest để chọn đúng nội dung image khi triển khai.
+
+Hai OCI labels ghi source repository và revision vào metadata của image. Label source hỗ trợ liên kết package với repository khi publish GHCR. Labels này là metadata image, không tự đặt biến môi trường `COMMIT_SHA` cho FastAPI.
+
+### 12.2. Thêm bước push
+
+Đặt sau bước build, cùng mức thụt lề với các dòng `- name` khác:
+
+```yaml
+      - name: Push application image
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: |
+          docker push "${IMAGE_NAME}:sha-${GITHUB_SHA}"
+          docker push "${IMAGE_NAME}:main"
+```
+
+Chỉ push sau khi build thành công và khi sự kiện là push vào `main`. Pull request vẫn build image trên runner nhưng bỏ qua cả login và push. Các lệnh push dùng thông tin xác thực do bước `docker/login-action` chuẩn bị.
+
+Hai lệnh publish hai tag của cùng image, không build thêm một bản ứng dụng khác. Khi layer đã có trên registry, log có thể hiện `Layer already exists`.
+
+### 12.3. Đối chiếu job container
+
+```yaml
+  container:
+    needs: test
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7
+
+      - name: Log in to GHCR
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build application image
+        run: |
+          docker build --platform linux/amd64 \
+            --label "org.opencontainers.image.source=https://github.com/${GITHUB_REPOSITORY}" \
+            --label "org.opencontainers.image.revision=${GITHUB_SHA}" \
+            -t "${IMAGE_NAME}:sha-${GITHUB_SHA}" \
+            -t "${IMAGE_NAME}:main" .
+
+      - name: Push application image
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: |
+          docker push "${IMAGE_NAME}:sha-${GITHUB_SHA}"
+          docker push "${IMAGE_NAME}:main"
+```
+
+Giữ job `test` và khối `env.IMAGE_NAME` cấp workflow đã viết trước đó. Kiểm tra file:
+
+```bash
+cat .github/workflows/container.yml
+```
+
+Tới đây đã mô tả đường publish, chưa xác nhận image tồn tại trên GHCR. Bước tiếp theo kiểm tra file rồi commit/push để chạy lần phát hành đầu tiên, sau đó lưu digest và kiểm tra image kéo lại từ registry.
+
+## 13. Chạy lần phát hành GHCR đầu tiên
+
+Trước khi push workflow, kiểm tra:
+
+- Biến `IMAGE_NAME` ở cấp workflow và đúng namespace của repository.
+- Job `container` có quyền `contents: read`, `packages: write` và phụ thuộc `test`.
+- Login và push cùng điều kiện chỉ chạy từ push vào `main`.
+- Build tạo hai tag GHCR, có source/revision labels.
+- Các dòng trống không còn khoảng trắng thừa, đặc biệt giữa bước build và bước push.
+
+Thêm rõ các file workflow/tài liệu đang thay đổi vào commit:
+
+```bash
+git add -- .github/workflows/container.yml README.md docs/ROADMAP.md docs/instruction/giaidoan3_ci_va_container_registry.md
+git diff --cached --check
+```
+
+Nếu kiểm tra báo whitespace, sửa file tương ứng rồi chạy lại `git add` và kiểm tra. Khi không báo lỗi:
+
+```bash
+git commit -m "ci: publish application image to GHCR"
+git push origin main
+```
+
+Mở Actions → workflow `Test and publish container` → lượt chạy của commit mới. Job `test` cần đạt trước. Trong job `container`, kiểm tra lần lượt:
+
+1. Checkout source.
+2. `Log in to GHCR` thành công.
+3. `Build application image` thành công.
+4. `Push application image` thành công cho cả hai tag.
+
+Log push cần thể hiện image repository `ghcr.io/todicode/multi-cloud-failover` và digest dạng `sha256:...` cho các tag. `Layer already exists` là kết quả bình thường khi layer đã có. Job xanh do push bị skip trên pull request không chứng minh image đã phát hành; dùng lượt chạy từ push vào `main` để nghiệm thu bước này.
+
+Mở repository trên GitHub và tìm mục Packages. Package `multi-cloud-failover` cần có hai tag:
+
+```text
+main
+sha-<full-commit-sha>
+```
+
+Ghi lại link workflow run, commit SHA và digest từ log push. Lần publish đầu tiên thường tạo package với quyền truy cập private; trạng thái repository public không tự chứng minh image có thể pull ẩn danh. Bước sau sẽ lưu định danh image và kiểm tra pull/runtime với quyền truy cập phù hợp.
+
+Image mới nằm trên GHCR, không tự chạy trên Windows hoặc trên cloud. Hai container lab hiện tại vẫn dùng image local đã tạo ở giai đoạn 2.
+
+## 14. Theo dõi tiến độ
 
 - [x] Tạo file và hiểu tên workflow, sự kiện kích hoạt, quyền đọc source.
 - [x] Bổ sung job Linux và checkout source.
 - [x] Chuẩn bị Python runtime và dependency.
 - [x] Cấu hình PostgreSQL service và chạy test trên GitHub.
-- [ ] Cấu hình build image sau khi test đạt.
+- [x] Build image trên GitHub sau khi test đạt.
 - [ ] Phát hành GHCR và lưu digest/commit.
 - [ ] Pull image bằng digest và xác nhận runtime.
 - [ ] Xác nhận pipeline đầy đủ test/build/publish/kiểm tra runtime thành công.
