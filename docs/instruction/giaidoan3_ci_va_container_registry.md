@@ -977,7 +977,7 @@ Trong `steps` của job `verify-image`, thêm hai bước sau dưới `Pull publ
 
       - name: Check published application HTTP
         run: |
-          curl -fsS --retry 10 --retry-connrefused --retry-delay 2 --max-time 5 \
+          curl -fsS --retry 10 --retry-all-errors --retry-delay 2 --max-time 5 \
             http://127.0.0.1:18080/health/live
           curl -fsS --max-time 5 http://127.0.0.1:18080/version
           curl -fsS --max-time 5 http://127.0.0.1:18080/issues.html -o /dev/null
@@ -996,12 +996,14 @@ Trong `steps` của job `verify-image`, thêm hai bước sau dưới `Pull publ
 | `-f` | Trả mã lỗi khi HTTP response báo lỗi từ 400 trở lên |
 | `-sS` | Bỏ progress meter nhưng vẫn hiển thị thông báo lỗi |
 | `--retry 10` | Cho phép retry tối đa 10 lần với các lỗi đủ điều kiện retry |
-| `--retry-connrefused` | Retry cả trường hợp server chưa mở cổng và kết nối bị từ chối |
+| `--retry-all-errors` | Cho phép retry mọi lỗi curl trong phép GET liveness, gồm connection refused và connection reset |
 | `--retry-delay 2` | Chờ 2 giây giữa các lần retry |
 | `--max-time 5` | Giới hạn thời gian mỗi lần truyền request ở mức 5 giây |
 | `-o /dev/null` | Không in HTML ra log, vẫn kiểm tra kết quả HTTP |
 
-Liveness có retry để chờ ứng dụng sẵn sàng sau `docker run`. Khi đã đạt, hai request tiếp theo kiểm tra version và static UI. Lệnh curl lỗi làm step thất bại theo cách runner thực thi shell script hiện tại.
+Liveness có retry để chờ ứng dụng sẵn sàng sau `docker run`. Docker có thể đã publish cổng trước khi Uvicorn bắt đầu nhận request; request quá sớm có thể bị từ chối hoặc bị reset. `docker run -d` trả thành công không chứng minh HTTP đã sẵn sàng. Khi liveness đã đạt, hai request tiếp theo kiểm tra version và static UI. Lệnh curl vẫn lỗi sau số lần thử cho phép làm step thất bại theo cách runner thực thi shell script hiện tại.
+
+`--retry-all-errors` được dùng cho GET liveness không thay đổi dữ liệu này. Không áp dụng tự động cùng cấu hình retry cho request ghi dữ liệu. Lỗi tạm thời vẫn có thể xuất hiện trong log trước lần thử thành công; tiêu chí là exit code cuối cùng của step.
 
 Kết quả cần quan sát trong log:
 
@@ -1082,6 +1084,23 @@ git diff -- .github/workflows/container.yml
 ```
 
 Chỉ đánh dấu hoàn thành giai đoạn khi workflow đã được push và cả ba job `test`, `container`, `verify-image` thành công trên GitHub Actions.
+
+### 19.3. Xử lý lỗi curl 56 trong lúc chờ ứng dụng khởi động
+
+Nếu `Check published application HTTP` dừng ngay với `curl: (56) Recv failure: Connection reset by peer`, kiểm tra cấu hình retry và log ứng dụng. `--retry-connrefused` chỉ mở rộng retry cho connection refused, không bao gồm mọi lỗi nhận dữ liệu như connection reset.
+
+Trong step HTTP, dùng dòng liveness ở mục 18 với `--retry 10 --retry-all-errors`. Hai request version và static UI giữ nguyên. Đây là cơ chế chờ có giới hạn; nếu ứng dụng crash hoặc không phục vụ HTTP, step vẫn thất bại sau các lần thử.
+
+Mở `Show logs and clean up` của lần chạy lỗi để xem log Uvicorn. Traceback hoặc lỗi import cần được xử lý theo log, không kết luận mọi connection reset đều do khởi động chậm. Sau khi sửa cấu hình chờ, commit lại và push để GitHub chạy phiên bản workflow mới:
+
+```bash
+git add -- .github/workflows/container.yml docs/instruction/giaidoan3_ci_va_container_registry.md
+git diff --cached --check
+git commit -m "fix(ci): retry connection resets during startup checks"
+git push origin main
+```
+
+Re-run một workflow cũ vẫn dùng cấu hình của commit cũ. Dùng lần chạy của commit sửa lỗi để nghiệm thu.
 
 ## 20. Commit, push và nghiệm thu pipeline
 
