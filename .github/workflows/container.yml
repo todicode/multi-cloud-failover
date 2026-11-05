@@ -1,0 +1,48 @@
+name: Test and publish container
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: taskflow
+          POSTGRES_PASSWORD: local-demo-only
+          POSTGRES_DB: taskflow
+        ports:
+          - "55432:5432"
+        options: >-
+          --health-cmd "pg_isready -U taskflow -d taskflow"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      TASKFLOW_DB_TESTS: "1"
+      DATABASE_URL: postgresql://taskflow:local-demo-only@127.0.0.1:55432/taskflow
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Install test dependencies
+        run: python -m pip install -r requirements-dev.txt
+
+      - name: Run API and database tests
+        run: python -m pytest -q
