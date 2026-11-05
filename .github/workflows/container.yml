@@ -53,6 +53,9 @@ jobs:
     needs: test
     runs-on: ubuntu-latest
 
+    outputs:
+      image_ref: ${{ steps.image.outputs.image_ref }}
+
     permissions:
       contents: read
       packages: write
@@ -82,3 +85,51 @@ jobs:
         run: |
           docker push "${IMAGE_NAME}:sha-${GITHUB_SHA}"
           docker push "${IMAGE_NAME}:main"
+
+      - name: Record published image
+        id: image
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: |
+          image_ref=$(docker image inspect "${IMAGE_NAME}:sha-${GITHUB_SHA}" --format '{{index .RepoDigests 0}}')
+          echo "image_ref=${image_ref}" >> "$GITHUB_OUTPUT"
+          echo "Published image: ${image_ref}"
+
+  verify-image:
+    needs: container
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+
+    env:
+      IMAGE_REF: ${{ needs.container.outputs.image_ref }}
+
+    steps:
+      - name: Pull published image
+        run: docker pull --platform linux/amd64 "$IMAGE_REF"
+
+      - name: Check image identity
+        run: |
+          revision=$(docker image inspect "$IMAGE_REF" --format '{{index .Config.Labels "org.opencontainers.image.revision"}}')
+          echo "Image revision: $revision"
+          test "$revision" = "$GITHUB_SHA"
+          test "$(docker image inspect "$IMAGE_REF" --format '{{.Config.User}}')" = "appuser"
+
+      - name: Start published application
+        run: |
+          docker run -d --name mcf-ci-verify \
+            -p 127.0.0.1:18080:8080 \
+            -e APP_ENV=ci-clean-pull \
+            -e APP_REGION=github-actions \
+            "$IMAGE_REF"
+
+      - name: Check published application HTTP
+        run: |
+          curl -fsS --retry 10 --retry-connrefused --retry-delay 2 --max-time 5 \
+            http://127.0.0.1:18080/health/live
+          curl -fsS --max-time 5 http://127.0.0.1:18080/version
+          curl -fsS --max-time 5 http://127.0.0.1:18080/issues.html -o /dev/null
+
+      - name: Show logs and clean up
+        if: always()
+        run: |
+          docker logs mcf-ci-verify || true
+          docker rm -f mcf-ci-verify || true

@@ -6,7 +6,7 @@ Tự động kiểm thử và đóng gói ứng dụng bằng GitHub Actions, ph
 
 Tham chiếu bước chuẩn bị: [Giai đoạn 2 — Docker hóa ứng dụng](giaidoan2_docker_hoa_ungdung.md).
 
-Tài liệu được bổ sung theo từng bước. Job kiểm thử API/database và job build image Linux AMD64 đã chạy thành công trên GitHub Actions. Phần dưới hướng dẫn tên image, quyền, đăng nhập, tag và push GHCR; phát hành thực tế và kiểm tra pull theo digest chưa được nghiệm thu.
+Tài liệu được bổ sung theo từng bước. Kiểm thử API/database, build Linux AMD64 và publish GHCR đã chạy thành công trên GitHub Actions. Pull bằng digest và runtime/database đã được xác nhận local. Phần dưới hướng dẫn job output, pull trên runner riêng và HTTP smoke check; job kiểm tra độc lập vẫn cần hoàn thiện và chạy nghiệm thu.
 
 Điều kiện nghiệm thu khi kết thúc toàn bộ giai đoạn:
 
@@ -747,15 +747,387 @@ Ghi lại link workflow run, commit SHA và digest từ log push. Lần publish 
 
 Image mới nằm trên GHCR, không tự chạy trên Windows hoặc trên cloud. Hai container lab hiện tại vẫn dùng image local đã tạo ở giai đoạn 2.
 
-## 14. Theo dõi tiến độ
+## 14. Kéo image đã phát hành bằng digest
+
+### 14.1. Định danh của lần phát hành đã kiểm chứng
+
+Lượt chạy đầu tiên đã xác nhận test, login, build và push đều thành công:
+
+| Trường | Giá trị |
+|---|---|
+| Workflow run | [42070998760](https://github.com/todicode/multi-cloud-failover/actions/runs/42070998760) |
+| Commit | `04596e5e7d5194d9e950b1859545be537893bb8e` |
+| Image | `ghcr.io/todicode/multi-cloud-failover` |
+| Digest | `sha256:726894c0cb50d04a87b52e64e0025e6c1daebe784fc1089b1c89f6a3d7aa0afd` |
+
+Registry đã trả về manifest theo tag commit cho truy cập ẩn danh, với digest nêu trên. Với lần phát hành mới, ghi nhận digest từ chính lượt chạy hoặc registry của bản đó, không suy ra từ tag `main` sau khi tag đã được cập nhật.
+
+Tag `main` và tag `sha-<commit>` là tên tham chiếu. Digest xác định nội dung manifest cụ thể. Dùng cú pháp `image@sha256:...` để chọn đúng bản đã ghi nhận cho việc kiểm thử và triển khai.
+
+### 14.2. Pull trên máy cá nhân
+
+Docker Desktop cần đang chạy Linux containers. Trong Git Bash:
+
+```bash
+docker pull --platform linux/amd64 ghcr.io/todicode/multi-cloud-failover@sha256:726894c0cb50d04a87b52e64e0025e6c1daebe784fc1089b1c89f6a3d7aa0afd
+```
+
+Lệnh tải image đã build trên GitHub về Docker image store của máy, không build lại source và không thay đổi container lab đang chạy. Docker có thể dùng lại layer đã có; không cần xóa image local để thực hiện bài này.
+
+Kết quả cần thể hiện đúng digest và pull kết thúc thành công. Nếu nội dung đã có, thông báo image up to date là hợp lệ. Kết quả pull chưa chứng minh ứng dụng đã khởi động được.
+
+Kiểm tra thông tin nền tảng/user và revision label sau khi pull thành công:
+
+```bash
+docker image inspect ghcr.io/todicode/multi-cloud-failover@sha256:726894c0cb50d04a87b52e64e0025e6c1daebe784fc1089b1c89f6a3d7aa0afd --format '{{.Os}}/{{.Architecture}} user={{.Config.User}}'
+docker image inspect ghcr.io/todicode/multi-cloud-failover@sha256:726894c0cb50d04a87b52e64e0025e6c1daebe784fc1089b1c89f6a3d7aa0afd --format '{{index .Config.Labels "org.opencontainers.image.revision"}}'
+```
+
+Giá trị cần có là `linux/amd64 user=appuser` và revision `04596e5e7d5194d9e950b1859545be537893bb8e`.
+
+Nếu tái tạo với package private, cần xác thực có quyền đọc package trước khi pull. Với bản đã kiểm chứng ở trên, registry cho phép truy cập ẩn danh nên không cần tạo token cho bước pull local này.
+
+Bước tiếp theo chạy container từ chính tham chiếu digest để kiểm tra HTTP và database. Sau đó bổ sung phép kiểm tra image đã phát hành trên runner riêng để hoàn thiện pipeline.
+
+## 15. Chạy image đã pull và kiểm tra runtime
+
+### 15.1. Chạy container kiểm tra
+
+Điều kiện: image ở mục 14 đã pull thành công, hai database của lab đang chạy đúng topology AWS primary/Azure standby, network `mcf-todicode_default` tồn tại và `.env.aws.local` đã cấu hình kết nối `database:5432`.
+
+Tạo container tạm từ chính digest đã ghi nhận. Cổng 8380 được chọn riêng với hai container web lab đang dùng 8280/8281:
+
+```bash
+docker run -d --name mcf-registry-smoke \
+  --network mcf-todicode_default \
+  --env-file .env.aws.local \
+  -e APP_ENV=registry-smoke \
+  -p 127.0.0.1:8380:8080 \
+  ghcr.io/todicode/multi-cloud-failover@sha256:726894c0cb50d04a87b52e64e0025e6c1daebe784fc1089b1c89f6a3d7aa0afd
+```
+
+`--env-file` dùng lại kết nối primary của lab. `-e APP_ENV=registry-smoke` ghi đè nhãn môi trường trong file cho container kiểm tra này. Container chạy image đã phát hành, kết nối database có sẵn và không yêu cầu build lại source.
+
+Nếu tên container đã tồn tại, kiểm tra trạng thái/log của container đó trước khi tạo lại. Cổng 8380 cần chưa bị tiến trình khác sử dụng.
+
+### 15.2. Kiểm tra ứng dụng
+
+Sau khi ứng dụng khởi động:
+
+```bash
+curl -fsS http://127.0.0.1:8380/health/live
+curl -fsS http://127.0.0.1:8380/version
+curl -fsS http://127.0.0.1:8380/api/database/status
+```
+
+Kết quả cần có:
+
+| Kiểm tra | Giá trị cần xác nhận |
+|---|---|
+| Liveness | HTTP 200, `status=alive` |
+| Version | HTTP 200, `environment=registry-smoke` |
+| Database status | HTTP 200, `connected=true`, `role=primary`, `writable=true` |
+
+`commit_sha` trong `/version` vẫn có thể là `not-built`, vì Dockerfile hiện chưa đưa commit vào biến runtime. Việc đối chiếu commit của image ở bước này dùng OCI revision label đã kiểm tra tại mục 14.2; label và biến ứng dụng là hai cơ chế riêng.
+
+Mở [http://127.0.0.1:8380/issues.html](http://127.0.0.1:8380/issues.html) để xác nhận static UI và danh sách dữ liệu lab được phục vụ. Nếu cần kiểm tra API đọc trực tiếp:
+
+```bash
+curl -fsS http://127.0.0.1:8380/api/issues
+```
+
+Có thể kiểm tra UID thực tế của user chạy lệnh trong container:
+
+```bash
+docker exec mcf-registry-smoke id -u
+```
+
+Giá trị cần có là `10001`, tương ứng với `appuser` trong Dockerfile.
+
+Nếu HTTP hoặc database status lỗi, xem log:
+
+```bash
+docker logs --tail 50 mcf-registry-smoke
+```
+
+### 15.3. Kết thúc bài kiểm tra local
+
+Chỉ ghi nhận runtime đạt sau khi các kết quả HTTP/database đúng. Khi đã kiểm tra xong, dừng và xóa container tạm nếu không còn cần:
+
+```bash
+docker stop mcf-registry-smoke
+docker rm mcf-registry-smoke
+```
+
+Hai web lab, PostgreSQL và application image vẫn được giữ lại. Bước sau bổ sung xác nhận image đã phát hành trên runner mới để pipeline tự kiểm tra đường phân phối, thay vì chỉ dựa vào phép thử local.
+
+## 16. Xuất tham chiếu image cho job kiểm tra độc lập
+
+Để job mới kiểm tra đúng image vừa publish, job `container` cần xuất giá trị có dạng `ghcr.io/...@sha256:...`. Không ghi cố định digest của lần publish đầu vào workflow vì mỗi lần build có thể tạo nội dung image mới.
+
+### 16.1. Lấy RepoDigest sau bước push
+
+Trong `steps` của job `container`, thêm sau `Push application image`:
+
+```yaml
+      - name: Record published image
+        id: image
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: |
+          image_ref=$(docker image inspect "${IMAGE_NAME}:sha-${GITHUB_SHA}" --format '{{index .RepoDigests 0}}')
+          echo "image_ref=${image_ref}" >> "$GITHUB_OUTPUT"
+          echo "Published image: ${image_ref}"
+```
+
+`docker image inspect` đọc metadata của image trên runner sau khi push. `.RepoDigests` chứa các tham chiếu repository kèm digest; `index ... 0` lấy tham chiếu đầu tiên. Trong job này image chỉ được publish vào cùng một GHCR repository với hai tag.
+
+`image_ref=$(...)` lấy output lệnh vào biến shell. Dòng ghi vào `$GITHUB_OUTPUT` tạo step output tên `image_ref`. `id: image` là ID để các biểu thức workflow tham chiếu step; khác với `name`, là nhãn hiển thị trong log. Dòng echo cuối in tham chiếu đã chọn để tra cứu.
+
+Điều kiện `if` giống step push, nên chỉ ghi nhận định danh sau lần phát hành từ push vào `main`. Pull request không publish và step này cũng bị skip.
+
+### 16.2. Đưa step output ra job output
+
+Trong job `container`, thêm khối sau dưới `runs-on`, cùng mức với `permissions` và `steps`:
+
+```yaml
+    outputs:
+      image_ref: ${{ steps.image.outputs.image_ref }}
+```
+
+`steps.image.outputs.image_ref` đọc output của step có `id: image`. Khối `outputs` công bố giá trị đó ra ngoài job `container`. Job phụ thuộc sau này sẽ đọc bằng `needs.container.outputs.image_ref`.
+
+Luồng dữ liệu:
+
+```text
+Push GHCR → inspect RepoDigest → step image output
+                                      ↓
+                         container job output image_ref
+                                      ↓
+                         job mới pull đúng image@digest
+```
+
+Output truyền chuỗi định danh, không truyền image hoặc file từ runner này sang runner khác. Job kiểm tra phải thực sự pull image từ registry. Job đó cũng cần điều kiện chỉ chạy khi có publish để không đọc output rỗng ở pull request.
+
+Kiểm tra file đã lưu:
+
+```bash
+cat .github/workflows/container.yml
+```
+
+Tới đây mới xuất định danh; phần tiếp theo thêm job kiểm tra độc lập và các lệnh HTTP. Hoàn thiện job đó trước khi commit/push kiểm chứng toàn bộ đường phân phối.
+
+## 17. Tạo job pull image trên runner riêng
+
+Sau khi job `container` đã khai báo output `image_ref` và step `Record published image`, thêm job sau vào cuối workflow, bên dưới job `container`:
+
+```yaml
+  verify-image:
+    needs: container
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+
+    env:
+      IMAGE_REF: ${{ needs.container.outputs.image_ref }}
+
+    steps:
+      - name: Pull published image
+        run: docker pull --platform linux/amd64 "$IMAGE_REF"
+```
+
+`verify-image:` cùng mức thụt lề với `test:` và `container:`, đều nằm trong một khối `jobs` duy nhất.
+
+| Thành phần | Vai trò |
+|---|---|
+| `needs: container` | Chờ job publish hoàn thành thành công và cho phép đọc outputs của job đó |
+| `if` | Chỉ chạy khi có publish từ push vào `main`; tránh đọc output rỗng ở pull request |
+| `runs-on: ubuntu-latest` | Dùng runner khác với job build/publish |
+| `IMAGE_REF` | Biến môi trường của job, nhận chuỗi `image@digest` từ job trước |
+| `docker pull` | Tải đúng image đã phát hành từ GHCR về runner kiểm tra |
+
+Biểu thức `${{ needs.container.outputs.image_ref }}` được GitHub giải quyết để đặt biến môi trường. Trong lệnh Bash, `$IMAGE_REF` đọc giá trị biến đó.
+
+Job này không checkout source và không build image. Runner mới pull từ registry thay vì dùng image còn trong Docker image store của runner build. Package đã kiểm chứng ở mục 14 cho phép đọc ẩn danh, nên job pull này không cần đăng nhập GHCR.
+
+Luồng workflow sau khi thêm job:
+
+```text
+test → container: build/push và xuất image_ref → verify-image: pull image_ref
+```
+
+Tới đây `verify-image` mới kiểm tra được đường tải image, chưa xác nhận khởi động ứng dụng. Phần tiếp theo bổ sung chạy container và kiểm tra HTTP trước khi commit/push nghiệm thu cả pipeline.
+
+Kiểm tra nội dung đã lưu:
+
+```bash
+cat .github/workflows/container.yml
+```
+
+## 18. Chạy container và kiểm tra HTTP trên runner mới
+
+Trong `steps` của job `verify-image`, thêm hai bước sau dưới `Pull published image`:
+
+```yaml
+      - name: Start published application
+        run: |
+          docker run -d --name mcf-ci-verify \
+            -p 127.0.0.1:18080:8080 \
+            -e APP_ENV=ci-clean-pull \
+            -e APP_REGION=github-actions \
+            "$IMAGE_REF"
+
+      - name: Check published application HTTP
+        run: |
+          curl -fsS --retry 10 --retry-connrefused --retry-delay 2 --max-time 5 \
+            http://127.0.0.1:18080/health/live
+          curl -fsS --max-time 5 http://127.0.0.1:18080/version
+          curl -fsS --max-time 5 http://127.0.0.1:18080/issues.html -o /dev/null
+```
+
+### 18.1. Khởi động image đã phát hành
+
+`docker run` sử dụng đúng `IMAGE_REF` nhận từ job publish, không dùng tag có thể thay đổi như `main`. Container tạm tên `mcf-ci-verify` publish cổng 18080 trên loopback của runner tới cổng 8080 của ứng dụng.
+
+`APP_ENV=ci-clean-pull` và `APP_REGION=github-actions` là identity của phép kiểm tra này. Lệnh run dùng `CMD` đã có trong image để khởi động Uvicorn. Không cần checkout source, setup Python trên runner hoặc cài dependency lại.
+
+### 18.2. Chờ khởi động và kiểm tra HTTP
+
+| Tùy chọn curl | Ý nghĩa |
+|---|---|
+| `-f` | Trả mã lỗi khi HTTP response báo lỗi từ 400 trở lên |
+| `-sS` | Bỏ progress meter nhưng vẫn hiển thị thông báo lỗi |
+| `--retry 10` | Cho phép retry tối đa 10 lần với các lỗi đủ điều kiện retry |
+| `--retry-connrefused` | Retry cả trường hợp server chưa mở cổng và kết nối bị từ chối |
+| `--retry-delay 2` | Chờ 2 giây giữa các lần retry |
+| `--max-time 5` | Giới hạn thời gian mỗi lần truyền request ở mức 5 giây |
+| `-o /dev/null` | Không in HTML ra log, vẫn kiểm tra kết quả HTTP |
+
+Liveness có retry để chờ ứng dụng sẵn sàng sau `docker run`. Khi đã đạt, hai request tiếp theo kiểm tra version và static UI. Lệnh curl lỗi làm step thất bại theo cách runner thực thi shell script hiện tại.
+
+Kết quả cần quan sát trong log:
+
+- Liveness trả `{"status":"alive"}`.
+- Version có `environment=ci-clean-pull` và `region=github-actions`.
+- Trang `/issues.html` trả thành công; HTML được bỏ khỏi log.
+
+Các lệnh curl hiện kiểm tra HTTP thành công và in JSON để đối chiếu; chưa tự assert tất cả trường JSON hoặc nội dung HTML. Các kiểm tra API chi tiết đã nằm trong job `test`.
+
+Job này không có PostgreSQL service hoặc network của lab local. Smoke check tập trung vào khả năng phân phối và khởi động web; kết nối database của image đã được kiểm tra local ở mục 15, còn integration test API/PostgreSQL chạy ở job `test`. Không dùng `/health/database` làm tiêu chí của job smoke khi chưa cấu hình database cho nó.
+
+Luồng kiểm tra:
+
+```text
+Runner mới → pull image@digest → chạy container → health/version/static UI
+```
+
+Kiểm tra nội dung file sau khi thêm:
+
+```bash
+cat .github/workflows/container.yml
+```
+
+Bước tiếp theo hoàn thiện đối chiếu identity của image và xử lý log/cleanup, rồi mới commit/push để nghiệm thu cả pipeline.
+
+## 19. Đối chiếu image và dọn container kiểm tra
+
+### 19.1. Kiểm tra metadata sau khi pull
+
+Trong job `verify-image`, thêm step sau **giữa** `Pull published image` và `Start published application`:
+
+```yaml
+      - name: Check image identity
+        run: |
+          revision=$(docker image inspect "$IMAGE_REF" --format '{{index .Config.Labels "org.opencontainers.image.revision"}}')
+          echo "Image revision: $revision"
+          test "$revision" = "$GITHUB_SHA"
+          test "$(docker image inspect "$IMAGE_REF" --format '{{.Config.User}}')" = "appuser"
+```
+
+`revision` đọc OCI label đã được gắn khi build. `GITHUB_SHA` là commit của workflow đang chạy. Lệnh `test` trả mã 0 nếu hai giá trị bằng nhau; nếu khác, step thất bại. Phép kiểm tra thứ hai xác nhận user mặc định trong cấu hình image là `appuser`, đúng với Dockerfile.
+
+Job pull theo digest để xác định nội dung image; kiểm tra label bổ sung đối chiếu commit mà image khai báo. Label là metadata do bước build cung cấp, không phải chữ ký chứng thực độc lập. Phép kiểm tra user đọc cấu hình mặc định của image, không kiểm tra mọi hành vi phân quyền của ứng dụng.
+
+OCI label này khác biến môi trường `COMMIT_SHA` mà API `/version` đọc. Dockerfile hiện chưa gán biến đó, nên API vẫn có thể trả `commit_sha=not-built` trong khi OCI label chứa đúng commit.
+
+### 19.2. Xem log và dọn container dù kiểm tra thất bại
+
+Thêm step sau **cuối** danh sách `steps` của `verify-image`, sau `Check published application HTTP`:
+
+```yaml
+      - name: Show logs and clean up
+        if: always()
+        run: |
+          docker logs mcf-ci-verify || true
+          docker rm -f mcf-ci-verify || true
+```
+
+`if: always()` cho phép step này chạy cả khi step trước thất bại. Log giúp xác định lỗi khởi động hoặc HTTP. `docker rm -f` dừng và xóa container tạm có tên cụ thể.
+
+`|| true` cho phép tiếp tục nếu container chưa được tạo, chẳng hạn do pull image lỗi. Chỉ hai lệnh log/cleanup được bỏ qua lỗi; một step kiểm tra đã thất bại trước đó vẫn làm job thất bại.
+
+Thứ tự các step sau khi hoàn thiện:
+
+```text
+Pull published image
+→ Check image identity
+→ Start published application
+→ Check published application HTTP
+→ Show logs and clean up
+```
+
+Kiểm tra thay đổi trước khi commit:
+
+```bash
+git diff --check
+git diff -- .github/workflows/container.yml
+```
+
+Chỉ đánh dấu hoàn thành giai đoạn khi workflow đã được push và cả ba job `test`, `container`, `verify-image` thành công trên GitHub Actions.
+
+## 20. Commit, push và nghiệm thu pipeline
+
+Sau khi đã thêm đủ các step của job `verify-image`, đưa workflow và tài liệu vào cùng commit. Chạy trong Git Bash từ thư mục gốc repository:
+
+```bash
+git add -- .github/workflows/container.yml README.md docs/ROADMAP.md docs/instruction/giaidoan3_ci_va_container_registry.md
+git diff --cached --check
+```
+
+Nếu lệnh kiểm tra không báo lỗi whitespace, tiếp tục:
+
+```bash
+git commit -m "ci: verify published image on a separate runner"
+git push origin main
+```
+
+Tiền tố `ci:` thể hiện thay đổi chính thuộc pipeline tích hợp và kiểm tra tự động. Cảnh báo LF/CRLF của Git trên Windows không đồng nghĩa với lỗi trailing whitespace; nếu có lỗi `trailing whitespace`, sửa dòng được báo rồi stage và kiểm tra lại trước khi commit.
+
+Mở [GitHub Actions của repository](https://github.com/todicode/multi-cloud-failover/actions), chọn lần chạy ứng với commit vừa push. Luồng cần thành công:
+
+```text
+test → container → verify-image
+```
+
+| Job | Tiêu chí nghiệm thu |
+|---|---|
+| `test` | Chạy bộ test API và integration test với PostgreSQL service thành công |
+| `container` | Build/push GHCR thành công; `Record published image` in tham chiếu `ghcr.io/...@sha256:...` |
+| `verify-image` | Pull đúng tham chiếu từ job trước, đối chiếu revision/user, khởi động container và kiểm tra HTTP thành công |
+
+Trong `verify-image`, xem log `Check published application HTTP`: liveness trả `alive`, version có environment `ci-clean-pull` và region `github-actions`. Step kiểm tra static UI thành công khi request `/issues.html` không lỗi. `Show logs and clean up` phải chạy sau phần kiểm tra; riêng step cleanup xanh không chứng minh các step trước thành công.
+
+Lưu liên kết workflow run, commit SHA và image digest trong ghi chép nghiệm thu. Image ở lần build này có thể mang digest khác lần publish đầu; lấy giá trị của đúng run đã kiểm chứng để triển khai sau này.
+
+Nếu một job đỏ, mở step lỗi đầu tiên và đọc log trước khi chạy lại. Không đánh dấu hoàn thành bằng kết quả kiểm tra cú pháp local: giai đoạn này cần bằng chứng cả ba job thành công trên GitHub. Workflow hiện kiểm tra/phát hành image; chưa triển khai tài nguyên AWS hoặc Azure.
+
+## 21. Theo dõi tiến độ
 
 - [x] Tạo file và hiểu tên workflow, sự kiện kích hoạt, quyền đọc source.
 - [x] Bổ sung job Linux và checkout source.
 - [x] Chuẩn bị Python runtime và dependency.
 - [x] Cấu hình PostgreSQL service và chạy test trên GitHub.
 - [x] Build image trên GitHub sau khi test đạt.
-- [ ] Phát hành GHCR và lưu digest/commit.
-- [ ] Pull image bằng digest và xác nhận runtime.
+- [x] Phát hành GHCR và lưu digest/commit.
+- [x] Pull image bằng digest và xác nhận runtime/database local.
 - [ ] Xác nhận pipeline đầy đủ test/build/publish/kiểm tra runtime thành công.
 
 Hướng dẫn cho các phần chưa thực hành sẽ được bổ sung theo tiến độ. Checklist không thay thế kết quả chạy workflow.

@@ -15,7 +15,10 @@ The current implementation runs a complete local environment: two FastAPI instan
 | Local watcher and read/write probes | Validated locally |
 | Linux AMD64 application image and two containerized web instances | Validated locally |
 | API/PostgreSQL tests and Linux AMD64 image build on GitHub Actions | Validated |
-| Registry publication and AWS/Azure deployment | Planned |
+| GHCR image publication | Validated |
+| Published image pull and runtime/database checks | Validated locally |
+| Published image verification on a separate CI runner | In progress |
+| AWS/Azure deployment | Planned |
 
 Cloud infrastructure and deployment automation are not part of the current implementation. The [roadmap](docs/ROADMAP.md) describes the remaining milestones.
 
