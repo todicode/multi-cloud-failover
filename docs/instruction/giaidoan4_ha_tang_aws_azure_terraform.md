@@ -1167,6 +1167,287 @@ Tham khảo: [terraform apply và saved plan mode](https://developer.hashicorp.c
 
 Đã xác nhận kết quả thực hành: apply tạo thành công năm resource, `state list` có đủ năm địa chỉ như trên và plan mới báo `No changes. Your infrastructure matches the configuration.` Danh sách trong state local cũng đã được đối chiếu. Lớp mạng AWS được nghiệm thu; chưa có máy chủ hoặc workload cloud trong phạm vi bước này.
 
+### 5.11. Tạo Security Group và quy tắc outbound
+
+Sau khi lớp mạng đã apply và plan báo No changes, bắt đầu cấu hình truy cập cho máy chủ. Từ thư mục gốc repository, tạo file:
+
+```bash
+touch deploy/terraform/aws/security.tf
+```
+
+Ghi vào `deploy/terraform/aws/security.tf`:
+
+```hcl
+resource "aws_security_group" "primary" {
+  name        = "mcf-aws-host"
+  description = "Traffic rules for the AWS primary host"
+  vpc_id      = aws_vpc.primary.id
+
+  tags = {
+    Name    = "mcf-aws-host"
+    Project = "multi-cloud-failover"
+  }
+}
+
+resource "aws_vpc_security_group_egress_rule" "all_ipv4" {
+  security_group_id = aws_security_group.primary.id
+  description       = "Allow outbound IPv4 traffic"
+  cidr_ipv4         = "0.0.0.0/0"
+  ip_protocol       = "-1"
+}
+```
+
+`aws_security_group.primary` tạo nhóm quy tắc trong VPC. `name` là tên Security Group trên AWS; `primary` là tên cục bộ trong Terraform. Nhóm sẽ được gắn với network interface của EC2 ở bước cấu hình máy chủ, không gắn với toàn bộ subnet chỉ bằng `vpc_id`.
+
+Resource `aws_vpc_security_group_egress_rule.all_ipv4` khai báo quy tắc outbound riêng:
+
+- `security_group_id`: tham chiếu nhóm mà quy tắc áp dụng.
+- `cidr_ipv4 = "0.0.0.0/0"`: mọi địa chỉ IPv4 đích.
+- `ip_protocol = "-1"`: cho phép mọi giao thức IP và mọi port; không khai báo `from_port` hoặc `to_port` khi dùng giá trị này.
+
+Outbound cho phép máy chủ chủ động tải package, K3s và image khi các điều kiện địa chỉ, routing và DNS đã đáp ứng. AWS provider loại bỏ egress allow-all mặc định khi tạo Security Group, nên khai báo rõ rule mong muốn trong Terraform. Dùng các resource rule riêng, không trộn với inline `ingress`/`egress` của cùng Security Group.
+
+Chưa có ingress rule cho kết nối mới từ bên ngoài, gồm SSH. Security Group là stateful: response của kết nối outbound được phép vẫn có thể quay về; không cần mở ingress tương ứng chỉ để nhận response. Quy tắc SSH theo public IPv4 của người quản trị được thêm ở bước sau.
+
+Từ thư mục gốc repository, chạy:
+
+```bash
+terraform -chdir=deploy/terraform/aws fmt
+terraform -chdir=deploy/terraform/aws validate
+```
+
+Khi validate thành công, xem plan mới:
+
+```bash
+terraform -chdir=deploy/terraform/aws plan
+```
+
+Kết quả mong đợi, nếu năm resource mạng đã apply và không có drift:
+
+```text
+Plan: 2 to add, 0 to change, 0 to destroy.
+```
+
+Hai resource mới là Security Group và outbound rule; năm resource mạng hiện có không cần tạo lại. Plan có thể in các dòng Refreshing state cho tài nguyên cũ; đọc các action và tổng kết để phân biệt refresh với thay đổi. Bước này chỉ đọc plan, chưa apply hoặc dùng lại `network.tfplan` của lần triển khai trước.
+
+Tham khảo: [aws_security_group](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/security_group), [aws_vpc_security_group_egress_rule](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/vpc_security_group_egress_rule), [AWS Security Group và stateful traffic](https://docs.aws.amazon.com/vpc/latest/userguide/vpc-security-groups.html).
+
+Đã xác nhận kết quả plan đúng hai resource mới theo cấu hình Security Group và outbound rule; chưa apply các resource này.
+
+### 5.12. Khai báo biến nguồn truy cập SSH
+
+Mỗi người quản trị cung cấp public IPv4 hiện tại làm nguồn SSH. Dùng input variable để cấu hình này không gắn cố định vào mã Security Group chung.
+
+Từ thư mục gốc repository, tạo file khai báo biến:
+
+```bash
+touch deploy/terraform/aws/variables.tf
+```
+
+Ghi vào `deploy/terraform/aws/variables.tf`:
+
+```hcl
+variable "admin_cidr" {
+  description = "Public IPv4 CIDR allowed to SSH to the AWS host"
+  type        = string
+}
+```
+
+`variable` khai báo một đầu vào tên `admin_cidr`. `type = string` yêu cầu giá trị chuỗi. Không khai báo `default` nên người chạy phải cung cấp giá trị khi Terraform lập plan. Cách tham chiếu trong resource ở bước sau là `var.admin_cidr`.
+
+Trong Git Bash, đọc public IPv4 của kết nối hiện tại:
+
+```bash
+curl -4 -fsS https://checkip.amazonaws.com
+```
+
+Địa chỉ trả về là IPv4 public của đường ra Internet đang sử dụng, có thể là địa chỉ NAT của router hoặc VPN; không dùng địa chỉ LAN của laptop. Lệnh chỉ truy vấn địa chỉ, không mở port hoặc tạo resource.
+
+Tạo file gán giá trị local:
+
+```bash
+touch deploy/terraform/aws/terraform.tfvars
+```
+
+Ghi vào `terraform.tfvars`, thay địa chỉ minh họa bằng kết quả thực tế:
+
+```hcl
+admin_cidr = "203.0.113.10/32"
+```
+
+`203.0.113.10` chỉ là địa chỉ ví dụ, không dùng để triển khai SSH thực tế. `/32` giới hạn đúng một địa chỉ IPv4 nguồn. Khi đổi mạng hoặc VPN làm public IPv4 thay đổi, cập nhật giá trị local và triển khai thay đổi rule tương ứng.
+
+`variables.tf` khai báo tên/kiểu đầu vào và được commit. `terraform.tfvars` gán giá trị riêng của người chạy, được `.gitignore` loại khỏi Git bằng quy tắc `*.tfvars`. Terraform tự đọc file đúng tên `terraform.tfvars` trong root module được chọn bởi `-chdir`; không cần thêm `-var-file` cho file này.
+
+Định dạng và kiểm tra từ thư mục gốc repository:
+
+```bash
+terraform -chdir=deploy/terraform/aws fmt
+terraform -chdir=deploy/terraform/aws validate
+git check-ignore -v deploy/terraform/aws/terraform.tfvars
+```
+
+Kết quả validate mong đợi là `Success! The configuration is valid.`; `check-ignore` cần hiển thị quy tắc `*.tfvars` từ `.gitignore`. Biến hiện chưa được dùng trong rule, nên bước này chưa thêm ingress hoặc resource cloud; không apply ở bước này. Không cần đưa public IP thực tế vào tài liệu công khai hoặc gửi để nghiệm thu; chỉ cần xác nhận đã điền đúng IPv4 với `/32`.
+
+Tham khảo: [Terraform input variables và variable values](https://developer.hashicorp.com/terraform/language/values/variables), [AWS SSH source IP](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/security-group-rules-reference.html#sg-rules-your-computer).
+
+Đã đối chiếu khai báo `admin_cidr`, xác nhận file `terraform.tfvars` local tồn tại và được ignore theo quy tắc `*.tfvars`. Giá trị được kiểm tra đúng cú pháp IPv4 `/32`, không dùng địa chỉ ví dụ `203.0.113.0/24`; không đưa giá trị thực vào tài liệu. Việc địa chỉ còn khớp đường ra Internet được kiểm tra lại khi cần kết nối SSH.
+
+### 5.13. Thêm ingress rule cho SSH
+
+Giữ nguyên Security Group và outbound rule trong `deploy/terraform/aws/security.tf`, thêm:
+
+```hcl
+resource "aws_vpc_security_group_ingress_rule" "ssh" {
+  security_group_id = aws_security_group.primary.id
+  description       = "Allow SSH from the operator IPv4"
+  cidr_ipv4         = var.admin_cidr
+  ip_protocol       = "tcp"
+  from_port         = 22
+  to_port           = 22
+}
+```
+
+`aws_vpc_security_group_ingress_rule.ssh` là một resource rule cho kết nối vào. `security_group_id` tham chiếu nhóm đã khai báo, còn `var.admin_cidr` đọc giá trị đầu vào được gán trong `terraform.tfvars`. Biểu thức tham chiếu không đặt trong dấu nháy.
+
+Luồng giá trị: khai báo tên/kiểu tại `variables.tf`, gán giá trị tại `terraform.tfvars`, sử dụng qua `var.admin_cidr` trong resource rule.
+
+Trong ingress rule, `cidr_ipv4` là dải IPv4 nguồn được phép kết nối. Trong outbound rule ở mục 5.11, cùng tên thuộc tính đó biểu thị dải IPv4 đích. `ip_protocol = "tcp"` cùng `from_port = 22` và `to_port = 22` chỉ cho phép TCP đến port 22 của máy chủ khi Security Group được gắn vào máy chủ đó; hai thuộc tính port là đầu/cuối của dải port đích, không phải port nguồn/port đích của kết nối.
+
+Từ thư mục gốc repository, chạy:
+
+```bash
+terraform -chdir=deploy/terraform/aws fmt
+terraform -chdir=deploy/terraform/aws validate
+```
+
+Khi validate thành công:
+
+```bash
+terraform -chdir=deploy/terraform/aws plan
+```
+
+Nếu Security Group và outbound rule ở mục 5.11 chưa apply, kết quả mong đợi:
+
+```text
+Plan: 3 to add, 0 to change, 0 to destroy.
+```
+
+Ba resource mới là Security Group, outbound rule và SSH ingress rule. Năm resource mạng đã triển khai được giữ nguyên. Kiểm tra riêng phần `aws_vpc_security_group_ingress_rule.ssh`: TCP, port 22–22, nguồn đúng IPv4 `/32` đã nhập. Nếu Terraform hỏi nhập `var.admin_cidr`, kiểm tra vị trí/tên `terraform.tfvars` trong root module AWS.
+
+Bước này chỉ kiểm tra plan, chưa apply rule. Chưa có EC2 nên chưa thực hiện kiểm tra kết nối SSH. Không dùng lại saved plan `network.tfplan` cho thay đổi mới.
+
+Tham khảo: [aws_vpc_security_group_ingress_rule](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/vpc_security_group_ingress_rule), [AWS SSH source và port](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/security-group-rules-reference.html#sg-rules-your-computer).
+
+Đã xác nhận plan sau khi thêm SSH rule đúng ba resource mới. Chưa apply nhóm và các rule.
+
+### 5.14. Thêm ingress rule HTTP và HTTPS
+
+Giữ nguyên nội dung hiện có trong `deploy/terraform/aws/security.tf`, thêm:
+
+```hcl
+resource "aws_vpc_security_group_ingress_rule" "http" {
+  security_group_id = aws_security_group.primary.id
+  description       = "Allow public HTTP"
+  cidr_ipv4         = "0.0.0.0/0"
+  ip_protocol       = "tcp"
+  from_port         = 80
+  to_port           = 80
+}
+
+resource "aws_vpc_security_group_ingress_rule" "https" {
+  security_group_id = aws_security_group.primary.id
+  description       = "Allow public HTTPS"
+  cidr_ipv4         = "0.0.0.0/0"
+  ip_protocol       = "tcp"
+  from_port         = 443
+  to_port           = 443
+}
+```
+
+Hai rule dùng cùng cơ chế như rule SSH. HTTP cho phép kết nối TCP đến port 80, HTTPS đến port 443. `cidr_ipv4 = "0.0.0.0/0"` trong ingress cho phép mọi địa chỉ IPv4 nguồn, phù hợp endpoint web công khai. Rule SSH vẫn giữ `var.admin_cidr` để giới hạn nguồn quản trị.
+
+| Kết nối vào | Port đích | Nguồn IPv4 |
+|---|---|---|
+| SSH | TCP 22 | `var.admin_cidr`, IPv4 `/32` của người quản trị |
+| HTTP | TCP 80 | `0.0.0.0/0` |
+| HTTPS | TCP 443 | `0.0.0.0/0` |
+
+Khi triển khai workload, Traefik sẽ phục vụ web qua các port này; HTTP có thể chuyển hướng sang HTTPS. Health check HTTPS cũng truy cập qua port 443. Ứng dụng vẫn có thể lắng nghe port 8080 bên trong cluster mà không cần mở trực tiếp port đó qua Security Group. Tạo rule không cài web server hoặc chứng chỉ TLS; các phần đó được thực hiện ở giai đoạn workload và HTTPS.
+
+Từ thư mục gốc repository, chạy định dạng và kiểm tra:
+
+```bash
+terraform -chdir=deploy/terraform/aws fmt
+terraform -chdir=deploy/terraform/aws validate
+```
+
+Khi validate thành công:
+
+```bash
+terraform -chdir=deploy/terraform/aws plan
+```
+
+Nếu Security Group và các rule trước vẫn chưa apply, kết quả mong đợi:
+
+```text
+Plan: 5 to add, 0 to change, 0 to destroy.
+```
+
+Năm resource mới gồm một Security Group, một outbound rule và ba ingress rule SSH/HTTP/HTTPS. Năm resource mạng đã triển khai không cần tạo lại. Kiểm tra đúng từng port và nguồn trong plan; tiếp tục chưa apply ở bước này.
+
+Tham khảo: [AWS web server rules](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/security-group-rules-reference.html#sg-rules-web-server), [Terraform ingress rule](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/vpc_security_group_ingress_rule).
+
+Đã xác nhận plan đúng năm resource mới. Nội dung `security.tf` được đối chiếu và các kiểm tra `fmt -check`, `validate` đều đạt. State tại thời điểm kiểm tra vẫn chỉ có năm resource mạng; nhóm và rule chưa được apply.
+
+### 5.15. Apply Security Group và các rule
+
+Từ thư mục gốc repository, lưu plan mới cho lớp truy cập:
+
+```bash
+terraform -chdir=deploy/terraform/aws plan -out=security.tfplan
+```
+
+Đọc kết quả trước khi thực hiện: phải có `5 to add, 0 to change, 0 to destroy`, gồm Security Group, outbound rule và ba ingress rule SSH/HTTP/HTTPS. Kiểm tra nguồn SSH đúng IPv4 `/32` của người quản trị, nguồn web `0.0.0.0/0` và các port đúng 22, 80, 443. Plan mới được lưu tại `deploy/terraform/aws/security.tfplan` và được Git ignore.
+
+Khi saved plan đúng, người quản trị thực hiện:
+
+```bash
+terraform -chdir=deploy/terraform/aws apply security.tfplan
+```
+
+Lệnh thực hiện kế hoạch đã lưu trên AWS, không hỏi nhập `yes` lần nữa. Không dùng saved plan `network.tfplan` đã apply ở bước trước.
+
+Kết quả thành công mong đợi:
+
+```text
+Apply complete! Resources: 5 added, 0 changed, 0 destroyed.
+```
+
+Kiểm tra lại bằng plan mới:
+
+```bash
+terraform -chdir=deploy/terraform/aws plan
+```
+
+Kết quả mong đợi:
+
+```text
+No changes. Your infrastructure matches the configuration.
+```
+
+Nếu cần đối chiếu danh sách quản lý:
+
+```bash
+terraform -chdir=deploy/terraform/aws state list
+```
+
+State mong đợi có tổng cộng mười resource: năm resource mạng trước đó và năm resource của lớp truy cập. Security Group tồn tại trong VPC nhưng chưa gắn với máy chủ nào, vì chưa triển khai EC2. Kết nối SSH/web thực tế được nghiệm thu sau khi có máy chủ và dịch vụ tương ứng. Giữ bản sao state cập nhật ngoài repository theo mục 5.9.
+
+Chỉ đánh dấu bước apply thành công theo kết quả thực hành. Nếu apply lỗi, giữ nguyên state và xử lý lỗi trước khi lập plan mới.
+
+Tham khảo: [Terraform saved plan mode](https://developer.hashicorp.com/terraform/cli/commands/apply#saved-plan-mode).
+
 ## 6. Theo dõi tiến độ
 
 - [ ] Xác nhận Terraform, AWS CLI, Azure CLI và SSH chạy được trong Git Bash.
@@ -1190,6 +1471,11 @@ Tham khảo: [terraform apply và saved plan mode](https://developer.hashicorp.c
 - [x] Khai báo route table và liên kết subnet; kiểm tra plan: `5 to add, 0 to change, 0 to destroy`; chưa apply.
 - [x] Lưu `network.tfplan` và đọc lại đúng plan lớp mạng trước khi apply.
 - [x] Apply lớp mạng AWS: năm resource được tạo, state list đủ năm resource và plan mới báo No changes.
+- [x] Khai báo Security Group và outbound rule; kiểm tra plan hai resource mới, chưa apply.
+- [x] Khai báo `admin_cidr`, gán IPv4 `/32` trong `terraform.tfvars` local và xác nhận Git ignore.
+- [x] Khai báo SSH ingress rule và kiểm tra plan ba resource mới; chưa apply.
+- [x] Khai báo HTTP/HTTPS ingress rule và kiểm tra plan năm resource mới; chưa apply.
+- [ ] Apply Security Group và bốn rule; plan mới báo No changes, state có tổng cộng mười resource.
 - [ ] Khai báo mạng và quy tắc truy cập của hai môi trường.
 - [ ] Khai báo compute, địa chỉ IP và đĩa.
 - [ ] Kiểm tra plan rồi triển khai các lớp hạ tầng.
