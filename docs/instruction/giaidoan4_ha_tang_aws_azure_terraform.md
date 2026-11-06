@@ -6,6 +6,8 @@ Chuẩn bị hai môi trường cloud độc lập cho mô hình AWS primary và
 
 Điều kiện bắt đầu: đã hoàn thành [giai đoạn 3 — CI và container registry](giaidoan3_ci_va_container_registry.md), có tài khoản AWS và Azure riêng, cùng tên miền thuộc quyền quản lý.
 
+Phạm vi nghiệm thu toàn project được theo dõi trong [yêu cầu và tiêu chí nghiệm thu](../PROJECT_REQUIREMENTS.md), gồm nội dung đề tài 29, General Deliverables và rubric. Giai đoạn này chuẩn bị hạ tầng cho hai môi trường; thí nghiệm, baseline và các số đo cloud được nghiệm thu ở giai đoạn tương ứng.
+
 | Thành phần | AWS | Azure |
 |---|---|---|
 | Mạng riêng | VPC và subnet | Virtual Network và subnet |
@@ -1704,12 +1706,11 @@ Giữ resource Key Pair hiện có trong `deploy/terraform/aws/compute.tf`, thê
 
 ```hcl
 resource "aws_instance" "primary" {
-  ami                         = data.aws_ami.ubuntu.id
-  instance_type               = "t3.medium"
-  subnet_id                   = aws_subnet.public.id
-  vpc_security_group_ids      = [aws_security_group.primary.id]
-  key_name                    = aws_key_pair.operator.key_name
-  associate_public_ip_address = false
+  ami                    = data.aws_ami.ubuntu.id
+  instance_type          = "t3.medium"
+  subnet_id              = aws_subnet.public.id
+  vpc_security_group_ids = [aws_security_group.primary.id]
+  key_name               = aws_key_pair.operator.key_name
 
   tags = {
     Name    = "mcf-aws-primary"
@@ -1725,7 +1726,7 @@ resource "aws_instance" "primary" {
 | `subnet_id` | Đặt EC2 vào subnet public của project, tại AZ `ap-southeast-1c` |
 | `vpc_security_group_ids` | Gắn danh sách Security Group cho network interface của máy chủ |
 | `key_name` | Chọn Key Pair đăng ký public key của người quản trị |
-| `associate_public_ip_address` | Không tự cấp public IPv4; Elastic IP được khai báo riêng trước khi triển khai |
+| Public IPv4 | Subnet giữ `map_public_ip_on_launch = false`; EIP được quản lý bằng resource riêng, không khai báo `associate_public_ip_address` trên instance |
 
 `vpc_security_group_ids` nhận một tập ID, nên viết trong dấu ngoặc vuông dù hiện chỉ có một nhóm. Tham chiếu `aws_security_group.primary.id` gắn các rule SSH/HTTP/HTTPS/outbound với máy chủ khi tạo. Tên tag `mcf-aws-primary` là tên hiển thị, chưa cấu hình vai trò PostgreSQL primary.
 
@@ -1753,7 +1754,7 @@ Nếu Key Pair vẫn chưa apply và chưa có drift ở các resource đã tri�
 Plan: 2 to add, 0 to change, 0 to destroy.
 ```
 
-Kiểm tra AMI đúng ID đã cố định, instance type `t3.medium`, subnet/SG đúng tài nguyên hiện có, key name `mcf-lab`, public IP tự cấp bằng `false`. Nếu plan hiển thị root block device hoặc các mặc định khác, đó chưa phải cấu hình compute hoàn chỉnh để triển khai: các thiết lập được bổ sung từng phần ở bước tiếp theo. Không chạy apply tại bước này.
+Kiểm tra AMI đúng ID đã cố định, instance type `t3.medium`, subnet/SG đúng tài nguyên hiện có và key name `mcf-lab`. Subnet tắt tự cấp public IPv4; không khai báo lại cờ đó trên instance khi quản lý EIP riêng. Nếu plan hiển thị root block device hoặc các mặc định khác, đó chưa phải cấu hình compute hoàn chỉnh để triển khai: các thiết lập được bổ sung từng phần ở bước tiếp theo. Không chạy apply tại bước này.
 
 Tham khảo: [Terraform aws_instance](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/instance), [AWS instance IP addressing](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/using-instance-addressing.html).
 
@@ -1849,7 +1850,7 @@ Tham khảo: [T3 Standard mode](https://docs.aws.amazon.com/AWSEC2/latest/UserGu
 
 ### 5.24. Cấp và gắn Elastic IP cho EC2
 
-Trạng thái thực hành: hướng dẫn chuẩn bị cho bước tiếp theo; các resource EIP và association chưa được bổ sung vào code Terraform hoặc triển khai. Cấu hình compute hiện tại mới gồm Key Pair và EC2, chưa apply.
+Trạng thái thực hành: đã đối chiếu code có các resource EIP và association đúng cấu hình bên dưới. Cấu hình compute gồm Key Pair, EC2, EIP và association; chưa apply.
 
 Đã đối chiếu code: EC2 có CPU credit mode `standard`, metadata endpoint `enabled` và HTTP tokens `required`. Bắt đầu khai báo public IPv4 cố định để kết nối tới máy chủ.
 
@@ -1879,7 +1880,18 @@ resource "aws_eip_association" "primary" {
 
 `depends_on` bổ sung dependency tường minh để việc gắn EIP chờ Internet Gateway của VPC. Khác với tham chiếu ID đã tạo dependency ngầm định, dòng này biểu diễn yêu cầu hạ tầng mà API gắn địa chỉ cần nhưng hai trường allocation/instance chưa thể hiện trực tiếp. Không thêm thuộc tính `instance` vào `aws_eip` khi đã quản lý việc gắn bằng association resource riêng này.
 
-Trong EC2, giữ `associate_public_ip_address = false`: máy không được cấp public IPv4 tự động lúc launch, sau đó được gắn Elastic IP bằng association. EIP giữ nguyên khi stop/start miễn vẫn giữ allocation và association tương ứng. `admin_cidr` là IP nguồn của người quản trị, còn EIP là địa chỉ đích của EC2; hai giá trị có vai trò riêng.
+Trong subnet, giữ `map_public_ip_on_launch = false`; không khai báo `associate_public_ip_address` trong EC2 khi quản lý EIP bằng association riêng. Cờ ở cấp instance là Optional/Computed trong AWS provider; khi gắn EIP, provider có thể đọc cờ này thành true và gây diff thay thế máy nếu code ép false. Xem cách kiểm tra và khắc phục ở mục 5.29. EIP giữ nguyên khi stop/start miễn vẫn giữ allocation và association tương ứng. `admin_cidr` là IP nguồn của người quản trị, còn EIP là địa chỉ đích của EC2; hai giá trị có vai trò riêng.
+
+Vai trò của public IP trong kiến trúc lab:
+
+- Web: DNS sẽ trả về origin tương ứng; client kết nối HTTPS tới EIP, Traefik trên máy chủ xử lý reverse proxy tới ứng dụng. Route 53 xử lý DNS, không chuyển tiếp request HTTPS.
+- Quản trị: SSH tới EIP, với TCP 22 giới hạn theo `admin_cidr`.
+- Replication liên cloud: EIP sẽ làm endpoint WireGuard phía AWS; rule UDP peer được bổ sung ở giai đoạn WireGuard và giới hạn theo public IP Azure. PostgreSQL giao tiếp qua địa chỉ tunnel theo thiết kế workload.
+- Outbound: EC2 có thể đi Internet qua EIP và IGW để tải package/image khi các quy tắc mạng đáp ứng.
+
+Thiết kế hiện dùng một host cho mỗi cloud và không có AWS ALB đứng trước EC2. Traefik vẫn đảm nhiệm reverse proxy ở trong host/K3s. Mô hình khác là public ALB chuyển tiếp tới EC2 qua private IP, quản trị bằng Session Manager và bố trí đường outbound phù hợp. Session Manager giải quyết truy cập quản trị; chuyển sang SSM không tự cung cấp endpoint web công khai hoặc endpoint UDP cho WireGuard. Nếu bỏ EIP trong kiến trúc hiện tại, cần thiết kế lại các đường truy cập đó; chỉ thêm ALB không thay thế đường UDP của WireGuard.
+
+Tham khảo mô hình thay thế: [Load balancer scheme và private targets](https://docs.aws.amazon.com/elasticloadbalancing/latest/userguide/how-elastic-load-balancing-works.html), [Session Manager không cần mở inbound SSH](https://docs.aws.amazon.com/systems-manager/latest/userguide/session-manager.html).
 
 EIP chỉ xuất hiện trên AWS sau khi apply thành công. Địa chỉ public cụ thể trong plan hiện hiển thị `(known after apply)`. EIP được cấp vẫn phát sinh phí khi máy dừng hoặc địa chỉ đang idle; stop máy không giải phóng allocation. Chi phí compute, EBS và public IPv4 được đối chiếu trước khi triển khai compute.
 
@@ -1905,6 +1917,232 @@ Plan: 4 to add, 0 to change, 0 to destroy.
 Bốn resource mới là Key Pair, EC2, EIP và EIP association. Root EBS là nested block của EC2; data source AMI chỉ đọc thông tin. Kiểm tra plan rồi tiếp tục hướng dẫn output và kiểm tra trước triển khai, chưa chạy apply ở bước này.
 
 Tham khảo: [Terraform aws_eip](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/eip), [Terraform aws_eip_association](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/eip_association), [AWS Elastic IP](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/elastic-ip-addresses-eip.html).
+
+### 5.25. Khai báo output cho inventory máy chủ
+
+Từ thư mục gốc repository, tạo file:
+
+```bash
+touch deploy/terraform/aws/outputs.tf
+```
+
+Ghi vào `deploy/terraform/aws/outputs.tf`:
+
+```hcl
+output "aws_instance_id" {
+  description = "ID of the AWS primary instance"
+  value       = aws_instance.primary.id
+}
+
+output "aws_private_ip" {
+  description = "Private IPv4 address of the AWS primary instance"
+  value       = aws_instance.primary.private_ip
+}
+
+output "aws_public_ip" {
+  description = "Elastic IPv4 address of the AWS primary instance"
+  value       = aws_eip.primary.public_ip
+}
+```
+
+Root module outputs công bố các giá trị cần đọc sau khi triển khai. `output` đặt tên đầu ra, `description` giải thích ý nghĩa và `value` tham chiếu thuộc tính của resource.
+
+| Output | Dùng để |
+|---|---|
+| `aws_instance_id` | Nhận diện máy chủ khi kiểm tra trạng thái hoặc thao tác vận hành |
+| `aws_private_ip` | Kiểm tra địa chỉ trong subnet của VPC |
+| `aws_public_ip` | Lấy Elastic IP để SSH, cấu hình DNS và endpoint peer ở các bước sau |
+
+Lấy public IP từ `aws_eip.primary.public_ip` để biểu thị đúng tài nguyên địa chỉ tĩnh đã khai báo. Output không tạo resource AWS hoặc thay đổi Security Group. Giá trị được lưu trong state khi apply; lệnh `terraform output` đọc state, không tự tạo máy chủ hoặc tra cứu thay thế việc apply.
+
+Chạy định dạng và kiểm tra:
+
+```bash
+terraform -chdir=deploy/terraform/aws fmt
+terraform -chdir=deploy/terraform/aws validate
+```
+
+Khi validate thành công:
+
+```bash
+terraform -chdir=deploy/terraform/aws plan
+```
+
+Nếu compute chưa apply, tổng kết mong đợi tiếp tục `Plan: 4 to add, 0 to change, 0 to destroy.` Plan đồng thời có phần `Changes to Outputs` với ba giá trị `(known after apply)`. Outputs không làm tăng số managed resource cần tạo.
+
+Sau lần apply compute thành công ở bước tương ứng, có thể đọc bằng `terraform -chdir=deploy/terraform/aws output` hoặc lấy riêng public IP với `terraform -chdir=deploy/terraform/aws output -raw aws_public_ip`. Chưa chạy các lệnh đọc output này để nghiệm thu lúc tài nguyên và output chưa được apply.
+
+Bước hiện tại chỉ kiểm tra plan. Chưa apply compute; tiếp theo đối chiếu quota đang dùng và chi phí dự kiến trước khi tạo tài nguyên trả phí.
+
+Tham khảo: [Terraform output values](https://developer.hashicorp.com/terraform/language/values/outputs), [terraform output đọc state](https://developer.hashicorp.com/terraform/cli/commands/output).
+
+### 5.26. Đọc instance hiện có để đối chiếu quota trước khi tạo compute
+
+Đã đọc `outputs.tf`: ba output instance ID, private IP và Elastic IP tham chiếu đúng các resource. Compute vẫn chờ bước kiểm tra trước triển khai.
+
+Quota Standard On-Demand đã đọc là 16 vCPU tại Singapore. Để đối chiếu phần đang dùng, liệt kê instance đang pending hoặc running của account tại region này, không giới hạn theo tag project:
+
+```bash
+aws ec2 describe-instances \
+  --profile default \
+  --region ap-southeast-1 \
+  --filters Name=instance-state-name,Values=pending,running \
+  --query 'Reservations[].Instances[].{Id:InstanceId,Type:InstanceType,State:State.Name,Lifecycle:InstanceLifecycle,Tenancy:Placement.Tenancy}' \
+  --output json \
+  --no-cli-pager
+```
+
+Không lọc theo tag project vì các instance của project khác cùng account/region cũng có thể dùng chung quota. Trạng thái stopped không nằm trong truy vấn này; cần kiểm tra lại quota khi khởi động thêm các máy khác.
+
+Nếu nhận `[]`, API không trả về instance pending/running trong phạm vi truy vấn tại thời điểm kiểm tra. Nếu có danh sách, đối chiếu instance type và số vCPU mặc định của từng loại, đồng thời phân biệt nhóm quota và hình thức mua. `Lifecycle` có giá trị `spot` thuộc quota Spot riêng; instance thông thường On-Demand thường không có trường này nên query hiển thị `null`. Dedicated Host có quota riêng và được nhận diện thêm qua `Tenancy`.
+
+Một `t3.medium` mới cần hai vCPU. Điều kiện đối chiếu cho quota Standard On-Demand là phần sử dụng trong nhóm tương ứng cộng hai không vượt 16. Đây là kiểm tra trước triển khai tại một thời điểm, không phải cam kết capacity tức thời hoặc thay thế kiểm tra của AWS khi launch. Nếu có instance hiện hữu chưa rõ thuộc quota nào, xác định trước khi cộng; không suy ra usage chỉ từ số lượng máy.
+
+Lệnh chỉ đọc thông tin, không start/stop hoặc tạo EC2. Chưa chạy apply compute ở bước này. Sau khi đối chiếu kết quả, tính chi phí dự kiến của EC2, EBS và public IPv4 trước lần triển khai.
+
+Tham khảo: [AWS CLI describe-instances](https://docs.aws.amazon.com/cli/latest/reference/ec2/describe-instances.html), [EC2 instance type quotas](https://docs.aws.amazon.com/ec2/latest/instancetypes/ec2-instance-quotas.html).
+
+Kết quả truy vấn đã nhận là `[]`: không có instance pending/running được trả về tại `ap-southeast-1` trong account/profile đang dùng. Chưa thấy instance hoạt động cần cộng vào phần usage trong phép đối chiếu này. Với quota Standard On-Demand đã đọc là 16 vCPU và nhu cầu hai vCPU của một `t3.medium`, có thể tiếp tục chuẩn bị triển khai theo các điều kiện đã kiểm tra; AWS vẫn xác nhận quota và capacity thực tế khi launch. Chưa tạo EC2.
+
+### 5.27. Ước tính chi phí AWS và định nghĩa cost proxy
+
+Trước khi apply compute, đối chiếu đơn giá niêm yết của các tài nguyên sẽ tạo. Giá được đọc từ AWS Price List Query API cho Singapore và trang giá public IPv4; đây là số tham khảo trước ưu đãi/credit, không phải số dư hoặc hóa đơn thực tế của account.
+
+| Hạng mục | Điều kiện | Đơn giá USD đã đọc |
+|---|---|---|
+| EC2 `t3.medium` | Linux, On-Demand, Shared tenancy, Singapore | 0.0528/giờ |
+| EBS gp3 storage | Singapore; giữ performance baseline | 0.096/GB-month theo đơn vị API |
+| Một public IPv4/EIP | Được cấp và giữ trong account, in-use hoặc idle | 0.005/giờ |
+
+Thông tin giúp tái kiểm tra Price List API:
+
+- Service code `AmazonEC2`, region giá `ap-southeast-1`, location `Asia Pacific (Singapore)`.
+- Compute SKU `USWP83ASNCY4BSQF`, usage type `APS1-BoxUsage:t3.medium`; filter instanceType `t3.medium`, operatingSystem `Linux`, tenancy `Shared`, preInstalledSw `NA`, capacitystatus `Used`, operation `RunInstances`.
+- Storage SKU `X8SY8CJFS8WV7VQN`, usage type `APS1-EBS:VolumeUsage.gp3`; filter productFamily `Storage`, volumeApiName `gp3`.
+- Query API được gọi qua endpoint `us-east-1`; region endpoint của Pricing API khác region tài nguyên đang định giá. Các giá trên được chọn bằng điều kiện Singapore.
+
+Ví dụ dùng tháng 30 ngày, 720 giờ. Giữ EBS 30 GiB và một EIP suốt tháng; chỉ thay đổi thời gian EC2 running:
+
+| Hạng mục | Bật EC2 2 giờ/ngày, 60 giờ/tháng | EC2 chạy liên tục, 720 giờ/tháng |
+|---|---:|---:|
+| Compute | 3.17 USD | 38.02 USD |
+| EBS 30 GiB | 2.88 USD | 2.88 USD |
+| EIP giữ cả tháng | 3.60 USD | 3.60 USD |
+| Tổng ba hạng mục | **9.65 USD** | **44.50 USD** |
+
+Công thức ước lượng cho trường hợp giữ đĩa và IP một tháng:
+
+```text
+AWS_cost_proxy_USD = 0.0528 × EC2_running_hours
+                   + 0.096 × 30
+                   + 0.005 × 720
+```
+
+Stop EC2 sau buổi học giảm thời gian compute running. EBS và EIP được giữ vẫn có phí; chỉ dừng instance không loại bỏ hai phần đó. Vì root volume được cấu hình giữ khi terminate, khi kết thúc lab cần quản lý cả volume còn lại. Ước lượng chưa gồm Azure, Route 53/health checks, traffic liên cloud/Internet, snapshots, thuế hoặc dịch vụ bổ sung; chưa trừ Free Tier, credit hay ưu đãi account. Cấu hình Standard CPU credits không sử dụng surplus CPU credit billing của Unlimited; gp3 hiện chưa khai báo performance vượt baseline.
+
+Trong yêu cầu đo đạc của đồ án, **simple cost proxy** là thước đo đại diện gần đúng cho chi phí, không phải network proxy. Có thể dùng tổng VM-hours hoặc một mô hình USD theo giờ chạy và đơn giá. Đây là phép tính phục vụ so sánh các phương án, với phạm vi và giả định được ghi rõ.
+
+Ví dụ cửa sổ đo một giờ: baseline chỉ một VM chạy tương ứng một VM-hour; hệ hai cloud cùng chạy một giờ tương ứng hai VM-hours. VM-hours chưa phản ánh chênh lệch đơn giá/cấu hình giữa cloud, nên phương án báo cáo phù hợp hơn cho project là dùng giờ chạy thực tế nhân đơn giá của từng cloud rồi cộng phần disk/public IP trong cùng cửa sổ đo. Trong giai đoạn lab có thể stop máy sau buổi học; trong cửa sổ đo warm standby, cả primary và standby cần running để so sánh đúng chế độ vận hành.
+
+Ghi nhận cost proxy bằng cùng phạm vi tài nguyên, thời gian đo, đơn vị và bảng giá cho baseline và hệ multi-cloud. Báo cáo kết quả ước tính riêng với chi phí Billing thực tế nếu thu thập được; chưa coi các ví dụ trên là số đo thực nghiệm đã hoàn thành. Hướng dẫn ghi dữ liệu thí nghiệm được bổ sung khi bắt đầu giai đoạn đo đạc.
+
+Nguồn: [AWS Price List Query API](https://docs.aws.amazon.com/awsaccountbilling/latest/aboutv2/using-price-list-query-api.html), [EC2 On-Demand](https://aws.amazon.com/ec2/pricing/on-demand/), [EBS pricing và performance baseline](https://aws.amazon.com/ebs/pricing/), [public IPv4 pricing](https://aws.amazon.com/vpc/pricing/), [billing theo trạng thái EC2](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/ec2-instance-lifecycle.html).
+
+### 5.28. Lưu plan và triển khai AWS compute
+
+Đã kiểm tra cấu hình hiện tại: `fmt -check` và `validate` đạt; plan đề xuất đúng bốn thao tác create gồm Key Pair, EC2, Elastic IP và association, không thay đổi hoặc xóa tài nguyên hiện có. Ba output instance ID/private IP/public IP hiển thị `(known after apply)`. Việc kiểm tra này chưa tạo compute.
+
+Trước khi triển khai, sao lưu state hiện có ra ngoài repository. Trong Git Bash tại thư mục gốc project:
+
+```bash
+mkdir -p ~/.mcf-state-backups/aws
+cp deploy/terraform/aws/terraform.tfstate \
+  ~/.mcf-state-backups/aws/before-compute-$(date -u +%Y%m%dT%H%M%SZ).tfstate
+```
+
+Đây là bản sao local có timestamp, cần giữ trong vùng lưu trữ được bảo vệ của người quản trị; không đưa vào Git. Nó hỗ trợ bảo quản state, không phải backup dữ liệu PostgreSQL.
+
+Lưu plan mới:
+
+```bash
+terraform -chdir=deploy/terraform/aws plan -out=compute.tfplan
+```
+
+Đọc lại kết quả, xác nhận:
+
+- `Plan: 4 to add, 0 to change, 0 to destroy.`
+- AMI `ami-0403d346e3210afd6`, instance type `t3.medium`, subnet hiện có tại `ap-southeast-1c`.
+- Key name `mcf-lab`; đúng Security Group của project.
+- Root gp3 30 GiB, encrypted true, delete_on_termination false.
+- CPU credits standard, metadata tokens required và subnet tắt tự cấp public IPv4; không ép cờ `associate_public_ip_address` trên instance.
+- Có EIP cùng association gắn vào instance và ba outputs dự kiến.
+
+Khi saved plan đúng, người quản trị triển khai:
+
+```bash
+terraform -chdir=deploy/terraform/aws apply compute.tfplan
+```
+
+Saved plan mode thực hiện kế hoạch đã lưu, không hỏi nhập `yes` lần nữa. Lệnh này tạo tài nguyên thật, bắt đầu phát sinh chi phí EC2/EBS/public IPv4 theo trạng thái tài nguyên; xem ước tính ở mục 5.27. Không dùng `network.tfplan` hoặc `security.tfplan` của những lần triển khai trước.
+
+Kết quả thành công mong đợi:
+
+```text
+Apply complete! Resources: 4 added, 0 changed, 0 destroyed.
+```
+
+Terraform sẽ hiển thị ba output với giá trị thực. Sau đó chạy plan mới để kiểm tra:
+
+```bash
+terraform -chdir=deploy/terraform/aws plan
+```
+
+Kết quả mong đợi là `No changes. Your infrastructure matches the configuration.` Có thể đọc lại output từ state bằng `terraform -chdir=deploy/terraform/aws output` sau khi apply thành công.
+
+Nếu apply lỗi giữa chừng, giữ nguyên state và gửi/đọc lỗi để xử lý; tài nguyên đã tạo có thể vẫn tồn tại và phát sinh chi phí. Không xóa state hoặc tạo bản sao tài nguyên bằng tay để bỏ qua lỗi. Sau khi xử lý, lập plan mới theo trạng thái đã ghi nhận, không cố dùng lại saved plan đã thực hiện một phần.
+
+Chưa đánh dấu triển khai compute hoàn thành cho tới khi có kết quả thực tế. Kết nối SSH, status checks và kiểm tra Ubuntu được hướng dẫn sau khi tạo thành công; Ubuntu running chưa phải nghiệm thu K3s, PostgreSQL hoặc ứng dụng cloud.
+
+Tham khảo: [Terraform saved plan apply](https://developer.hashicorp.com/terraform/cli/commands/apply#saved-plan-mode), [Terraform plan](https://developer.hashicorp.com/terraform/cli/commands/plan).
+
+Kết quả thực hành đã nhận: apply thành công bốn resource và có đủ ba output. Plan đầu tiên sau apply với cờ public IP cũ đề xuất thay thế EC2 và EIP association. Đã xử lý theo mục 5.29 và xác nhận plan No changes; không thực hiện kế hoạch thay thế đó.
+
+### 5.29. Xử lý replacement diff sau khi gắn EIP
+
+Triệu chứng đã quan sát với AWS provider 6.72.0:
+
+```text
+associate_public_ip_address = true -> false # forces replacement
+Plan: 2 to add, 0 to change, 2 to destroy.
+```
+
+Sau khi EIP được gắn vào network interface, provider đọc trạng thái có public IP thành true. Nếu instance cấu hình `associate_public_ip_address = false`, Terraform đề xuất thay thế instance; EIP association cũng phải thay theo instance ID. Đây không phải yêu cầu đổi AMI, AZ hoặc root volume trong trường hợp đã kiểm tra.
+
+Trong `compute.tf`, xóa duy nhất dòng sau khỏi `aws_instance.primary`:
+
+```hcl
+associate_public_ip_address = false
+```
+
+Giữ `map_public_ip_on_launch = false` trong subnet và giữ hai resource EIP/association. Như vậy subnet tiếp tục điều khiển mặc định public IP khi launch, EIP association quản lý địa chỉ tĩnh, còn provider đọc thuộc tính public IP của instance. Không sửa state bằng tay hoặc đổi sang một giá trị khác chỉ để ép plan.
+
+Chạy:
+
+```bash
+terraform -chdir=deploy/terraform/aws fmt
+terraform -chdir=deploy/terraform/aws validate
+terraform -chdir=deploy/terraform/aws plan
+```
+
+Kết quả mong đợi là `No changes. Your infrastructure matches the configuration.` Khi không còn thay đổi, không cần apply; instance và EIP hiện có được giữ nguyên.
+
+Cách sửa bỏ cờ đã được kiểm tra trên bản sao cấu hình và state trong thư mục tạm, dùng provider đã khóa và chỉ chạy plan đọc AWS. Kết quả là exit code 0, No changes. Không chỉnh file Terraform hoặc state gốc trong phép thử; người quản trị thực hiện sửa code rồi kiểm tra lại trên root module chính.
+
+Các dòng `Apply complete! ...` và `No changes. ...` trong tài liệu là kết quả mong đợi, không phải lệnh terminal. Chỉ chạy các dòng lệnh trong block bash.
+
+Đã xác nhận trên cấu hình chính: dòng `associate_public_ip_address` đã được bỏ, subnet vẫn có `map_public_ip_on_launch = false` và người quản trị xác nhận plan báo No changes. Bước kiểm tra sau apply đã đạt; chưa nghiệm thu SSH hoặc workload cloud.
+
+Tham khảo: [provider issue về EIP và replacement diff](https://github.com/hashicorp/terraform-provider-aws/issues/47100), [schema và logic đọc của AWS provider 6.72.0](https://github.com/hashicorp/terraform-provider-aws/blob/v6.72.0/internal/service/ec2/ec2_instance.go), [AWS subnet public IP defaults](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/using-instance-addressing.html).
 
 ## 6. Theo dõi tiến độ
 
@@ -1943,7 +2181,14 @@ Tham khảo: [Terraform aws_eip](https://registry.terraform.io/providers/hashico
 - [x] Khai báo EC2 với các tham chiếu AMI/subnet/SG/Key Pair và kiểm tra plan hai resource mới; chưa apply.
 - [x] Cấu hình root EBS gp3 30 GiB, mã hóa và giữ đĩa khi terminate; kiểm tra plan, chưa apply.
 - [x] Khai báo CPU credit mode standard và yêu cầu IMDSv2; đã đối chiếu code, chưa apply.
-- [ ] Khai báo Elastic IP và association, kiểm tra plan bốn resource mới; chưa apply.
+- [x] Khai báo Elastic IP và association; đã đối chiếu code, chưa apply.
+- [x] Khai báo ba output và đối chiếu các tham chiếu trong code.
+- [x] Xác nhận plan compute bốn resource mới cùng ba output chưa có giá trị; chưa apply.
+- [x] Truy vấn instance pending/running tại Singapore trả `[]`; đối chiếu nhu cầu hai vCPU với quota Standard On-Demand 16 vCPU.
+- [x] Đối chiếu giá AWS, lập ví dụ chi phí compute/EBS/EIP và định nghĩa cost proxy; chưa phải số đo Billing hoặc thí nghiệm.
+- [x] Apply compute thành công bốn resource mới; có đủ ba output với giá trị thực.
+- [x] Bỏ cờ public IP ở cấp instance theo mục 5.29 và xác nhận plan của root module chính báo No changes.
+- [ ] Nghiệm thu status checks, SSH và Ubuntu trên máy chủ AWS.
 - [ ] Khai báo mạng và quy tắc truy cập của hai môi trường.
 - [ ] Khai báo compute, địa chỉ IP và đĩa.
 - [ ] Kiểm tra plan rồi triển khai các lớp hạ tầng.

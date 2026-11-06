@@ -20,11 +20,11 @@ The current implementation runs a complete local environment: two FastAPI instan
 | Published image verification on a separate CI runner | Validated |
 | AWS VPC, subnet, Internet Gateway, and public routing with Terraform | Deployed and validated |
 | AWS host Security Group and SSH/HTTP/HTTPS rules | Deployed and validated |
-| AWS EC2 and SSH Key Pair configuration | Defined; provisioning pending |
-| AWS Elastic IP and Azure infrastructure | Planned |
+| AWS EC2, SSH Key Pair, and Elastic IP | Deployed; SSH validation pending |
+| Azure infrastructure | Planned |
 | Cloud application deployment and failover | Planned |
 
-The AWS Terraform root module provisions networking and host access rules in Singapore, with ten managed resources recorded in state. The subnet AZ and Ubuntu AMI are pinned. EC2 and SSH Key Pair configuration is prepared; compute provisioning, Elastic IP, Azure infrastructure, and cloud workload deployment remain pending. The [roadmap](docs/ROADMAP.md) describes the remaining milestones.
+The AWS Terraform root module provisions networking, host access rules, EC2, SSH Key Pair, and Elastic IP in Singapore. The subnet AZ and Ubuntu AMI are pinned. Compute creation succeeded and the post-apply plan reports no changes; SSH acceptance is pending. Azure infrastructure and cloud workload deployment remain pending. The [roadmap](docs/ROADMAP.md) describes the remaining milestones.
 
 ## Features
 
@@ -99,6 +99,7 @@ The [accepted CI run](https://github.com/todicode/multi-cloud-failover/actions/r
 
 ## Documentation
 
+- [Project requirements and acceptance criteria](docs/PROJECT_REQUIREMENTS.md)
 - [Stage 1: local application and database instructions](docs/instruction/giaidoan1_ungdung_database_local.md)
 - [Stage 2: application container packaging](docs/instruction/giaidoan2_docker_hoa_ungdung.md)
 - [Stage 3: CI and container registry instructions](docs/instruction/giaidoan3_ci_va_container_registry.md)
