@@ -34,7 +34,7 @@ The project progresses from local recovery validation to deployment and measurem
 
 ## In progress: cloud infrastructure
 
-The [Stage 4 guide](instruction/giaidoan4_ha_tang_aws_azure_terraform.md) covers operator tooling, Azure fundamentals and account checks, AWS authentication, and incremental Terraform implementation. The initial AWS network has been deployed in Singapore: VPC, subnet, Internet Gateway, public route table, and subnet association. Acceptance confirmed five managed resources and a subsequent plan with no changes. Compute and Azure infrastructure remain to be implemented.
+The [Stage 4 guide](instruction/giaidoan4_ha_tang_aws_azure_terraform.md) covers operator tooling, Azure fundamentals and account checks, AWS authentication, and incremental Terraform implementation. AWS networking and the host Security Group with its outbound/SSH/HTTP/HTTPS rules have been deployed in Singapore, with ten managed resources recorded in state. The subnet AZ and Ubuntu AMI are pinned. EC2 and SSH Key Pair configuration is prepared, including encrypted root EBS, Standard CPU credits, and IMDSv2. Compute provisioning, Elastic IP configuration, and Azure infrastructure remain pending.
 
 The implementation sequence completes the required Azure background, then builds and validates AWS infrastructure with Terraform before Azure. Infrastructure code stays in this repository under `deploy/terraform/`. AWS uses the `deploy/terraform/aws/` root module with a local backend for the single-operator lab; Azure will use a separate root module and state. State and saved plans are excluded from version control; the provider lock file is committed.
 

@@ -896,6 +896,7 @@ Giữ nguyên block VPC trong `deploy/terraform/aws/network.tf`, thêm block sau
 resource "aws_subnet" "public" {
   vpc_id                  = aws_vpc.primary.id
   cidr_block              = "10.29.1.0/24"
+  availability_zone       = "ap-southeast-1c"
   map_public_ip_on_launch = false
 
   tags = {
@@ -910,13 +911,14 @@ resource "aws_subnet" "public" {
 | `aws_subnet.public` | Địa chỉ resource subnet trong Terraform |
 | `vpc_id = aws_vpc.primary.id` | Tham chiếu ID của VPC trong cùng root module |
 | `cidr_block` | Dải subnet nằm trong CIDR `10.29.0.0/16` của VPC |
+| `availability_zone` | Cố định subnet tại `ap-southeast-1c` trong Singapore |
 | `map_public_ip_on_launch = false` | Subnet không tự cấp public IPv4 cho instance mới; Elastic IP của máy chủ sẽ được cấu hình riêng |
 
 `aws_vpc.primary.id` là biểu thức tham chiếu, không đặt trong dấu nháy. Terraform suy ra subnet phụ thuộc VPC từ biểu thức này: khi apply cấu hình mới, tạo VPC, nhận VPC ID rồi dùng ID đó để tạo subnet. Không cần điền sẵn `vpc-...`, không cần tạo VPC thủ công và không cần thêm `depends_on` cho quan hệ đã thể hiện bằng tham chiếu.
 
 VPC ID chưa biết khi plan không ngăn Terraform lập kế hoạch tạo subnet. Trong plan, `vpc_id = (known after apply)` là kết quả bình thường.
 
-Mỗi subnet AWS nằm trong một Availability Zone. Đoạn cấu hình này chưa chỉ định AZ nên AWS chọn một AZ khi tạo subnet; subnet không trải trên nhiều AZ. Khả năng cấp loại EC2 trong AZ thực tế cần kiểm tra trước bước máy chủ.
+Mỗi subnet AWS nằm trong một Availability Zone. Khai báo `availability_zone = "ap-southeast-1c"` để vị trí được xác định rõ trong code khi tái dựng. Nếu bỏ thuộc tính này, AWS chọn một AZ khi tạo subnet; subnet không trải trên nhiều AZ. Khả năng cấp loại EC2 trong AZ đã chọn cần kiểm tra trước bước máy chủ.
 
 Tên `public` và tag `mcf-aws-public-subnet` diễn tả mục đích sử dụng. Subnet chỉ trở thành public khi route table hiệu lực có route trực tiếp đến Internet Gateway. Bước này chưa khai báo gateway và route đó. Cờ tự cấp public IP cũng không quyết định subnet là public hay private.
 
@@ -946,7 +948,7 @@ Plan: 2 to add, 0 to change, 0 to destroy.
 
 Tham khảo: [aws_subnet](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/subnet), [Terraform references và dependency](https://developer.hashicorp.com/terraform/language/expressions/references), [AWS subnet và phân loại theo routing](https://docs.aws.amazon.com/vpc/latest/userguide/configure-subnets.html).
 
-Đã đối chiếu plan gồm `aws_vpc.primary` và `aws_subnet.public`: VPC CIDR `10.29.0.0/16`, subnet CIDR `10.29.1.0/24`, region `ap-southeast-1`, subnet không tự cấp public IPv4. `vpc_id` và Availability Zone của subnet hiển thị `(known after apply)` đúng với cấu hình. Tổng kết `Plan: 2 to add, 0 to change, 0 to destroy.` Chưa chạy apply và chưa nghiệm thu tài nguyên trên AWS.
+Đã đối chiếu plan gồm `aws_vpc.primary` và `aws_subnet.public`: VPC CIDR `10.29.0.0/16`, subnet CIDR `10.29.1.0/24`, region `ap-southeast-1`, subnet không tự cấp public IPv4. `vpc_id` hiển thị `(known after apply)` vì VPC chưa được tạo. Tổng kết `Plan: 2 to add, 0 to change, 0 to destroy.` Tại thời điểm kiểm tra này chưa chạy apply; AZ được cố định rõ trong cấu hình hiện tại và kiểm tra lại ở mục 5.17.
 
 ### 5.7. Khai báo Internet Gateway
 
@@ -1448,6 +1450,462 @@ Chỉ đánh dấu bước apply thành công theo kết quả thực hành. N�
 
 Tham khảo: [Terraform saved plan mode](https://developer.hashicorp.com/terraform/cli/commands/apply#saved-plan-mode).
 
+Đã đối chiếu state local sau bước triển khai: có đủ mười resource, bao gồm Security Group và bốn rule. AZ của subnet trong state là `ap-southeast-1c`, CIDR `10.29.1.0/24`. Plan sau triển khai được xác nhận No changes khi kiểm tra cấu hình cố định AZ ở mục 5.17.
+
+### 5.16. Kiểm tra quota và EC2 offering trước khi khai báo máy chủ
+
+Máy chủ dự kiến dùng `t3.medium` On-Demand, x86-64, hai vCPU và 4 GiB RAM để chạy K3s, PostgreSQL và ứng dụng trong lab. Đây là cấu hình ứng viên; khả năng chạy workload và số đo hiệu năng cần được kiểm tra sau khi triển khai. AMI, EBS, CPU credit mode và chi phí được đối chiếu trước bước tạo máy chủ.
+
+Kiểm tra quota Standard On-Demand tại Singapore bằng Git Bash:
+
+```bash
+aws service-quotas get-service-quota \
+  --profile default \
+  --region ap-southeast-1 \
+  --service-code ec2 \
+  --quota-code L-1216C47A \
+  --query 'Quota.{Name:QuotaName,Value:Value}' \
+  --output table \
+  --no-cli-pager
+```
+
+Quota `L-1216C47A` là Running On-Demand Standard (A, C, D, H, I, M, R, T, Z) instances, tính bằng vCPU theo region. `Value` là giới hạn áp dụng, không phải số vCPU còn trống hoặc số máy. Một `t3.medium` cần hai vCPU trong quota này; phải trừ phần quota đang dùng bởi các instance Standard On-Demand khác. Nếu gặp AccessDenied khi đọc quota, đây là lỗi quyền truy vấn, không có nghĩa quota bằng không.
+
+Kiểm tra những AZ trong region có offering `t3.medium`:
+
+```bash
+aws ec2 describe-instance-type-offerings \
+  --profile default \
+  --region ap-southeast-1 \
+  --location-type availability-zone \
+  --filters Name=instance-type,Values=t3.medium \
+  --query 'InstanceTypeOfferings[].{Type:InstanceType,AZ:Location}' \
+  --output table \
+  --no-cli-pager
+```
+
+Đối chiếu với AZ của subnet trong cấu hình và state. Cấu hình hiện cố định `ap-southeast-1c`, nên cần có offering tại AZ đó trong account đang dùng. Khi tái dựng hoặc chủ động thay đổi cấu hình AZ, kiểm tra lại offering và đọc vị trí subnet bằng:
+
+```bash
+terraform -chdir=deploy/terraform/aws state show aws_subnet.public
+```
+
+EC2 đặt trong subnet sẽ nằm cùng AZ với subnet đó. Offering cho biết loại máy được cung cấp tại AZ, không bảo đảm capacity tức thời hoặc toàn bộ điều kiện account để launch. Hai lệnh AWS phía trên chỉ đọc thông tin, không tạo instance và không thay đổi quota. Chưa chạy lệnh tạo máy chủ hoặc viết resource EC2 ở bước này.
+
+Tham khảo: [thông số EC2 general purpose](https://docs.aws.amazon.com/ec2/latest/instancetypes/gp.html), [EC2 On-Demand quotas](https://docs.aws.amazon.com/ec2/latest/instancetypes/ec2-instance-quotas.html), [AWS CLI quota example và quota code](https://docs.aws.amazon.com/cli/latest/userguide/cli_service-quotas_code_examples.html), [describe-instance-type-offerings](https://docs.aws.amazon.com/cli/latest/reference/ec2/describe-instance-type-offerings.html).
+
+Kết quả kiểm tra đã nhận tại `ap-southeast-1`:
+
+| Hạng mục | Kết quả |
+|---|---|
+| Standard On-Demand quota `L-1216C47A` | 16 vCPU |
+| Offering `t3.medium` | `ap-southeast-1a`, `ap-southeast-1b`, `ap-southeast-1c` |
+| AZ subnet theo state | `ap-southeast-1c`, có offering phù hợp |
+
+Giới hạn 16 vCPU lớn hơn nhu cầu hai vCPU của một `t3.medium`, nhưng chưa đối chiếu phần quota đang dùng bởi các instance khác. Không diễn giải kết quả này thành còn trống 16 vCPU hoặc bảo đảm launch thành công. Chưa triển khai EC2 ở bước kiểm tra này.
+
+### 5.17. Cố định AZ khớp subnet đã triển khai
+
+Subnet hiện có nằm tại `ap-southeast-1c`. Dòng cấu hình được bổ sung vào resource `aws_subnet.public` trong `network.tf`:
+
+```hcl
+availability_zone = "ap-southeast-1c"
+```
+
+Khai báo rõ AZ làm cho cấu hình tái dựng xác định vị trí subnet. Với subnet đang tồn tại đúng AZ này, thay đổi code không yêu cầu tạo lại subnet. Sau khi thêm, kiểm tra:
+
+```bash
+terraform -chdir=deploy/terraform/aws fmt -check
+terraform -chdir=deploy/terraform/aws validate
+terraform -chdir=deploy/terraform/aws plan
+```
+
+Kết quả plan mong đợi là `No changes. Your infrastructure matches the configuration.` Không cần apply khi plan không có thay đổi. Nếu chọn một AZ khác với subnet hiện có, Terraform có thể đề xuất thay thế subnet và tài nguyên phụ thuộc; đọc kỹ plan trước khi thực hiện.
+
+Tham khảo: [AWS CreateSubnet — AZ mặc định](https://docs.aws.amazon.com/AWSEC2/latest/APIReference/API_CreateSubnet.html), [Terraform aws_subnet](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/subnet).
+
+Kết quả đã kiểm tra: `fmt -check` và `validate` đạt; `plan -detailed-exitcode` trả về exit code 0 với thông báo No changes. Không thực hiện apply cho thay đổi khai báo AZ này.
+
+### 5.18. Tra cứu AMI Ubuntu bằng data source
+
+Từ thư mục gốc repository, tạo file tra cứu dữ liệu AWS:
+
+```bash
+touch deploy/terraform/aws/data.tf
+```
+
+Ghi vào `deploy/terraform/aws/data.tf`:
+
+```hcl
+data "aws_ami" "ubuntu" {
+  most_recent = true
+  owners      = ["099720109477"]
+
+  filter {
+    name   = "name"
+    values = ["ubuntu/images/hvm-ssd-gp3/ubuntu-noble-24.04-amd64-server-*"]
+  }
+
+  filter {
+    name   = "architecture"
+    values = ["x86_64"]
+  }
+
+  filter {
+    name   = "virtualization-type"
+    values = ["hvm"]
+  }
+}
+```
+
+`data` đọc thông tin đã có từ provider. `aws_ami` tìm Amazon Machine Image; `ubuntu` là tên cục bộ, cho địa chỉ data source `data.aws_ami.ubuntu`. Khác với managed resource, bước tra cứu này không tạo hoặc sao chép AMI.
+
+| Cấu hình | Ý nghĩa |
+|---|---|
+| `owners` | Chỉ tìm AMI của Canonical, owner ID `099720109477` trong AWS partition đang dùng |
+| Name filter | Giới hạn Ubuntu Server 24.04 Noble, AMD64, HVM và dòng image EBS gp3 |
+| Architecture filter | Xác nhận `x86_64`, phù hợp instance T3 và container image Linux AMD64 |
+| Virtualization filter | Chọn HVM |
+| `most_recent = true` | Khi có nhiều AMI khớp, lấy bản mới nhất trong tập đã lọc |
+
+Owner ID này là định danh công khai của nhà phát hành Canonical, không phải account ID của người triển khai. Các filter được áp dụng đồng thời, và data source sử dụng region `ap-southeast-1` của AWS provider. Tên AMI dùng `amd64`, còn trường architecture của AWS dùng `x86_64` cho cùng kiến trúc.
+
+`most_recent` vẫn bị giới hạn bởi filter Ubuntu 24.04; không tự đổi sang bản Ubuntu khác. Kết quả AMI có thể thay đổi khi có bản phát hành mới khớp filter. Trước khi dùng cho máy chủ chứa dữ liệu, chốt cách giữ AMI đã chọn để kiểm soát việc thay thế máy chủ trong các lần cập nhật sau.
+
+Cách lấy ID khi cấu hình máy chủ ở bước sau là `data.aws_ami.ubuntu.id`. Bước này chỉ khai báo tra cứu, chưa khai báo EC2.
+
+Định dạng và kiểm tra:
+
+```bash
+terraform -chdir=deploy/terraform/aws fmt
+terraform -chdir=deploy/terraform/aws validate
+```
+
+Khi validate thành công, chạy:
+
+```bash
+terraform -chdir=deploy/terraform/aws plan
+```
+
+Terraform cần quyền `ec2:DescribeImages` để đọc kết quả. Khi tra cứu thành công, log thường có dòng `data.aws_ami.ubuntu: Read complete ... [id=ami-...]`. Với mười managed resource hiện tại đã khớp cấu hình và chưa có output mới, plan mong đợi tiếp tục báo `No changes. Your infrastructure matches the configuration.` Data source không được tính thành một resource AWS cần tạo mới. Nếu chưa thấy ID hoặc cần kiểm tra thêm thuộc tính, hướng dẫn đọc kết quả được bổ sung ở bước tương ứng.
+
+Tham khảo: [Canonical — tìm và xác minh Ubuntu AMI](https://ubuntu.com/aws/docs/aws-how-to/instances/find-ubuntu-images/), [Terraform aws_ami](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/data-sources/ami), [Terraform data sources](https://developer.hashicorp.com/terraform/language/data-sources).
+
+Đã đối chiếu nội dung `data.tf` và log tra cứu thành công: `data.aws_ami.ubuntu` trả về `ami-0403d346e3210afd6` tại Singapore theo các filter trên. AMI ID này là kết quả tại thời điểm kiểm tra, không phải giá trị mặc định cố định cho mọi lần dựng lại. Các dòng `Refreshing state` tiếp theo biểu thị đọc tài nguyên hiện có, không phải tạo lại chúng. Phần tổng kết cuối plan chưa có trong log được cung cấp cho bước này.
+
+### 5.19. Khai báo EC2 Key Pair từ public key local
+
+Tái sử dụng cặp key ED25519 đã chuẩn bị tại mục 4.8. Đã xác nhận hai file local tồn tại và đọc fingerprint public key thành công; không đọc nội dung private key. Người tái dựng project cần chuẩn bị cặp key của mình theo hướng dẫn, không dùng private key của người khác.
+
+Từ thư mục gốc repository, tạo file cấu hình compute:
+
+```bash
+touch deploy/terraform/aws/compute.tf
+```
+
+Ghi vào `deploy/terraform/aws/compute.tf`:
+
+```hcl
+resource "aws_key_pair" "operator" {
+  key_name   = "mcf-lab"
+  public_key = file(pathexpand("~/.ssh/mcf-lab.pub"))
+
+  tags = {
+    Name    = "mcf-lab"
+    Project = "multi-cloud-failover"
+  }
+}
+```
+
+`aws_key_pair.operator` đăng ký public key có sẵn lên EC2 tại region của provider khi apply. Resource này không sinh cặp key mới hoặc tải private key về. `key_name` là tên đăng ký trên AWS, còn `operator` là tên cục bộ của resource trong Terraform.
+
+Biểu thức `file(pathexpand("~/.ssh/mcf-lab.pub"))` được đọc từ trong ra ngoài:
+
+1. `pathexpand` thay `~` bằng thư mục home của người đang chạy Terraform.
+2. `file` đọc nội dung public key ở đường dẫn đó.
+3. `public_key` nhận nội dung key để gửi tới AWS khi apply.
+
+Public key phải tồn tại trên máy chạy Terraform ngay khi đọc cấu hình. Nếu tên hoặc vị trí key khác, điều chỉnh đường dẫn tới đúng file `.pub`. Private key `~/.ssh/mcf-lab` giữ ngoài repository và không được tham chiếu trong resource.
+
+Khi khai báo EC2 ở bước sau, dùng `aws_key_pair.operator.key_name` để chọn key. Khi khởi tạo Linux instance, public key tương ứng được đặt vào `authorized_keys` của tài khoản đăng nhập; SSH client sử dụng private key local để chứng minh danh tính. Security Group và SSH key có vai trò riêng: rule cho phép đường kết nối TCP 22 từ nguồn đã chọn, còn key dùng xác thực đăng nhập.
+
+Định dạng và kiểm tra:
+
+```bash
+terraform -chdir=deploy/terraform/aws fmt
+terraform -chdir=deploy/terraform/aws validate
+```
+
+Khi validate thành công:
+
+```bash
+terraform -chdir=deploy/terraform/aws plan
+```
+
+Với mười managed resource hiện có đã khớp cấu hình, kết quả mong đợi là:
+
+```text
+# aws_key_pair.operator will be created
+...
+Plan: 1 to add, 0 to change, 0 to destroy.
+```
+
+Data source AMI tiếp tục chỉ đọc thông tin. Bước này chưa apply Key Pair và chưa tạo EC2; kết quả plan không phải nghiệm thu kết nối SSH.
+
+Tham khảo: [Terraform aws_key_pair](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/key_pair), [Terraform pathexpand](https://developer.hashicorp.com/terraform/language/functions/pathexpand), [AWS EC2 key pairs](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/ec2-key-pairs.html).
+
+### 5.20. Cố định AMI đã chọn trước khi khai báo EC2
+
+Sau bước tra cứu, dùng AMI ID đã xác nhận thay cho việc luôn chọn bản phát hành mới nhất. AMI đã đọc tại Singapore là `ami-0403d346e3210afd6`. ID AMI là thông tin image của region, không phải credential của người triển khai.
+
+Trong `deploy/terraform/aws/data.tf`, bỏ dòng:
+
+```hcl
+most_recent = true
+```
+
+Thêm filter bên trong block `data "aws_ami" "ubuntu"`, giữ nguyên `owners` và các filter name, architecture, virtualization-type:
+
+```hcl
+filter {
+  name   = "image-id"
+  values = ["ami-0403d346e3210afd6"]
+}
+```
+
+Các filter được kết hợp đồng thời: phải đúng ID đã chọn, do Canonical phát hành, tên Ubuntu Server 24.04 AMD64, architecture x86-64 và virtualization HVM. Data source vẫn đọc thông tin AMI và cung cấp `data.aws_ami.ubuntu.id` để resource máy chủ tham chiếu.
+
+Sau thay đổi, việc Canonical phát hành AMI mới cùng dòng không làm kết quả tra cứu tự đổi sang ID khác. Đổi AMI về sau là thay đổi có chủ đích trong code và phải xem tác động đến máy chủ trong plan, đặc biệt khi máy chủ đã có dữ liệu PostgreSQL. Pin AMI không ngăn cập nhật package bên trong hệ điều hành.
+
+Người tái dựng ở region khác cần tra cứu lại AMI và cập nhật đồng bộ region/filter/ID; không dùng một ID bất kỳ để bỏ qua kiểm tra nhà phát hành.
+
+Chạy định dạng và kiểm tra từ thư mục gốc repository:
+
+```bash
+terraform -chdir=deploy/terraform/aws fmt
+terraform -chdir=deploy/terraform/aws validate
+```
+
+Khi validate thành công:
+
+```bash
+terraform -chdir=deploy/terraform/aws plan
+```
+
+Kiểm tra data source tiếp tục trả về `ami-0403d346e3210afd6`. Nếu Key Pair vừa khai báo chưa apply, tổng kết vẫn mong đợi `Plan: 1 to add, 0 to change, 0 to destroy.`, resource tạo mới là `aws_key_pair.operator`. Filter AMI không tạo thêm resource AWS; chưa khai báo hoặc apply EC2 trong bước này.
+
+Tham khảo: [Terraform aws_ami — kết hợp filter và chọn một AMI](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/data-sources/ami).
+
+### 5.21. Khai báo EC2 và các tham chiếu hạ tầng
+
+Đã đối chiếu `data.tf`: bỏ `most_recent`, thêm image-id filter đúng `ami-0403d346e3210afd6` và giữ các filter xác minh image. Bắt đầu khai báo EC2 ở mức các tham chiếu chính; chưa apply cho tới khi hoàn thiện cấu hình đĩa, thiết lập máy chủ, địa chỉ public và kiểm tra trước triển khai.
+
+Giữ resource Key Pair hiện có trong `deploy/terraform/aws/compute.tf`, thêm block bên dưới:
+
+```hcl
+resource "aws_instance" "primary" {
+  ami                         = data.aws_ami.ubuntu.id
+  instance_type               = "t3.medium"
+  subnet_id                   = aws_subnet.public.id
+  vpc_security_group_ids      = [aws_security_group.primary.id]
+  key_name                    = aws_key_pair.operator.key_name
+  associate_public_ip_address = false
+
+  tags = {
+    Name    = "mcf-aws-primary"
+    Project = "multi-cloud-failover"
+  }
+}
+```
+
+| Thuộc tính | Vai trò |
+|---|---|
+| `ami` | ID từ data source AMI đã cố định và kiểm tra filter |
+| `instance_type` | Loại máy dự kiến `t3.medium`, hai vCPU và 4 GiB RAM |
+| `subnet_id` | Đặt EC2 vào subnet public của project, tại AZ `ap-southeast-1c` |
+| `vpc_security_group_ids` | Gắn danh sách Security Group cho network interface của máy chủ |
+| `key_name` | Chọn Key Pair đăng ký public key của người quản trị |
+| `associate_public_ip_address` | Không tự cấp public IPv4; Elastic IP được khai báo riêng trước khi triển khai |
+
+`vpc_security_group_ids` nhận một tập ID, nên viết trong dấu ngoặc vuông dù hiện chỉ có một nhóm. Tham chiếu `aws_security_group.primary.id` gắn các rule SSH/HTTP/HTTPS/outbound với máy chủ khi tạo. Tên tag `mcf-aws-primary` là tên hiển thị, chưa cấu hình vai trò PostgreSQL primary.
+
+Không cần ghi lại AZ trong EC2 vì đã chỉ định subnet ở `ap-southeast-1c`. Các tham chiếu giúp Terraform suy ra dependencies với data source AMI, subnet, Security Group và Key Pair. Private IPv4 được AWS chọn trong subnet khi tạo nếu chưa chỉ định địa chỉ cụ thể.
+
+Từ thư mục gốc repository, chạy:
+
+```bash
+terraform -chdir=deploy/terraform/aws fmt
+terraform -chdir=deploy/terraform/aws validate
+```
+
+Khi validate thành công:
+
+```bash
+terraform -chdir=deploy/terraform/aws plan
+```
+
+Nếu Key Pair vẫn chưa apply và chưa có drift ở các resource đã triển khai, kết quả mong đợi:
+
+```text
+# aws_instance.primary will be created
+# aws_key_pair.operator will be created
+...
+Plan: 2 to add, 0 to change, 0 to destroy.
+```
+
+Kiểm tra AMI đúng ID đã cố định, instance type `t3.medium`, subnet/SG đúng tài nguyên hiện có, key name `mcf-lab`, public IP tự cấp bằng `false`. Nếu plan hiển thị root block device hoặc các mặc định khác, đó chưa phải cấu hình compute hoàn chỉnh để triển khai: các thiết lập được bổ sung từng phần ở bước tiếp theo. Không chạy apply tại bước này.
+
+Tham khảo: [Terraform aws_instance](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/instance), [AWS instance IP addressing](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/using-instance-addressing.html).
+
+### 5.22. Cấu hình root EBS volume của EC2
+
+Đã đối chiếu code EC2 với các tham chiếu đã chuẩn bị; người quản trị xác nhận plan đúng hai resource mới, gồm Key Pair và EC2. Chưa apply compute.
+
+Trong `deploy/terraform/aws/compute.tf`, thêm block sau bên trong `resource "aws_instance" "primary"`, trước block tags của instance:
+
+```hcl
+root_block_device {
+  volume_size           = 30
+  volume_type           = "gp3"
+  encrypted             = true
+  delete_on_termination = false
+
+  tags = {
+    Name    = "mcf-aws-root"
+    Project = "multi-cloud-failover"
+  }
+}
+```
+
+| Thuộc tính | Ý nghĩa |
+|---|---|
+| `root_block_device` | Cấu hình EBS root volume dùng khởi động Ubuntu |
+| `volume_size = 30` | Dung lượng đĩa 30 GiB; độc lập với RAM 4 GiB của instance |
+| `volume_type = "gp3"` | General Purpose SSD |
+| `encrypted = true` | Mã hóa EBS bằng cơ chế AWS KMS |
+| `delete_on_termination = false` | Giữ volume khi EC2 bị terminate |
+| Tags trong block này | Gắn nhãn cho volume, với Name `mcf-aws-root` |
+
+Thiết kế lab dùng root EBS cho Ubuntu, container runtime, K3s và đường dẫn dữ liệu của local-path PVC. PostgreSQL được triển khai ở giai đoạn workload; dữ liệu của nó sẽ nằm trên đĩa này. Mã hóa đĩa không thay thế cơ chế xác thực PostgreSQL hoặc SSH.
+
+Chọn giữ volume khi terminate để bảo toàn đĩa phục vụ khôi phục và đối chiếu dữ liệu. Volume được giữ tiếp tục phát sinh phí lưu trữ; khi kết thúc lab cần kiểm tra EBS Volumes theo tag Project/Name và dọn volume đã giữ khi dữ liệu không còn cần. Việc khôi phục hoặc gắn lại đĩa vào máy khác cần quy trình riêng, không tự xảy ra chỉ vì đặt cờ này. Stop/start EC2 giữ EBS; thuộc tính DeleteOnTermination điều khiển hành vi khi terminate.
+
+Từ thư mục gốc repository, chạy:
+
+```bash
+terraform -chdir=deploy/terraform/aws fmt
+terraform -chdir=deploy/terraform/aws validate
+```
+
+Khi validate thành công:
+
+```bash
+terraform -chdir=deploy/terraform/aws plan
+```
+
+Plan vẫn mong đợi `2 to add, 0 to change, 0 to destroy` nếu chưa apply Key Pair và EC2. Root volume được khai báo trong resource instance nên không tính thành managed resource Terraform thứ ba. Trong phần `aws_instance.primary`, kiểm tra `root_block_device` có dung lượng 30, loại gp3, encrypted true và delete_on_termination false. Các ID volume chưa biết trước khi tạo là bình thường.
+
+Chưa chạy apply tại bước này; tiếp tục hoàn thiện các thiết lập máy chủ và địa chỉ public trước khi triển khai compute.
+
+Tham khảo: [Terraform root_block_device](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/instance#root_block_device), [giữ EBS khi terminate và chi phí volume giữ lại](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/preserving-volumes-on-termination.html), [EBS encryption](https://docs.aws.amazon.com/ebs/latest/userguide/ebs-encryption.html).
+
+### 5.23. Cấu hình CPU credit mode và IMDSv2
+
+Đã đối chiếu cấu hình root EBS 30 GiB, gp3, mã hóa và giữ đĩa khi terminate; người quản trị xác nhận plan vẫn đúng hai resource mới. Chưa apply compute.
+
+Trong `deploy/terraform/aws/compute.tf`, thêm hai block sau bên trong `resource "aws_instance" "primary"`, cùng cấp với `root_block_device`, trước block tags của instance:
+
+```hcl
+credit_specification {
+  cpu_credits = "standard"
+}
+
+metadata_options {
+  http_endpoint = "enabled"
+  http_tokens   = "required"
+}
+```
+
+T3 là dòng burstable: CPU có mức baseline, dùng CPU credits tích lũy để chạy vượt baseline. Chọn `standard` giới hạn burst theo credit hiện có; khi credit giảm cạn, CPU dần hạ về baseline. Điều này tránh cơ chế tính phí surplus CPU credits của Unlimited, nhưng cần ghi nhận credit mode và theo dõi credit balance khi đo hiệu năng sau này. CPU credit là đơn vị sử dụng CPU, độc lập với credit tiền của chương trình tài trợ cloud.
+
+`metadata_options` cấu hình truy cập Instance Metadata Service trên EC2. `http_endpoint = "enabled"` bật dịch vụ, `http_tokens = "required"` yêu cầu IMDSv2: client lấy session token rồi gửi token khi đọc metadata. Metadata có thể gồm instance ID, loại máy và thông tin khác của instance. Đây là thiết lập metadata của EC2, không điều khiển HTTP/HTTPS endpoint ứng dụng hoặc rule port 80/443.
+
+Hai block là thuộc tính của resource EC2, không phải managed resource Terraform riêng. Từ thư mục gốc repository, chạy:
+
+```bash
+terraform -chdir=deploy/terraform/aws fmt
+terraform -chdir=deploy/terraform/aws validate
+```
+
+Khi validate thành công:
+
+```bash
+terraform -chdir=deploy/terraform/aws plan
+```
+
+Nếu Key Pair và EC2 chưa apply, tổng kết tiếp tục mong đợi `Plan: 2 to add, 0 to change, 0 to destroy.` Trong `aws_instance.primary`, kiểm tra `credit_specification.cpu_credits` là `standard`, metadata endpoint enabled và HTTP tokens required. Chưa chạy apply; Elastic IP và kiểm tra trước triển khai compute được thực hiện tiếp theo.
+
+Tham khảo: [T3 Standard mode](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/burstable-performance-instances-standard-mode.html), [Unlimited mode và surplus credits](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/burstable-performance-instances-unlimited-mode.html), [IMDSv2](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/configuring-instance-metadata-service.html), [Terraform aws_instance](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/instance).
+
+### 5.24. Cấp và gắn Elastic IP cho EC2
+
+Trạng thái thực hành: hướng dẫn chuẩn bị cho bước tiếp theo; các resource EIP và association chưa được bổ sung vào code Terraform hoặc triển khai. Cấu hình compute hiện tại mới gồm Key Pair và EC2, chưa apply.
+
+Đã đối chiếu code: EC2 có CPU credit mode `standard`, metadata endpoint `enabled` và HTTP tokens `required`. Bắt đầu khai báo public IPv4 cố định để kết nối tới máy chủ.
+
+Trong `deploy/terraform/aws/compute.tf`, giữ nguyên các resource hiện có và thêm hai block sau ở ngoài resource EC2, sau dấu ngoặc đóng của `aws_instance.primary`:
+
+```hcl
+resource "aws_eip" "primary" {
+  domain = "vpc"
+
+  tags = {
+    Name    = "mcf-aws-public-ip"
+    Project = "multi-cloud-failover"
+  }
+}
+
+resource "aws_eip_association" "primary" {
+  allocation_id = aws_eip.primary.id
+  instance_id   = aws_instance.primary.id
+
+  depends_on = [aws_internet_gateway.primary]
+}
+```
+
+`aws_eip.primary` cấp một Elastic IP vào account, trong region của provider khi apply. `domain = "vpc"` chỉ định địa chỉ dùng cho VPC, không phải tên miền web và không tạo bản ghi DNS.
+
+`aws_eip_association.primary` gắn địa chỉ đã cấp với EC2. `allocation_id` nhận ID cấp phát dạng `eipalloc-...`, không phải chuỗi public IP; `instance_id` nhận ID máy chủ. Hai tham chiếu làm association chờ EIP và instance được tạo.
+
+`depends_on` bổ sung dependency tường minh để việc gắn EIP chờ Internet Gateway của VPC. Khác với tham chiếu ID đã tạo dependency ngầm định, dòng này biểu diễn yêu cầu hạ tầng mà API gắn địa chỉ cần nhưng hai trường allocation/instance chưa thể hiện trực tiếp. Không thêm thuộc tính `instance` vào `aws_eip` khi đã quản lý việc gắn bằng association resource riêng này.
+
+Trong EC2, giữ `associate_public_ip_address = false`: máy không được cấp public IPv4 tự động lúc launch, sau đó được gắn Elastic IP bằng association. EIP giữ nguyên khi stop/start miễn vẫn giữ allocation và association tương ứng. `admin_cidr` là IP nguồn của người quản trị, còn EIP là địa chỉ đích của EC2; hai giá trị có vai trò riêng.
+
+EIP chỉ xuất hiện trên AWS sau khi apply thành công. Địa chỉ public cụ thể trong plan hiện hiển thị `(known after apply)`. EIP được cấp vẫn phát sinh phí khi máy dừng hoặc địa chỉ đang idle; stop máy không giải phóng allocation. Chi phí compute, EBS và public IPv4 được đối chiếu trước khi triển khai compute.
+
+Từ thư mục gốc repository, chạy:
+
+```bash
+terraform -chdir=deploy/terraform/aws fmt
+terraform -chdir=deploy/terraform/aws validate
+```
+
+Khi validate thành công:
+
+```bash
+terraform -chdir=deploy/terraform/aws plan
+```
+
+Nếu các resource compute hiện vẫn chưa apply, tổng kết mong đợi:
+
+```text
+Plan: 4 to add, 0 to change, 0 to destroy.
+```
+
+Bốn resource mới là Key Pair, EC2, EIP và EIP association. Root EBS là nested block của EC2; data source AMI chỉ đọc thông tin. Kiểm tra plan rồi tiếp tục hướng dẫn output và kiểm tra trước triển khai, chưa chạy apply ở bước này.
+
+Tham khảo: [Terraform aws_eip](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/eip), [Terraform aws_eip_association](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/eip_association), [AWS Elastic IP](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/elastic-ip-addresses-eip.html).
+
 ## 6. Theo dõi tiến độ
 
 - [ ] Xác nhận Terraform, AWS CLI, Azure CLI và SSH chạy được trong Git Bash.
@@ -1475,7 +1933,17 @@ Tham khảo: [Terraform saved plan mode](https://developer.hashicorp.com/terrafo
 - [x] Khai báo `admin_cidr`, gán IPv4 `/32` trong `terraform.tfvars` local và xác nhận Git ignore.
 - [x] Khai báo SSH ingress rule và kiểm tra plan ba resource mới; chưa apply.
 - [x] Khai báo HTTP/HTTPS ingress rule và kiểm tra plan năm resource mới; chưa apply.
-- [ ] Apply Security Group và bốn rule; plan mới báo No changes, state có tổng cộng mười resource.
+- [x] Apply Security Group và bốn rule; đã đối chiếu state có tổng cộng mười resource.
+- [x] Xác nhận plan mới sau apply lớp truy cập báo No changes.
+- [x] Đọc quota Standard On-Demand 16 vCPU và xác nhận offering `t3.medium` tại AZ subnet `ap-southeast-1c`; usage/capacity chưa được nghiệm thu.
+- [x] Cố định subnet tại `ap-southeast-1c` trong code và xác nhận plan không thay đổi tài nguyên.
+- [x] Khai báo data source và tra cứu thành công AMI Ubuntu Server 24.04 x86-64 của Canonical tại Singapore: `ami-0403d346e3210afd6`.
+- [x] Khai báo `aws_key_pair.operator` từ public key local; được đề xuất tạo mới trong plan compute, chưa apply.
+- [x] Cố định AMI `ami-0403d346e3210afd6` bằng image-id filter và kiểm tra lại data source.
+- [x] Khai báo EC2 với các tham chiếu AMI/subnet/SG/Key Pair và kiểm tra plan hai resource mới; chưa apply.
+- [x] Cấu hình root EBS gp3 30 GiB, mã hóa và giữ đĩa khi terminate; kiểm tra plan, chưa apply.
+- [x] Khai báo CPU credit mode standard và yêu cầu IMDSv2; đã đối chiếu code, chưa apply.
+- [ ] Khai báo Elastic IP và association, kiểm tra plan bốn resource mới; chưa apply.
 - [ ] Khai báo mạng và quy tắc truy cập của hai môi trường.
 - [ ] Khai báo compute, địa chỉ IP và đĩa.
 - [ ] Kiểm tra plan rồi triển khai các lớp hạ tầng.

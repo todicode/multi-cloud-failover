@@ -19,10 +19,12 @@ The current implementation runs a complete local environment: two FastAPI instan
 | Published image pull and runtime/database checks | Validated locally |
 | Published image verification on a separate CI runner | Validated |
 | AWS VPC, subnet, Internet Gateway, and public routing with Terraform | Deployed and validated |
-| AWS compute and Azure infrastructure | Planned |
+| AWS host Security Group and SSH/HTTP/HTTPS rules | Deployed and validated |
+| AWS EC2 and SSH Key Pair configuration | Defined; provisioning pending |
+| AWS Elastic IP and Azure infrastructure | Planned |
 | Cloud application deployment and failover | Planned |
 
-The AWS Terraform root module provisions the initial network in Singapore. Validation confirmed five managed resources and a subsequent plan with no changes. Compute, Azure infrastructure, and cloud workload deployment remain planned. The [roadmap](docs/ROADMAP.md) describes the remaining milestones.
+The AWS Terraform root module provisions networking and host access rules in Singapore, with ten managed resources recorded in state. The subnet AZ and Ubuntu AMI are pinned. EC2 and SSH Key Pair configuration is prepared; compute provisioning, Elastic IP, Azure infrastructure, and cloud workload deployment remain pending. The [roadmap](docs/ROADMAP.md) describes the remaining milestones.
 
 ## Features
 
