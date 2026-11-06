@@ -6,7 +6,7 @@ Tự động kiểm thử và đóng gói ứng dụng bằng GitHub Actions, ph
 
 Tham chiếu bước chuẩn bị: [Giai đoạn 2 — Docker hóa ứng dụng](giaidoan2_docker_hoa_ungdung.md).
 
-Tài liệu được bổ sung theo từng bước. Kiểm thử API/database, build Linux AMD64 và publish GHCR đã chạy thành công trên GitHub Actions. Pull bằng digest và runtime/database đã được xác nhận local. Phần dưới hướng dẫn job output, pull trên runner riêng và HTTP smoke check; job kiểm tra độc lập vẫn cần hoàn thiện và chạy nghiệm thu.
+Giai đoạn đã được nghiệm thu: kiểm thử API/database, build Linux AMD64, publish GHCR và kiểm tra image trên runner riêng đều thành công. Pull bằng digest và runtime/database cũng đã được xác nhận local. Hướng dẫn dưới đây trình bày từng bước cấu hình; mục 21 ghi bằng chứng nghiệm thu và định danh image.
 
 Điều kiện nghiệm thu khi kết thúc toàn bộ giai đoạn:
 
@@ -1138,7 +1138,26 @@ Lưu liên kết workflow run, commit SHA và image digest trong ghi chép nghi�
 
 Nếu một job đỏ, mở step lỗi đầu tiên và đọc log trước khi chạy lại. Không đánh dấu hoàn thành bằng kết quả kiểm tra cú pháp local: giai đoạn này cần bằng chứng cả ba job thành công trên GitHub. Workflow hiện kiểm tra/phát hành image; chưa triển khai tài nguyên AWS hoặc Azure.
 
-## 21. Theo dõi tiến độ
+## 21. Kết quả nghiệm thu
+
+Lần chạy đã xác nhận thành công:
+
+- Workflow run: [42080473436](https://github.com/todicode/multi-cloud-failover/actions/runs/42080473436).
+- Commit: `8609fd05b7859f065a1fef88615542f8027424ed`.
+- Tag tương ứng: `ghcr.io/todicode/multi-cloud-failover:sha-8609fd05b7859f065a1fef88615542f8027424ed`.
+- Tham chiếu immutable của image:
+
+```text
+ghcr.io/todicode/multi-cloud-failover@sha256:1f22b3b09759dce6b265f5d80d2270bede4295fd5cff674eb7095c7964382fa4
+```
+
+Cả ba job `test`, `container` và `verify-image` cùng các step kiểm tra của chúng đều thành công. Digest trên được đối chiếu bằng header `Docker-Content-Digest` của manifest GHCR cho tag commit tương ứng. Job `verify-image` nhận tham chiếu từ job publish, pull trên runner riêng, đối chiếu label revision và user mặc định, sau đó chạy container và kiểm tra HTTP liveness/version/static UI.
+
+Kết quả này nghiệm thu CI và đường phân phối image. Database connectivity của published image được kiểm tra ở local; cloud networking, lưu trữ và phục hồi AWS/Azure thuộc các giai đoạn tiếp theo.
+
+Nếu build/phát hành lại, ghi nhận run và digest mới sau khi kiểm tra đạt. Tag `main` có thể thay đổi; dùng tham chiếu digest đã chọn khi cần triển khai cùng nội dung image trên hai cloud.
+
+## 22. Theo dõi tiến độ
 
 - [x] Tạo file và hiểu tên workflow, sự kiện kích hoạt, quyền đọc source.
 - [x] Bổ sung job Linux và checkout source.
@@ -1147,6 +1166,6 @@ Nếu một job đỏ, mở step lỗi đầu tiên và đọc log trước khi 
 - [x] Build image trên GitHub sau khi test đạt.
 - [x] Phát hành GHCR và lưu digest/commit.
 - [x] Pull image bằng digest và xác nhận runtime/database local.
-- [ ] Xác nhận pipeline đầy đủ test/build/publish/kiểm tra runtime thành công.
+- [x] Xác nhận pipeline đầy đủ test/build/publish/kiểm tra runtime thành công.
 
-Hướng dẫn cho các phần chưa thực hành sẽ được bổ sung theo tiến độ. Checklist không thay thế kết quả chạy workflow.
+Giai đoạn 3 hoàn thành theo bằng chứng ở mục 21. Các giai đoạn tiếp theo được ghi trong roadmap; hướng dẫn riêng được bổ sung khi bắt đầu từng giai đoạn.
