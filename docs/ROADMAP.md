@@ -24,11 +24,24 @@ The project progresses from local recovery validation to deployment and measurem
 - [x] Manual issue/comment replication checks through the containerized web instances.
 - [x] Reproducible [Stage 2 container packaging instructions](instruction/giaidoan2_docker_hoa_ungdung.md).
 
+## Completed: CI and container registry
+
+- [x] API/PostgreSQL tests on GitHub Actions.
+- [x] Dependent Linux AMD64 image build and GHCR publication.
+- [x] Published image pull by digest and runtime/database checks locally.
+- [x] Separate CI runner: pull by digest, revision/default-user checks, application startup, and HTTP smoke checks.
+- [x] Successful [three-job workflow run](https://github.com/todicode/multi-cloud-failover/actions/runs/42080473436) and recorded artifact identity in the [Stage 3 guide](instruction/giaidoan3_ci_va_container_registry.md).
+
+## In progress: cloud infrastructure
+
+The [Stage 4 guide](instruction/giaidoan4_ha_tang_aws_azure_terraform.md) covers operator tooling, Azure fundamentals and account checks, AWS authentication, and incremental Terraform implementation. The initial AWS network has been deployed in Singapore: VPC, subnet, Internet Gateway, public route table, and subnet association. Acceptance confirmed five managed resources and a subsequent plan with no changes. Compute and Azure infrastructure remain to be implemented.
+
+The implementation sequence completes the required Azure background, then builds and validates AWS infrastructure with Terraform before Azure. Infrastructure code stays in this repository under `deploy/terraform/`. AWS uses the `deploy/terraform/aws/` root module with a local backend for the single-operator lab; Azure will use a separate root module and state. State and saved plans are excluded from version control; the provider lock file is committed.
+
 ## Planned milestones
 
 | Phase | Deliverable | Acceptance evidence |
 |---|---|---|
-| CI and registry | Test/build/publish workflow and immutable image digest | Successful workflow run and clean pull of the selected digest |
 | Infrastructure | Independent AWS and Azure compute, networking, IPs, and storage | Reviewed Terraform plan and inventory for the selected accounts |
 | Cluster and workload | Two K3s environments, PostgreSQL, application, and WireGuard | Node/pod readiness, tunnel connectivity, role checks, and replayed business data |
 | HTTPS | Origin/shared hostnames and certificate renewal | Valid TLS on both origins and the shared hostname |
@@ -37,8 +50,6 @@ The project progresses from local recovery validation to deployment and measurem
 | Cloud recovery | Manual failover, rejoin, and controlled failback | A single writer throughout; verified data after both transitions |
 | Automatic failover | Optional Azure-hosted watcher | Confirmed fencing before promotion and observable failure handling |
 | Evaluation | Repeated failure exercises and operational analysis | Raw measurements for downtime, latency, errors, data loss, and cost |
-
-The [Stage 3 guide](instruction/giaidoan3_ci_va_container_registry.md) is being developed incrementally. API/PostgreSQL tests, the dependent Linux AMD64 image build and GHCR publication have run successfully on GitHub Actions. Pull by digest and runtime/database checks passed locally; verification on a separate CI runner remains to be completed.
 
 ## Evaluation goals
 

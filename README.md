@@ -17,10 +17,12 @@ The current implementation runs a complete local environment: two FastAPI instan
 | API/PostgreSQL tests and Linux AMD64 image build on GitHub Actions | Validated |
 | GHCR image publication | Validated |
 | Published image pull and runtime/database checks | Validated locally |
-| Published image verification on a separate CI runner | In progress |
-| AWS/Azure deployment | Planned |
+| Published image verification on a separate CI runner | Validated |
+| AWS VPC, subnet, Internet Gateway, and public routing with Terraform | Deployed and validated |
+| AWS compute and Azure infrastructure | Planned |
+| Cloud application deployment and failover | Planned |
 
-Cloud infrastructure and deployment automation are not part of the current implementation. The [roadmap](docs/ROADMAP.md) describes the remaining milestones.
+The AWS Terraform root module provisions the initial network in Singapore. Validation confirmed five managed resources and a subsequent plan with no changes. Compute, Azure infrastructure, and cloud workload deployment remain planned. The [roadmap](docs/ROADMAP.md) describes the remaining milestones.
 
 ## Features
 
@@ -91,11 +93,14 @@ The local test suite passed **19 tests**. The lifecycle check passed repeated sw
 
 The application image was built for Linux AMD64 and run as `appuser` in two containers using the same image ID. Local checks confirmed HTTP endpoints, primary/standby connectivity, and manual issue/comment replication through the containerized web instances.
 
+The [accepted CI run](https://github.com/todicode/multi-cloud-failover/actions/runs/42080473436) passed API/PostgreSQL tests, image build/publication, and verification on a separate runner. That runner pulled by digest, checked the image revision and default user, started the application, and checked liveness, version, and static UI over HTTP. The [Stage 3 guide](docs/instruction/giaidoan3_ci_va_container_registry.md) records the accepted commit and image digest.
+
 ## Documentation
 
 - [Stage 1: local application and database instructions](docs/instruction/giaidoan1_ungdung_database_local.md)
 - [Stage 2: application container packaging](docs/instruction/giaidoan2_docker_hoa_ungdung.md)
-- [Stage 3: CI and container registry instructions (in progress)](docs/instruction/giaidoan3_ci_va_container_registry.md)
+- [Stage 3: CI and container registry instructions](docs/instruction/giaidoan3_ci_va_container_registry.md)
+- [Stage 4: AWS/Azure infrastructure with Terraform (in progress)](docs/instruction/giaidoan4_ha_tang_aws_azure_terraform.md)
 - [Architecture and consistency model](docs/ARCHITECTURE.md)
 - [Local setup and operations](docs/LOCAL_DEVELOPMENT.md)
 - [Failover and recovery runbook](docs/DISASTER_RECOVERY.md)
