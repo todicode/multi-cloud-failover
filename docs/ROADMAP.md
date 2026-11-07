@@ -34,19 +34,19 @@ The [project requirements and acceptance criteria](PROJECT_REQUIREMENTS.md) trac
 - [x] Separate CI runner: pull by digest, revision/default-user checks, application startup, and HTTP smoke checks.
 - [x] Successful [three-job workflow run](https://github.com/todicode/multi-cloud-failover/actions/runs/42080473436) and recorded artifact identity in the [Stage 3 guide](instruction/giaidoan3_ci_va_container_registry.md).
 
-## In progress: cloud infrastructure
+## Validated: cloud infrastructure
 
 The [Stage 4 guide](instruction/giaidoan4_ha_tang_aws_azure_terraform.md) covers operator tooling, Azure fundamentals and account checks, AWS authentication, and incremental Terraform implementation. AWS networking, host access rules, EC2, SSH Key Pair, and Elastic IP were deployed and validated in Singapore. Status checks and SSH acceptance passed, and the post-apply plan reported no changes. The subnet AZ and Ubuntu AMI are pinned; the host configuration includes encrypted root EBS, Standard CPU credits, and IMDSv2. Lab resources were subsequently removed, including retained EBS and Elastic IP, to control costs while implementing Azure.
 
-The Azure root module now defines the Resource Group, VNet, subnet, NSG, and SSH/HTTP/HTTPS rules. Formatting, validation, and a plan of seven resource creations have passed; these resources have not been applied. Public IP, NIC, VM, and Azure SSH acceptance remain pending.
+The Azure root module deployed eleven resources: Resource Group, VNet, subnet, NSG and SSH/HTTP/HTTPS rules, Static Public IP, NIC, NIC–NSG association, and Ubuntu VM. The VM uses Standard_B2als_v2 in Zone 1 with a pinned Ubuntu 24.04 image and a 32 GiB Standard SSD OS disk. Formatting, validation, deployment, VM/agent state checks, and a clean post-apply plan passed. The operator confirmed SSH access and the expected username/Ubuntu version. The Azure lab was subsequently removed with a reviewed Terraform destroy plan, including the managed OS disk and Static Public IP. Infrastructure has been validated independently on both clouds; cloud clusters and workloads remain pending.
 
-The implementation sequence completes the required Azure background, then builds and validates AWS infrastructure with Terraform before Azure. Infrastructure code stays in this repository under `deploy/terraform/`. AWS and Azure use separate root modules under `deploy/terraform/aws/` and `deploy/terraform/azure/`, with separate local state for the single-operator lab. State and saved plans are excluded from version control; provider lock files are committed. Recreate the AWS environment when both hosts are needed for the WireGuard and replication exercises.
+The implementation sequence completes the required Azure background, then builds and validates AWS infrastructure with Terraform before Azure. Infrastructure code stays in this repository under `deploy/terraform/`. AWS and Azure use separate root modules under `deploy/terraform/aws/` and `deploy/terraform/azure/`, with separate local state for the single-operator lab. State and saved plans are excluded from version control; provider lock files are committed. Both lab environments are currently removed. Recreate them from fresh reviewed plans for the cluster, WireGuard, and replication exercises.
 
-## Planned milestones
+## Milestones
 
 | Phase | Deliverable | Acceptance evidence |
 |---|---|---|
-| Infrastructure | Independent AWS and Azure compute, networking, IPs, and storage | Reviewed Terraform plan and inventory for the selected accounts |
+| Infrastructure | Independent AWS and Azure compute, networking, IPs, and storage | Validated independently: deployment, post-apply plan, and SSH; lab resources subsequently removed on both clouds |
 | Cluster and workload | Two K3s environments, PostgreSQL, application, and WireGuard | Node/pod readiness, tunnel connectivity, role checks, and replayed business data |
 | HTTPS | Origin/shared hostnames and certificate renewal | Valid TLS on both origins and the shared hostname |
 | DNS failover | Writer health checks and Route 53 routing | Traffic reaches the promoted writer after the old writer is fenced |

@@ -32,9 +32,9 @@ Công cụ → Xác thực tài khoản → Chọn region và cấu hình SSH
 → Terraform Azure: cấu hình → plan → apply → xác nhận
 ```
 
-Terraform được giữ trong cùng repository với ứng dụng ở `deploy/terraform/`, để cấu hình hạ tầng, workload và hướng dẫn được quản lý theo cùng project. AWS sử dụng root module `deploy/terraform/aws/`; Azure sẽ sử dụng root module riêng khi bắt đầu triển khai phía Azure. Mỗi root module có state riêng để thao tác từng cloud độc lập. Lab một người quản trị sử dụng local backend cho AWS theo mục 5.9. Quy mô hiện tại chưa cần một repository hạ tầng riêng.
+Terraform được giữ trong cùng repository với ứng dụng ở `deploy/terraform/`, để cấu hình hạ tầng, workload và hướng dẫn được quản lý theo cùng project. AWS sử dụng root module `deploy/terraform/aws/`; Azure sử dụng `deploy/terraform/azure/`. Mỗi root module có local state riêng cho lab một người quản trị để thao tác từng cloud độc lập; xem nguyên tắc state ở mục 5.9. Quy mô hiện tại chưa cần một repository hạ tầng riêng.
 
-Tài liệu được bổ sung theo từng bước thực hành. Lớp mạng AWS đã được triển khai và kiểm tra theo mục 5.10; compute, hạ tầng Azure và kết nối SSH tới máy chủ chưa được nghiệm thu.
+Tài liệu được bổ sung theo từng bước thực hành. Hạ tầng AWS và Azure đã được triển khai, kiểm tra post-apply plan và nghiệm thu SSH độc lập theo các mục dưới đây. Sau nghiệm thu, cả hai môi trường lab đã được dọn để tiết kiệm chi phí; giữ code và state local để tạo lại. Lập plan mới khi tiếp tục thực hành và tạo lại các máy theo nhu cầu của giai đoạn 5. Phần workload cloud được tiếp tục ở giai đoạn đó.
 
 ## 2. Công cụ trên máy quản trị
 
@@ -2697,13 +2697,430 @@ Plan: 8 to add, 0 to change, 0 to destroy.
 
 Gồm bảy resource trước và `azurerm_public_ip.standby`. IP thực tế hiển thị `(known after apply)`. Chưa apply hoặc tạo Public IP; bước tiếp theo khai báo NIC để nối subnet, Public IP và VM.
 
-Public IPv4 tĩnh là tài nguyên có tính phí sau khi được cấp theo chính sách billing Azure, kể cả khi VM bị stop/deallocate hoặc IP chưa gắn vào VM. Để tiết kiệm, tiếp tục hoàn thiện code và đọc plan trước khi tạo tài nguyên cần dùng cho buổi thực hành. Chưa đánh dấu Public IP/plan đạt cho tới khi có kết quả thực hành.
+Public IPv4 tĩnh là tài nguyên có tính phí sau khi được cấp theo chính sách billing Azure, kể cả khi VM bị stop/deallocate hoặc IP chưa gắn vào VM. Để tiết kiệm, tiếp tục hoàn thiện code và đọc plan trước khi tạo tài nguyên cần dùng cho buổi thực hành.
+
+Đã đọc lại block Public IP do người thực hành tạo và chuyển sang `network.tf`; `fmt -check` và `validate` đạt. Terraform gộp các file `.tf` trong cùng root module, nên đặt block trong file khác cùng thư mục vẫn có hiệu lực; việc phân file giúp quản lý code. Chỉ giữ một khai báo cho resource này. Chưa apply; kết quả plan của bước NIC tiếp theo sẽ kiểm tra cả Public IP.
 
 Tham khảo: [AzureRM 4.81.0 public IP](https://github.com/hashicorp/terraform-provider-azurerm/blob/v4.81.0/website/docs/r/public_ip.html.markdown), [Azure Public IP và availability zones](https://learn.microsoft.com/en-us/azure/virtual-network/ip-services/public-ip-addresses), [Azure IP pricing và billing FAQ](https://azure.microsoft.com/en-us/pricing/details/ip-addresses/).
 
+### 6.10. Tạo NIC và liên kết NSG
+
+NIC là card mạng của VM, có vai trò tương tự ENI trên AWS. NIC tham chiếu subnet để nhận private IPv4, đồng thời tham chiếu Public IP tĩnh đã khai báo để kết nối Internet. Một resource association riêng gắn NSG vào NIC, đưa các rule SSH/HTTP/HTTPS vào phạm vi áp dụng của card mạng đó.
+
+Trong `deploy/terraform/azure/network.tf`, giữ nguyên VNet, subnet, Public IP và thêm hai block dưới đây ở bên ngoài các resource hiện có:
+
+```hcl
+resource "azurerm_network_interface" "standby" {
+  name                = "mcf-azure-nic"
+  location            = azurerm_resource_group.standby.location
+  resource_group_name = azurerm_resource_group.standby.name
+
+  ip_configuration {
+    name                          = "primary"
+    primary                       = true
+    subnet_id                     = azurerm_subnet.standby.id
+    private_ip_address_allocation = "Dynamic"
+    public_ip_address_id          = azurerm_public_ip.standby.id
+  }
+
+  tags = {
+    Project = "multi-cloud-failover"
+  }
+}
+
+resource "azurerm_network_interface_security_group_association" "standby" {
+  network_interface_id      = azurerm_network_interface.standby.id
+  network_security_group_id = azurerm_network_security_group.standby.id
+}
+```
+
+Trong `ip_configuration`, `subnet_id` chọn mạng con `10.30.1.0/24`; `private_ip_address_allocation="Dynamic"` để Azure tự cấp private IP cho NIC từ mạng con đó. `public_ip_address_id` gắn Public IP Static của mục 6.9 vào cùng cấu hình IP. `primary=true` đánh dấu cấu hình IP chính của NIC. Tất cả ID được tham chiếu từ resource Terraform, không điền ID thủ công.
+
+Association tham chiếu cả NIC và NSG. Terraform nhận dependency từ các tham chiếu; VM được khai báo ở bước sau sẽ dùng NIC này và chờ association phù hợp trước khi khởi tạo. Bước hiện tại mới khai báo mạng, chưa có resource VM.
+
+Sau khi lưu, trong Git Bash đã chọn subscription và export theo mục 6.2, chạy:
+
+```bash
+terraform -chdir=deploy/terraform/azure fmt
+terraform -chdir=deploy/terraform/azure validate
+terraform -chdir=deploy/terraform/azure plan
+```
+
+Kết quả dự kiến:
+
+```text
+Plan: 10 to add, 0 to change, 0 to destroy.
+```
+
+Mười resource gồm Resource Group, VNet, subnet, NSG, ba inbound rule, Public IP, NIC và NIC–NSG association. Các private IP/ID thực tế vẫn có thể hiển thị `(known after apply)`. Người thực hành đã xác nhận plan chạy đúng; code NIC/association đã được đọc lại, fmt/validate đạt. Chưa apply.
+
+Tham khảo: [AzureRM 4.81.0 network interface](https://github.com/hashicorp/terraform-provider-azurerm/blob/v4.81.0/website/docs/r/network_interface.html.markdown), [NIC–NSG association](https://github.com/hashicorp/terraform-provider-azurerm/blob/v4.81.0/website/docs/r/network_interface_security_group_association.html.markdown).
+
+### 6.11. Tra cứu image Ubuntu và quota trước khi khai báo VM
+
+AWS dùng AMI ID để chọn image hệ điều hành; Azure Marketplace image có thể được xác định bằng URN gồm bốn thành phần:
+
+```text
+Publisher:Offer:SKU:Version
+```
+
+Với Ubuntu của project, đã tra cứu `Canonical:ubuntu-24_04-lts:server:latest` tại Southeast Asia và đọc được phiên bản cụ thể `24.04.202610250`. Tiếp tục truy vấn chính phiên bản này để kiểm tra lại:
+
+```bash
+az vm image show \
+  --location southeastasia \
+  --urn Canonical:ubuntu-24_04-lts:server:24.04.202610250 \
+  --query '{Version:name,Architecture:architecture,Generation:hyperVGeneration}' \
+  --output table
+```
+
+Kết quả đã đối chiếu từ Azure: version `24.04.202610250`, architecture `x64`, Hyper-V generation `V2`, hệ điều hành Linux; không có Marketplace plan bổ sung trong metadata trả về. Publisher/offer/SKU được xác nhận từ ID image trả về, không dựa vào các thuộc tính top-level không có trong response.
+
+Khi viết `source_image_reference` cho VM ở bước tiếp theo, dùng:
+
+| Thuộc tính | Giá trị |
+|---|---|
+| publisher | `Canonical` |
+| offer | `ubuntu-24_04-lts` |
+| sku | `server` |
+| version | `24.04.202610250` |
+
+Version cụ thể giúp tái lập cùng image, tương tự việc đã cố định AMI AWS. Tra cứu `latest` chỉ phục vụ tìm phiên bản ứng viên; thay đổi version trong resource VM cần đọc plan vì có thể dẫn tới thay thế máy. Tra cứu image hiện tại chưa tạo VM hoặc đổi code Terraform.
+
+Quota cũng cần kiểm tra trước khi chọn VM:
+
+```bash
+az vm list-usage \
+  --location southeastasia \
+  --query "[?name.value=='cores' || name.value=='standardBasv2Family'].{Name:name.value,Used:currentValue,Limit:limit}" \
+  --output table
+```
+
+Kết quả đã đọc: tổng regional vCPU `cores` dùng 0/6, family `standardBasv2Family` dùng 0/10. Nếu chọn máy 2 vCPU thuộc họ Basv2 thì còn đủ quota theo hai giới hạn này. Restriction của đúng SKU/zone và capacity khi cấp máy vẫn phải kiểm tra riêng trước triển khai; quota còn không bảo đảm cấp máy thành công.
+
+Đã đọc lại catalog cho `Standard_B2als_v2` tại Southeast Asia: family `standardBasv2Family`, các zone được hỗ trợ là 1, 2, 3; restriction của subscription chỉ nêu Zone 2 với `NotAvailableForSubscription`. Kết quả không nêu Location restriction. Chọn ứng viên size `Standard_B2als_v2` tại Zone 1 cho bước code VM; catalog và quota không bảo đảm capacity lúc apply.
+
+Để tự đối chiếu kết quả SKU/zone từ laptop:
+
+```bash
+az vm list-skus \
+  --location southeastasia \
+  --resource-type virtualMachines \
+  --size Standard_B2als_v2 \
+  --all \
+  --query "[?name=='Standard_B2als_v2'].{Name:name,Family:family,Zones:locationInfo[?location=='southeastasia'].zones[],Restrictions:restrictions}" \
+  --output json
+```
+
+Ở bước này chỉ tra cứu image, quota và SKU/zone; resource VM được bổ sung ở bước tiếp theo. Các lệnh trên chạy trên laptop trong Azure CLI đã chọn đúng subscription.
+
+Tham khảo: [Azure CLI VM image show](https://learn.microsoft.com/en-us/cli/azure/vm/image?view=azure-cli-latest#az-vm-image-show), [Azure CLI VM usage và SKU](https://learn.microsoft.com/en-us/cli/azure/vm?view=azure-cli-latest), [AzureRM 4.81.0 Linux VM](https://github.com/hashicorp/terraform-provider-azurerm/blob/v4.81.0/website/docs/r/linux_virtual_machine.html.markdown).
+
+### 6.12. Khai báo Ubuntu VM cho Azure standby
+
+Tạo một resource Linux VM dùng NIC/NSG đã khai báo. Size ứng viên `Standard_B2als_v2`, zone `1`, image Ubuntu 24.04 x64 Gen2 version `24.04.202610250` đã được đối chiếu ở mục 6.11. Public IP zone-redundant không thay đổi việc VM chỉ nằm trong một zone.
+
+Trong Git Bash tại thư mục gốc repository:
+
+```bash
+touch deploy/terraform/azure/compute.tf
+```
+
+Người thực hành tự nhập vào `deploy/terraform/azure/compute.tf`:
+
+```hcl
+resource "azurerm_linux_virtual_machine" "standby" {
+  name                            = "mcf-azure-standby"
+  location                        = azurerm_resource_group.standby.location
+  resource_group_name             = azurerm_resource_group.standby.name
+  size                            = "Standard_B2als_v2"
+  zone                            = "1"
+  admin_username                  = "azureuser"
+  disable_password_authentication = true
+  network_interface_ids           = [azurerm_network_interface.standby.id]
+
+  admin_ssh_key {
+    username   = "azureuser"
+    public_key = file(pathexpand("~/.ssh/mcf-lab.pub"))
+  }
+
+  os_disk {
+    name                 = "mcf-azure-osdisk"
+    caching              = "ReadWrite"
+    storage_account_type = "StandardSSD_LRS"
+    disk_size_gb         = 32
+  }
+
+  source_image_reference {
+    publisher = "Canonical"
+    offer     = "ubuntu-24_04-lts"
+    sku       = "server"
+    version   = "24.04.202610250"
+  }
+
+  tags = {
+    Project = "multi-cloud-failover"
+  }
+
+  depends_on = [azurerm_network_interface_security_group_association.standby]
+}
+```
+
+`size` tương đương lựa chọn instance type trên AWS. `zone` cố định vị trí VM tại Zone 1; Azure subnet là tài nguyên regional, nên chọn zone ở VM. `network_interface_ids` nối VM vào NIC có subnet và Public IP của project. Tham chiếu NIC tạo dependency tự động; `depends_on` bổ sung điều kiện chờ NSG được associate với NIC trước khi tạo VM.
+
+`admin_username` tạo tài khoản `azureuser`. Block `admin_ssh_key` cấu hình public key có sẵn cho đúng username, còn `disable_password_authentication=true` sử dụng SSH key để đăng nhập. `pathexpand` đổi `~` thành thư mục home trên laptop; `file` đọc file public `.pub`. Private key `~/.ssh/mcf-lab` tiếp tục được giữ trên laptop và dùng khi SSH sau apply. Provider 4.81.0 hỗ trợ định dạng ssh-ed25519 của cặp key hiện tại.
+
+`os_disk` cấu hình ổ hệ điều hành Standard SSD LRS 32 GiB với caching ReadWrite. Đây là managed OS disk bền vững, chứa Ubuntu và các tool sẽ cài sau. Với `features {}` mặc định hiện có, AzureRM xóa OS disk khi destroy resource VM; cần nhớ hành vi này khi đã có database/data trên cloud. Việc deallocate VM giữ OS disk và dữ liệu. Bước triển khai workload và phương án bảo quản/backup dữ liệu được hướng dẫn ở giai đoạn tương ứng.
+
+`source_image_reference` điền bốn thành phần URN đã tra cứu. Resource VM hiện chỉ tạo máy Ubuntu và cấu hình SSH; K3s, WireGuard, PostgreSQL và web được triển khai sau theo từng lớp.
+
+Sau khi lưu, trong Git Bash đã chọn đúng subscription và export theo mục 6.2:
+
+```bash
+terraform -chdir=deploy/terraform/azure fmt
+terraform -chdir=deploy/terraform/azure validate
+terraform -chdir=deploy/terraform/azure plan
+```
+
+Kết quả dự kiến:
+
+```text
+Plan: 11 to add, 0 to change, 0 to destroy.
+```
+
+So với mục 6.10, chỉ thêm resource `azurerm_linux_virtual_machine.standby`. OS disk là phần được quản lý bên trong resource VM này, không xuất hiện như một `azurerm_managed_disk` riêng trong số đếm. Đối chiếu tên máy, size/zone, image version, public key, NIC và cấu hình disk trong plan. Người thực hành đã xác nhận plan đúng; code VM đã được đọc lại, fmt/validate đạt. Chưa apply hoặc ghi nhận SSH thành công; bước tiếp theo thêm outputs trước khi lập kế hoạch triển khai.
+
+Tham khảo: [AzureRM 4.81.0 Linux VM](https://github.com/hashicorp/terraform-provider-azurerm/blob/v4.81.0/website/docs/r/linux_virtual_machine.html.markdown), [OS disk deletion behavior](https://github.com/hashicorp/terraform-provider-azurerm/blob/v4.81.0/website/docs/guides/features-block.html.markdown).
+
+### 6.13. Khai báo outputs cho môi trường Azure
+
+Outputs giúp lấy lại ID máy và các địa chỉ IP từ state sau apply, tương tự ba output đã tạo cho AWS. Khai báo output không tạo thêm tài nguyên cloud.
+
+Trong Git Bash tại thư mục gốc project:
+
+```bash
+touch deploy/terraform/azure/outputs.tf
+```
+
+Người thực hành tự nhập vào `deploy/terraform/azure/outputs.tf`:
+
+```hcl
+output "azure_vm_id" {
+  description = "Azure resource ID of the standby VM"
+  value       = azurerm_linux_virtual_machine.standby.id
+}
+
+output "azure_private_ip" {
+  description = "Private IPv4 address of the Azure standby NIC"
+  value       = azurerm_network_interface.standby.private_ip_address
+}
+
+output "azure_public_ip" {
+  description = "Static public IPv4 address of the Azure standby host"
+  value       = azurerm_public_ip.standby.ip_address
+}
+```
+
+`azure_vm_id` là ARM resource ID dạng `/subscriptions/.../resourceGroups/.../providers/Microsoft.Compute/virtualMachines/...`, không phải UUID thuộc tính `virtual_machine_id` của VM. `azure_private_ip` lấy private IPv4 từ NIC; `azure_public_ip` lấy địa chỉ từ Public IP resource. Các tên output là giao diện để dùng lại trong lệnh CLI và bước vận hành sau.
+
+Sau khi lưu, trong Git Bash đã chọn subscription và export theo mục 6.2:
+
+```bash
+terraform -chdir=deploy/terraform/azure fmt
+terraform -chdir=deploy/terraform/azure validate
+terraform -chdir=deploy/terraform/azure plan
+```
+
+Số resource dự kiến vẫn giữ nguyên:
+
+```text
+Plan: 11 to add, 0 to change, 0 to destroy.
+
+Changes to Outputs:
+  + azure_private_ip = (known after apply)
+  + azure_public_ip  = (known after apply)
+  + azure_vm_id      = (known after apply)
+```
+
+Các giá trị thực chỉ được ghi vào state sau apply thành công; lúc đó dùng `terraform -chdir=deploy/terraform/azure output` để đọc lại. Người thực hành đã xác nhận plan đúng mười một resource và ba output; đã đọc lại file outputs, fmt/validate đạt. Chưa chạy apply trong bước outputs. Bước tiếp theo sẽ lưu kế hoạch mới và triển khai sau khi đối chiếu phạm vi tài nguyên và chi phí.
+
+Tham khảo: [Terraform outputs](https://developer.hashicorp.com/terraform/language/values/outputs), [AzureRM Linux VM attributes](https://github.com/hashicorp/terraform-provider-azurerm/blob/v4.81.0/website/docs/r/linux_virtual_machine.html.markdown).
+
+### 6.14. Lưu plan và triển khai hạ tầng Azure
+
+Đã kiểm tra trước triển khai: code VM/outputs đúng các tham chiếu, fmt/validate đạt, admin CIDR là public IPv4 `/32` hợp lệ và tfvars/plan được Git ignore. Ở thời điểm kiểm tra, chưa có state file Azure và `az group exists --name mcf-azure-rg` trả `false`. Đây là kiểm tra tên nhóm dự kiến trong subscription đang chọn, không phải kiểm kê toàn tài khoản.
+
+Đã đối chiếu giá compute công khai qua Azure Retail Prices API ngày 2026-11-07: `Virtual Machines Basv2 Series`, `B2als v2`, region `southeastasia`, loại `Consumption`, Linux, đơn vị `1 Hour`, retail price `0.0472 USD`. Đây là giá tham khảo riêng compute, chưa gồm Standard SSD, Public IPv4, giao dịch đĩa, traffic hoặc thuế/ưu đãi. Credit và số tiền Billing thực tế phụ thuộc subscription.
+
+Khi apply tạo tài nguyên, VM/managed OS disk/Public IP được tính theo trạng thái và chính sách billing tương ứng. Deallocate VM sẽ dừng phí compute khi máy đã được giải phóng; disk và Static Public IP được giữ vẫn có phí. Việc nghỉ hoặc dọn lab cần quản lý các tài nguyên này theo trạng thái thực tế.
+
+Trên Git Bash ở thư mục gốc project, kiểm tra subscription:
+
+```bash
+az account show --query '{Name:name,State:state}' --output table
+```
+
+Chọn đúng Azure for Students, trạng thái Enabled. Sau đó, trong cùng terminal:
+
+```bash
+export ARM_SUBSCRIPTION_ID="$(az account show --query id --output tsv | tr -d '\r')"
+terraform -chdir=deploy/terraform/azure plan -out=azure.tfplan
+```
+
+Lệnh này lập kế hoạch mới và lưu tại `deploy/terraform/azure/azure.tfplan`. Đọc lại:
+
+- `Plan: 11 to add, 0 to change, 0 to destroy.`
+- Resource Group `mcf-azure-rg`, region `southeastasia`.
+- VNet `10.30.0.0/16`, subnet `10.30.1.0/24`, NIC gắn Public IP và NSG.
+- SSH TCP 22 từ IP quản trị `/32`; HTTP/HTTPS từ Internet.
+- VM `mcf-azure-standby`, size `Standard_B2als_v2`, zone `1`.
+- User `azureuser`, public key `mcf-lab.pub`, Ubuntu image version `24.04.202610250`.
+- OS disk StandardSSD_LRS 32 GiB, ba output được xác định sau apply.
+
+Khi saved plan đúng, người thực hành chạy:
+
+```bash
+terraform -chdir=deploy/terraform/azure apply azure.tfplan
+```
+
+Saved plan mode thực hiện kế hoạch đã lưu, không hỏi nhập `yes` lần nữa. Đây là lệnh tạo tài nguyên thật; chưa cấu hình K3s, WireGuard hoặc ứng dụng. Giữ terminal chờ kết quả.
+
+Kết quả mong đợi:
+
+```text
+Apply complete! Resources: 11 added, 0 changed, 0 destroyed.
+```
+
+Đọc lại output sau khi apply thành công:
+
+```bash
+terraform -chdir=deploy/terraform/azure output
+```
+
+Nếu apply lỗi giữa chừng, giữ nguyên state, đọc/gửi lỗi để xử lý và lập plan mới sau khi sửa nguyên nhân. Các resource đã tạo trước lỗi có thể vẫn tồn tại và phát sinh phí. Không xóa state hoặc tạo bản sao resource bằng tay. Không dùng lại saved plan đã áp dụng một phần hoặc của lần dọn/tạo hạ tầng cũ.
+
+Người thực hành đã xác nhận apply thành công. Đã đọc được ba output mới từ state; truy vấn trực tiếp VM trả `Provisioning succeeded`, `VM running` và VM Agent `Ready`. Post-apply plan trả exit code 0 và `No changes. Your infrastructure matches the configuration.` Chưa nghiệm thu SSH; thực hiện tiếp mục 6.15.
+
+Tham khảo: [Terraform saved plan apply](https://developer.hashicorp.com/terraform/cli/commands/apply#saved-plan-mode), [Azure Retail Prices API](https://learn.microsoft.com/en-us/rest/api/cost-management/retail-prices/azure-retail-prices), [Retail Prices endpoint](https://prices.azure.com/api/retail/prices), [Azure Public IP billing FAQ](https://azure.microsoft.com/en-us/pricing/details/ip-addresses/), [Azure VM CLI deallocate](https://learn.microsoft.com/en-us/cli/azure/vm?view=azure-cli-latest#az-vm-deallocate).
+
+### 6.15. Kiểm tra trạng thái và SSH vào VM Azure
+
+Đã xác nhận VM `mcf-azure-standby` được tạo thành công, đang running và Azure VM Agent ready. Plan sau apply không đề xuất thay đổi. Các kiểm tra này xác nhận hạ tầng/agent; kết nối SSH và hệ điều hành được nghiệm thu riêng bên dưới.
+
+Để tự kiểm tra trạng thái từ Git Bash trên laptop:
+
+```bash
+az vm get-instance-view \
+  --resource-group mcf-azure-rg \
+  --name mcf-azure-standby \
+  --query '{Name:name,Statuses:instanceView.statuses[].{Code:code,Status:displayStatus},Agent:instanceView.vmAgent.statuses[].displayStatus}' \
+  --output json
+```
+
+Đối chiếu các trạng thái `ProvisioningState/succeeded`, `PowerState/running` và agent Ready.
+
+Public key đăng nhập đã được cấu hình bằng block `admin_ssh_key` trong `compute.tf`. Đã đối chiếu metadata VM trên Azure: username `azureuser`, password authentication bị tắt, public key khớp file `~/.ssh/mcf-lab.pub` trên laptop và đường dẫn key được cấu hình là `/home/azureuser/.ssh/authorized_keys`. Đây là kiểm tra cấu hình Azure trả về, chưa phải đọc file trong guest hoặc nghiệm thu SSH.
+
+Cần phân biệt cặp key đăng nhập của người quản trị với host key của VM: public key đăng nhập giúp VM xác thực người quản trị, còn fingerprint host giúp SSH client xác thực danh tính máy chủ. Run Command dưới đây phục vụ việc đọc fingerprint host.
+
+Trước lần SSH đầu tiên, lấy fingerprint host từ đúng VM qua Azure Portal: Virtual machines, chọn `mcf-azure-standby`, mở nhóm **Operations** ở menu bên trái, chọn **Run command**, rồi **RunShellScript**. Cần mở trang chi tiết của VM; có thể gõ `Run command` vào ô tìm kiếm menu của trang VM để lọc mục. Nhập lệnh đọc public host key rồi chạy:
+
+```bash
+ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub
+```
+
+Run Command thực hiện lệnh trên VM qua Azure VM Agent. Lệnh trên đọc fingerprint ED25519 của máy chủ, khác fingerprint của cặp key đăng nhập `mcf-lab`. Giữ kết quả để so sánh với lời nhắc khi SSH. Việc chạy Run Command do người thực hành thực hiện, chưa được đánh dấu đã chạy trong kết quả kiểm tra hạ tầng.
+
+Cũng có thể lấy fingerprint từ Git Bash trên laptop bằng Azure CLI:
+
+```bash
+MSYS_NO_PATHCONV=1 az vm run-command invoke \
+  --resource-group mcf-azure-rg \
+  --name mcf-azure-standby \
+  --command-id RunShellScript \
+  --scripts 'ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub' \
+  --query 'value[].message' \
+  --output tsv
+```
+
+`MSYS_NO_PATHCONV=1` giữ nguyên đường dẫn Linux trong script khi gọi Azure CLI Windows từ Git Bash. Đây là cách thay thế thao tác Portal, cùng dùng Run Command/VM Agent để thực hiện lệnh đọc fingerprint; có thể mất thêm thời gian khởi chạy handler ở lần đầu.
+
+Trong Git Bash trên laptop tại thư mục gốc project, lấy Public IP từ state và SSH:
+
+```bash
+azure_ip=$(terraform -chdir=deploy/terraform/azure output -raw azure_public_ip)
+ssh -i ~/.ssh/mcf-lab "azureuser@$azure_ip"
+```
+
+`-i` trỏ đến private key local, `azureuser` là username đã cấu hình trong VM resource. Khi SSH hiển thị ED25519 fingerprint, đối chiếu với kết quả Run Command của đúng VM; nhập `yes` khi khớp. Nếu không khớp hoặc có cảnh báo host key changed, dừng xác minh danh tính máy trước khi xử lý known_hosts. Nếu private key có passphrase, nhập passphrase đã đặt lúc tạo key.
+
+Sau khi đăng nhập, các lệnh tiếp theo chạy trên Azure VM:
+
+```bash
+whoami
+cat /etc/os-release
+```
+
+Kết quả mong đợi: user `azureuser` và Ubuntu 24.04 LTS. Nếu SSH timeout, kiểm tra running state, Public IP và source `/32` của rule SSH có đúng public IPv4 hiện tại của laptop. Nếu `Permission denied (publickey)`, kiểm tra đúng username/private key. Không mở rộng rule SSH cho toàn Internet để bỏ qua lỗi cấu hình.
+
+Người thực hành đã xác nhận SSH thành công và hai lệnh kiểm tra trả kết quả đúng: user `azureuser`, Ubuntu 24.04 LTS. Phần nghiệm thu hạ tầng và truy cập máy chủ của giai đoạn 4 đã đạt độc lập trên AWS và Azure. AWS đã được dọn sau nghiệm thu để tiết kiệm, Azure đã triển khai và nghiệm thu SSH. Cần tạo lại AWS trước các bước yêu cầu hai máy chạy đồng thời. K3s, WireGuard, PostgreSQL và ứng dụng cloud được triển khai ở giai đoạn tiếp theo. Checklist budget vẫn chưa được xác nhận thực hiện.
+
+Tham khảo: [Microsoft: connect to a Linux VM và xác minh fingerprint](https://learn.microsoft.com/en-us/azure/virtual-machines/linux-vm-connect), [Run Command qua Portal và CLI](https://learn.microsoft.com/en-us/azure/virtual-machines/linux/run-command), [Azure VM instance view](https://learn.microsoft.com/en-us/cli/azure/vm?view=azure-cli-latest#az-vm-get-instance-view).
+
+### 6.16. Dọn lab Azure sau buổi thực hành và tạo lại
+
+Ở thời điểm dọn lần này, VM mới được nghiệm thu SSH/Ubuntu, chưa cài K3s hoặc triển khai database/workload cloud. Người quản trị yêu cầu xóa hạ tầng Azure để nghỉ, giữ khả năng tạo lại bằng Terraform. Không áp dụng thao tác xóa bên dưới cho máy đã có dữ liệu cần giữ nếu chưa có phương án backup và khôi phục phù hợp.
+
+Trước khi xóa, đối chiếu `terraform state list` của root Azure và inventory trong Resource Group `mcf-azure-rg`. Sao lưu state local ra ngoài Git:
+
+```bash
+mkdir -p ~/.mcf-state-backups/azure
+cp deploy/terraform/azure/terraform.tfstate \
+  ~/.mcf-state-backups/azure/before-destroy-$(date -u +%Y%m%dT%H%M%SZ).tfstate
+```
+
+Trong terminal đã chọn đúng Azure for Students và export theo mục 6.2, lập saved destroy plan:
+
+```bash
+terraform -chdir=deploy/terraform/azure plan -destroy -out=pause-destroy.tfplan
+```
+
+Đọc kỹ phạm vi; ở cấu hình hiện tại phải chỉ gồm mười một resource đã tạo trong Resource Group của project:
+
+```text
+Plan: 0 to add, 0 to change, 11 to destroy.
+```
+
+Thực hiện kế hoạch đã xem:
+
+```bash
+terraform -chdir=deploy/terraform/azure apply pause-destroy.tfplan
+```
+
+Lệnh saved plan apply không hỏi nhập `yes` lại. Với `features {}` hiện có, provider xóa managed OS disk cùng VM. Nếu sau này thay đổi cấu hình giữ đĩa, cần kiểm tra và quản lý đĩa còn lại riêng.
+
+Kết quả thực tế của lần dọn này:
+
+```text
+Apply complete! Resources: 0 added, 0 changed, 11 destroyed.
+```
+
+Đã kiểm tra sau khi xóa: `az group exists --name mcf-azure-rg` trả `false`, không còn resource thuộc nhóm hoặc mang tag Project của đồ án trong kết quả kiểm tra subscription, không còn OS disk `mcf-azure-osdisk` hoặc Public IP `mcf-azure-public-ip`. Azure state có 0 managed resource. Private/public SSH key trên laptop vẫn tồn tại; code, tfvars, lock file và state đã cập nhật được giữ nguyên. State đã được sao lưu tại thư mục `~/.mcf-state-backups/azure/` trước thao tác xóa.
+
+Khi tiếp tục, dùng code hiện có để lập kế hoạch tạo mới, không dùng lại saved plan cũ:
+
+```bash
+export ARM_SUBSCRIPTION_ID="$(az account show --query id --output tsv | tr -d '\r')"
+terraform -chdir=deploy/terraform/azure plan -out=azure.tfplan
+```
+
+Sau khi kiểm tra đúng subscription, cấu hình và mười một resource tạo mới, apply theo mục 6.14 rồi nghiệm thu theo mục 6.15. Dùng outputs và host fingerprint mới. AWS cũng đã được dọn ở phần trước, nên tạo lại từ root AWS khi cần; không dùng IP hoặc saved plan của máy đã xóa. Việc tạo lại được thực hiện khi quay lại thực hành, chưa tự động triển khai trong bước dọn lab.
+
+Tham khảo: [Terraform destroy plan](https://developer.hashicorp.com/terraform/cli/commands/destroy), [AzureRM OS disk deletion behavior](https://github.com/hashicorp/terraform-provider-azurerm/blob/v4.81.0/website/docs/guides/features-block.html.markdown).
+
 ## 7. Theo dõi tiến độ
 
-- [ ] Xác nhận Terraform, AWS CLI, Azure CLI và SSH chạy được trong Git Bash.
+- [x] Xác nhận Terraform, AWS CLI, Azure CLI và SSH chạy được trong Git Bash.
 - [x] Đăng nhập Azure CLI và xác nhận Azure for Students ở trạng thái Enabled, được chọn mặc định.
 - [x] Kiểm tra quyền tại subscription: xác nhận role Owner qua View my access.
 - [x] Đọc quota Southeast Asia: tổng region 0/6; BS 0/4; Bsv2 và Basv2 đều 0/10.
@@ -2713,8 +3130,8 @@ Tham khảo: [AzureRM 4.81.0 public IP](https://github.com/hashicorp/terraform-p
 - [ ] Tạo budget tại subscription và xác nhận thresholds/email cảnh báo.
 - [x] Xác thực AWS: người quản trị xác nhận STS trả về đúng danh tính tài khoản dùng triển khai.
 - [x] Chuẩn bị SSH key local và kiểm tra fingerprint public key ED25519.
-- [ ] Chọn region, kiểm tra khả năng cấp máy và chuẩn bị SSH key.
-- [ ] Tạo cấu hình Terraform/provider và quy ước state/lock file.
+- [x] Chọn region, kiểm tra khả năng cấp máy và chuẩn bị SSH key.
+- [x] Tạo cấu hình Terraform/provider và quy ước state/lock file.
 - [x] Tạo `deploy/terraform/aws/versions.tf`; đã đọc và đối chiếu nội dung khai báo phiên bản.
 - [x] Tạo `deploy/terraform/aws/providers.tf`; đã đọc và đối chiếu region/profile.
 - [x] Chạy `terraform init` và `terraform validate` thành công cho root module AWS; AWS provider được khóa ở `6.72.0`.
@@ -2759,10 +3176,19 @@ Tham khảo: [AzureRM 4.81.0 public IP](https://github.com/hashicorp/terraform-p
 - [x] Khai báo NSG Azure và kiểm tra plan bốn resource tạo mới theo mục 6.6; chưa apply.
 - [x] Khai báo admin CIDR và rule SSH Azure, xác nhận tfvars được ignore và plan năm resource tạo mới theo mục 6.7; chưa apply.
 - [x] Khai báo HTTP/HTTPS ingress Azure và kiểm tra plan bảy resource tạo mới theo mục 6.8; chưa apply.
-- [ ] Khai báo Static Standard Public IPv4 Azure và kiểm tra plan tám resource tạo mới theo mục 6.9.
-- [ ] Khai báo mạng và quy tắc truy cập của hai môi trường.
-- [ ] Khai báo compute, địa chỉ IP và đĩa.
-- [ ] Kiểm tra plan rồi triển khai các lớp hạ tầng.
-- [ ] Xác nhận inventory, kết nối SSH và ghi bằng chứng nghiệm thu.
+- [x] Khai báo Static Standard Public IPv4 Azure trong `network.tf`, kiểm tra fmt/validate đạt theo mục 6.9; chưa apply.
+- [x] Khai báo NIC, NIC–NSG association và kiểm tra plan mười resource tạo mới theo mục 6.10; chưa apply.
+- [x] Tra cứu Ubuntu 24.04 x64 Gen2, cố định ứng viên image version và đọc quota regional/Basv2 theo mục 6.11.
+- [x] Đọc lại SKU restrictions; chọn ứng viên `Standard_B2als_v2` tại Zone 1, tránh Zone 2 bị hạn chế theo mục 6.11.
+- [x] Khai báo VM Azure với image đã cố định, SSH key và OS disk; kiểm tra plan mười một resource tạo mới theo mục 6.12; chưa apply.
+- [x] Khai báo ba output Azure và kiểm tra plan theo mục 6.13; chưa apply.
+- [x] Lưu plan và apply mười một resource Azure theo mục 6.14, nhận ba output thực tế.
+- [x] Xác nhận Azure VM provisioning succeeded, running, agent Ready và post-apply plan No changes.
+- [x] Nghiệm thu SSH và Ubuntu trên VM Azure theo mục 6.15.
+- [x] Dọn lab Azure theo yêu cầu nghỉ thực hành, sao lưu state và kiểm tra VM/OS disk/Public IP/Resource Group đã được xóa theo mục 6.16.
+- [x] Khai báo mạng và quy tắc truy cập của hai môi trường.
+- [x] Khai báo compute, địa chỉ IP và đĩa.
+- [x] Kiểm tra plan rồi triển khai các lớp hạ tầng độc lập trên AWS và Azure.
+- [x] Đối chiếu inventory/state, trạng thái máy và ghi nhận xác nhận SSH từ người thực hành; các bằng chứng được mô tả ở mục tương ứng của tài liệu.
 
 Chỉ đánh dấu hoàn thành theo kết quả thực hành. Các lệnh đăng nhập và đoạn cấu hình Terraform sẽ được bổ sung khi bắt đầu bước tương ứng.
