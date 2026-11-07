@@ -2144,7 +2144,564 @@ Các dòng `Apply complete! ...` và `No changes. ...` trong tài liệu là k�
 
 Tham khảo: [provider issue về EIP và replacement diff](https://github.com/hashicorp/terraform-provider-aws/issues/47100), [schema và logic đọc của AWS provider 6.72.0](https://github.com/hashicorp/terraform-provider-aws/blob/v6.72.0/internal/service/ec2/ec2_instance.go), [AWS subnet public IP defaults](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/using-instance-addressing.html).
 
-## 6. Theo dõi tiến độ
+### 5.30. Tiếp tục thực hành sau khi dọn hạ tầng
+
+Ở lần tiếp tục thực hành này, `terraform state list` không trả về resource. Truy vấn AWS tại Singapore cũng không tìm thấy EC2 ở trạng thái pending/running/stopping/stopped hoặc EBS volume mang tag `Project=multi-cloud-failover`. Đây là kết quả kiểm tra phạm vi project, không phải kiểm kê mọi dịch vụ trong tài khoản.
+
+Các kết quả apply ở mục trước ghi lại lần triển khai đã thực hiện. Sau khi dọn hạ tầng, cần tạo lại trước khi nghiệm thu SSH; dùng output mới thay cho instance ID/IP của lần trước.
+
+Giữ nguyên các file Terraform, `terraform.tfvars`, lock file, state và SSH key local. Nếu đổi mạng Internet, kiểm tra `admin_cidr` trong `terraform.tfvars` vẫn là public IPv4 hiện tại kèm `/32`, vì Security Group chỉ cho phép SSH từ địa chỉ đó. Không đưa file tfvars hoặc private key lên Git.
+
+Trong Git Bash tại thư mục gốc project, lập kế hoạch mới:
+
+```bash
+terraform -chdir=deploy/terraform/aws plan
+```
+
+Với cấu hình hiện tại và state trống, kết quả dự kiến:
+
+```text
+Plan: 14 to add, 0 to change, 0 to destroy.
+```
+
+Mười bốn resource gồm năm resource mạng, Security Group và bốn rule, Key Pair, EC2, Elastic IP và EIP association. AMI data source chỉ tra cứu image, không nằm trong số resource tạo mới.
+
+Đối chiếu region `ap-southeast-1`, AZ `ap-southeast-1c`, instance type `t3.medium`, root gp3 30 GiB và ba output sẽ được xác định sau apply. Lệnh plan chưa tạo máy hoặc bắt đầu phí chạy EC2. Không dùng lại các saved plan của lần triển khai cũ.
+
+Kết quả thực hành đã nhận: người quản trị xác nhận plan đúng `14 to add, 0 to change, 0 to destroy`. Tiếp tục tạo lại hạ tầng từ Git Bash:
+
+```bash
+terraform -chdir=deploy/terraform/aws apply
+```
+
+Lệnh apply không kèm saved plan sẽ lập kế hoạch mới và yêu cầu xác nhận. Đọc lại đúng 14 resource tạo mới, không change/destroy, đúng account/region và cấu hình đã kiểm tra; sau đó nhập `yes` tại lời nhắc. Đây là bước tạo tài nguyên thật, bắt đầu phát sinh chi phí EC2/EBS/public IPv4 theo trạng thái tài nguyên.
+
+Kết quả mong đợi:
+
+```text
+Apply complete! Resources: 14 added, 0 changed, 0 destroyed.
+```
+
+Đọc lại ba output mới:
+
+```bash
+terraform -chdir=deploy/terraform/aws output
+```
+
+Các output `aws_instance_id`, `aws_private_ip`, `aws_public_ip` được dùng cho những bước kiểm tra tiếp theo. Không dùng ID/IP của lần triển khai trước. Nếu apply lỗi giữa chừng, giữ nguyên state để xử lý, không xóa state hoặc dùng lại saved plan cũ. Chưa đánh dấu tạo lại hạ tầng hoặc SSH hoàn thành cho tới khi có kết quả thực tế; status checks và SSH là bước tiếp theo.
+
+Tham khảo: [Terraform plan](https://developer.hashicorp.com/terraform/cli/commands/plan), [Terraform apply](https://developer.hashicorp.com/terraform/cli/commands/apply).
+
+### 5.31. Kiểm tra EC2 và kết nối SSH
+
+Người quản trị đã thực hiện apply tạo lại hạ tầng. Đã đọc được ba output mới từ state; truy vấn trực tiếp EC2 xác nhận máy ở trạng thái `running`, system check, instance check và attached EBS check đều `ok`. Kết quả này xác nhận trạng thái hạ tầng; SSH và Ubuntu cần kiểm tra riêng.
+
+Để tự kiểm tra lại từ Git Bash trên laptop:
+
+```bash
+instance_id=$(terraform -chdir=deploy/terraform/aws output -raw aws_instance_id)
+aws ec2 describe-instance-status \
+  --profile default \
+  --region ap-southeast-1 \
+  --instance-ids "$instance_id" \
+  --include-all-instances \
+  --query 'InstanceStatuses[].{State:InstanceState.Name,System:SystemStatus.Status,Instance:InstanceStatus.Status,EBS:AttachedEbsStatus.Status}' \
+  --output table \
+  --no-cli-pager
+```
+
+Kết quả mong đợi là `running` và các check `ok`. Nếu mới khởi động còn `initializing`, đợi rồi kiểm tra lại.
+
+Lấy Elastic IP mới và SSH bằng private key local:
+
+```bash
+aws_ip=$(terraform -chdir=deploy/terraform/aws output -raw aws_public_ip)
+ssh -i ~/.ssh/mcf-lab "ubuntu@$aws_ip"
+```
+
+`-i` chọn private key trên laptop; file `.pub` đã được dùng khi Terraform tạo key pair. `ubuntu` là username của Ubuntu AMI đang dùng. Kết nối đi từ laptop tới Elastic IP qua TCP 22 và chịu giới hạn `admin_cidr` trong Security Group.
+
+Lần đầu SSH hiển thị fingerprint host và hỏi có tin máy chủ hay không. Đối chiếu fingerprint với mục `SSH HOST KEY FINGERPRINTS` trong system log của đúng EC2 (Console: Instances, chọn máy, Actions, Monitor and troubleshoot, Get system log), rồi nhập `yes` khi khớp. Fingerprint host thuộc máy chủ, khác fingerprint public key đăng nhập của người quản trị. Sau khi tạo lại EC2, đọc fingerprint mới; nếu SSH báo host key changed, kiểm tra danh tính máy trước khi xử lý known_hosts.
+
+Khi đăng nhập thành công, terminal đang chạy lệnh trên EC2. Chạy:
+
+```bash
+whoami
+cat /etc/os-release
+```
+
+Kết quả mong đợi: user `ubuntu`, hệ điều hành Ubuntu 24.04 LTS. Nếu key có passphrase, nhập passphrase đã đặt khi tạo key. Nếu timeout, kiểm tra EC2/status checks, public IP và `admin_cidr`; nếu `Permission denied (publickey)`, kiểm tra username và cặp key. Không mở SSH cho toàn Internet để xử lý lỗi kết nối.
+
+Kết quả thực hành đã nhận: người quản trị xác nhận SSH và kiểm tra Ubuntu thành công. Plan sau apply đã được kiểm tra, exit code 0 và thông báo `No changes. Your infrastructure matches the configuration.` Phần hạ tầng AWS đã đạt các bước tạo tài nguyên, status checks, SSH và đối chiếu cấu hình; K3s, WireGuard và ứng dụng được thực hành sau.
+
+Tham khảo: [AWS SSH connection prerequisites](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/connect-to-linux-instance.html), [EC2 status checks](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/monitoring-system-instance-status-check.html).
+
+## 6. Terraform cho hạ tầng Azure
+
+Trong lúc viết và kiểm tra Terraform Azure, chưa cần giữ máy AWS chạy. Hai root module hiện độc lập; hạ tầng AWS chưa có K3s, tool hoặc database cần giữ. Có thể dọn tài nguyên AWS sau khi nghiệm thu SSH rồi tạo lại khi bắt đầu triển khai workload. Cả hai máy cần chạy đồng thời khi kiểm tra WireGuard, streaming replication và diễn tập failover.
+
+Để dọn AWS, trước tiên ghi lại root volume ID của đúng EC2 hiện tại (EC2 Console, chọn instance, tab Storage). Nếu còn ở phiên SSH, dùng `exit` để về laptop, sau đó chạy trong Git Bash tại thư mục gốc repository:
+
+```bash
+terraform -chdir=deploy/terraform/aws destroy
+```
+
+Đọc kế hoạch chỉ gồm tài nguyên AWS của root này; cấu hình hiện tại dự kiến `0 to add, 0 to change, 14 to destroy`. Nhập `yes` khi đúng phạm vi. Root Azure có state riêng nên không thuộc thao tác destroy này.
+
+Sau `Destroy complete!`, vào EC2 Console tại Singapore, mục Volumes, đối chiếu root volume ID đã ghi, tag `Name=mcf-aws-root`, `Project=multi-cloud-failover`, dung lượng 30 GiB. Khi volume ở trạng thái `available`, xóa volume đó nếu không cần dữ liệu. Cấu hình `delete_on_termination=false` giữ lại EBS sau khi EC2 bị terminate; không bỏ qua bước dọn đĩa. Xóa volume làm mất dữ liệu trên đĩa đó.
+
+Giữ code, tfvars, lock file, state đã được Terraform cập nhật và SSH key trên laptop. Khi cần dùng AWS trở lại, làm plan/apply mới theo mục 5.30, kiểm tra output mới và SSH theo mục 5.31. Không dùng IP, host fingerprint hoặc saved plan của máy đã xóa.
+
+Đã kiểm tra sau khi người quản trị dọn AWS: Terraform state trống; EC2 của lần triển khai mới ở trạng thái `terminated`. Truy vấn tại `ap-southeast-1` không còn instance pending/running/stopping/stopped, EBS volume, Elastic IP, NAT Gateway chưa deleted hoặc snapshot do tài khoản sở hữu. VPC, subnet, Internet Gateway, route table, Security Group mang tag project và key pair `mcf-lab` cũng không còn. Kết quả kiểm tra giới hạn các tài nguyên và region vừa nêu, không phải kiểm toán chi phí toàn tài khoản hoặc các region khác. Có thể tiếp tục cấu hình Azure mà chưa cần tạo lại AWS.
+
+Tham khảo: [EBS được giữ sau termination](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/preserving-volumes-on-termination.html), [xóa EBS volume](https://docs.aws.amazon.com/ebs/latest/userguide/ebs-deleting-volume.html).
+
+### 6.1. Khai báo phiên bản Terraform và AzureRM provider
+
+Giữ hai môi trường trong cùng repository, dùng hai root module `deploy/terraform/aws` và `deploy/terraform/azure`. Mỗi root có state, thư mục `.terraform` và dependency lock file riêng. Các lệnh Azure dưới đây chạy trên laptop trong Git Bash; nếu còn trong SSH vào EC2, chạy `exit` để trở về laptop trước.
+
+Từ thư mục gốc project:
+
+```bash
+cd /d/multi-cloud-failover
+mkdir -p deploy/terraform/azure
+touch deploy/terraform/azure/versions.tf
+```
+
+Người thực hành tự điền nội dung sau vào `deploy/terraform/azure/versions.tf`:
+
+```hcl
+terraform {
+  required_version = ">= 1.10.0, < 2.0.0"
+
+  required_providers {
+    azurerm = {
+      source  = "hashicorp/azurerm"
+      version = "~> 4.0"
+    }
+  }
+}
+```
+
+`required_version` giới hạn phiên bản Terraform CLI, giống root AWS. Provider `hashicorp/azurerm` giúp Terraform gọi Azure Resource Manager API để quản lý Resource Group, VNet, VM và các tài nguyên Azure. Chọn nhánh provider 4.x cho cấu hình của bài thực hành; `~> 4.0` cho phép các phiên bản từ 4.0.0 đến dưới 5.0.0, không có nghĩa phải dùng bản mới nhất trên mọi major version.
+
+Sau khi lưu file, tải provider:
+
+```bash
+terraform -chdir=deploy/terraform/azure init
+```
+
+Kết quả mong đợi là `Terraform has been successfully initialized!`; Terraform tạo dependency lock file trong root Azure và ghi phiên bản provider thực tế được chọn. Lock file cần được đưa vào Git, còn `.terraform/` và state đã được ignore. Bước này chỉ khởi tạo thư mục làm việc và tải provider, chưa tạo tài nguyên Azure.
+
+Đã nhận xác nhận init thành công và đối chiếu `versions.tf` cùng lock file: AzureRM được khóa ở phiên bản `4.81.0`. Cấu hình provider và lựa chọn subscription được thực hành ở mục 6.2.
+
+Tham khảo: [Terraform provider requirements](https://developer.hashicorp.com/terraform/language/providers/requirements), [AzureRM provider](https://registry.terraform.io/providers/hashicorp/azurerm/latest/docs).
+
+### 6.2. Cấu hình provider và chọn Azure subscription
+
+Trên Git Bash ở thư mục gốc project, tạo file:
+
+```bash
+touch deploy/terraform/azure/providers.tf
+```
+
+Tự điền vào `deploy/terraform/azure/providers.tf`:
+
+```hcl
+provider "azurerm" {
+  features {}
+}
+```
+
+`versions.tf` khai báo provider cần tải; `providers.tf` cấu hình cách sử dụng provider. Khối `features {}` là bắt buộc với AzureRM, để trống nghĩa là dùng các hành vi resource mặc định của provider. AzureRM có thể dùng phiên đăng nhập Azure CLI trên laptop. Trong bài thực hành, subscription được truyền rõ qua biến môi trường `ARM_SUBSCRIPTION_ID`.
+
+Kiểm tra subscription đang được chọn:
+
+```bash
+az account show --query '{Name:name,ID:id,State:state}' --output table
+```
+
+Kết quả cần là subscription Azure for Students của người thực hành ở trạng thái `Enabled`. Nếu CLI yêu cầu đăng nhập, chạy `az login` và chọn subscription đúng rồi kiểm tra lại. Nếu chọn nhầm subscription, dùng `az account set --subscription '<subscription-id-cua-ban>'` rồi kiểm tra lại trước khi tiếp tục.
+
+Trong cùng terminal, gán subscription cho Terraform:
+
+```bash
+export ARM_SUBSCRIPTION_ID="$(az account show --query id --output tsv | tr -d '\r')"
+```
+
+`az account show` đọc ID subscription hiện được chọn; `tr -d '\r'` loại ký tự carriage return có thể xuất hiện từ Azure CLI Windows. `export` cho Terraform khởi chạy từ terminal này đọc được biến. Đây là subscription ID, không phải access token. Khi mở terminal Git Bash mới, kiểm tra lại subscription và chạy lại lệnh export trước plan/apply. Nếu lệnh Azure CLI lỗi hoặc không trả ID, xử lý đăng nhập trước khi chạy tiếp.
+
+Kiểm tra định dạng và cấu hình:
+
+```bash
+terraform -chdir=deploy/terraform/azure fmt
+terraform -chdir=deploy/terraform/azure validate
+```
+
+`fmt` thường không in nội dung nếu file đã đúng định dạng. `validate` cần báo `Success! The configuration is valid.` Nó kiểm tra cấu hình, không chứng minh token hay quyền tạo tài nguyên; việc gọi Azure thực tế được kiểm tra khi plan tài nguyên ở bước tiếp theo.
+
+Đã đối chiếu file `providers.tf` do người thực hành tạo; `fmt -check` và `validate` đều đạt. Chưa có khai báo resource trong root Azure ở thời điểm kiểm tra này. Trạng thái CLI đã được đọc là Azure for Students, Enabled, default. Biến môi trường cần được gán trong chính terminal chạy plan/apply như hướng dẫn trên.
+
+Tham khảo: [AzureRM 4.81.0 provider configuration](https://github.com/hashicorp/terraform-provider-azurerm/blob/v4.81.0/website/docs/index.html.markdown), [xác thực bằng Azure CLI](https://github.com/hashicorp/terraform-provider-azurerm/blob/v4.81.0/website/docs/guides/azure_cli.html.markdown).
+
+### 6.3. Khai báo Resource Group và đọc plan đầu tiên
+
+Resource Group là nhóm quản lý các tài nguyên liên quan của giải pháp Azure. Project sẽ đặt VNet, NSG, public IP, NIC và VM của môi trường standby vào nhóm riêng `mcf-azure-rg` để quản lý vòng đời cùng nhau.
+
+Trên Git Bash ở thư mục gốc project:
+
+```bash
+touch deploy/terraform/azure/resource_group.tf
+```
+
+Người thực hành tự điền vào `deploy/terraform/azure/resource_group.tf`:
+
+```hcl
+resource "azurerm_resource_group" "standby" {
+  name     = "mcf-azure-rg"
+  location = "southeastasia"
+
+  tags = {
+    Project = "multi-cloud-failover"
+  }
+}
+```
+
+`azurerm_resource_group` là loại resource; `standby` là tên tham chiếu trong Terraform; `mcf-azure-rg` là tên trên Azure. `location` của Resource Group xác định nơi lưu metadata của nhóm; resource bên trong có location riêng. Với bài thực hành, các resource có location sẽ được cấu hình ở Southeast Asia theo các bước tiếp theo. Tag giúp nhận diện project, không tự động truyền xuống mọi resource thành viên.
+
+Trong cùng terminal đã chọn đúng subscription và export `ARM_SUBSCRIPTION_ID`, chạy:
+
+```bash
+terraform -chdir=deploy/terraform/azure fmt
+terraform -chdir=deploy/terraform/azure validate
+terraform -chdir=deploy/terraform/azure plan
+```
+
+Nếu mở Git Bash mới, thực hiện lại bước kiểm tra subscription và export ở mục 6.2 trước plan. `validate` cần đạt, plan dự kiến có `azurerm_resource_group.standby` với name/location/tag như trên và tổng kết:
+
+```text
+Plan: 1 to add, 0 to change, 0 to destroy.
+```
+
+Chưa apply ở bước này. Plan lập kế hoạch tạo nhóm, chưa tạo VM hoặc nhóm tài nguyên. Lần đầu provider kết nối subscription có thể cần thêm thời gian kiểm tra/đăng ký các Azure Resource Provider theo cấu hình mặc định. Nếu có lỗi đăng nhập, quyền, policy hoặc provider registration, đọc lỗi để xử lý trước khi đi tiếp; không coi validate thành công là đã nghiệm thu kết nối Azure.
+
+Theo yêu cầu người thực hành, đã chạy `fmt`, `validate` và `plan` trên cấu hình này. `fmt` và `validate` đạt; Azure CLI chọn Azure for Students ở trạng thái Enabled, subscription ID được truyền qua biến môi trường cho tiến trình Terraform. Plan trả đúng `1 to add, 0 to change, 0 to destroy`, gồm `azurerm_resource_group.standby`, tên `mcf-azure-rg`, location `southeastasia`, tag project như trên. Với `-detailed-exitcode`, exit code 2 nghĩa là plan thành công và có thay đổi dự kiến. Chưa chạy apply hoặc tạo Resource Group. Bước tiếp theo sẽ khai báo VNet thuộc nhóm này.
+
+Tham khảo: [Resource Group trong Azure](https://learn.microsoft.com/en-us/azure/azure-resource-manager/management/manage-resource-groups-portal), [AzureRM 4.81.0 resource group](https://github.com/hashicorp/terraform-provider-azurerm/blob/v4.81.0/website/docs/r/resource_group.html.markdown).
+
+### 6.4. Khai báo VNet cho Azure standby
+
+VNet là mạng riêng của môi trường Azure, có vai trò tương đương VPC trên AWS. Bài thực hành chọn CIDR `10.30.0.0/16`, tách khỏi dải AWS `10.29.0.0/16` để tránh trùng địa chỉ khi xây dựng kết nối liên cloud.
+
+Tại thư mục gốc repository trong Git Bash, tạo file:
+
+```bash
+touch deploy/terraform/azure/network.tf
+```
+
+Người thực hành tự nhập vào `deploy/terraform/azure/network.tf`:
+
+```hcl
+resource "azurerm_virtual_network" "standby" {
+  name                = "mcf-azure-vnet"
+  location            = azurerm_resource_group.standby.location
+  resource_group_name = azurerm_resource_group.standby.name
+  address_space       = ["10.30.0.0/16"]
+
+  tags = {
+    Project = "multi-cloud-failover"
+  }
+}
+```
+
+`name` là tên VNet trên Azure; `location` dùng cùng region đã khai báo cho nhóm. `resource_group_name` đặt VNet vào Resource Group của project. Các tham chiếu `azurerm_resource_group.standby.*` giúp Terraform nhận biết dependency để tạo Resource Group trước VNet, không cần khai báo thêm `depends_on`. `address_space` là danh sách CIDR của mạng, tương ứng ý nghĩa dải địa chỉ VPC ở bước AWS.
+
+VNet hiện chưa có subnet. Bước tiếp theo sẽ thêm subnet bằng resource riêng trong cùng file `network.tf`.
+
+Sau khi lưu, trong terminal đã chọn đúng Azure for Students, chạy:
+
+```bash
+export ARM_SUBSCRIPTION_ID="$(az account show --query id --output tsv | tr -d '\r')"
+terraform -chdir=deploy/terraform/azure fmt
+terraform -chdir=deploy/terraform/azure validate
+terraform -chdir=deploy/terraform/azure plan
+```
+
+Biến môi trường của một tiến trình chạy hộ không được truyền ngược về terminal người thực hành; lệnh export trên giúp terminal hiện tại có subscription ID trước khi plan. Nếu `az account show` lỗi hoặc chọn sai subscription, xử lý theo mục 6.2 trước khi tiếp tục.
+
+Do Resource Group chưa apply ở bước trước, plan dự kiến có hai resource tạo mới là `azurerm_resource_group.standby` và `azurerm_virtual_network.standby`:
+
+```text
+Plan: 2 to add, 0 to change, 0 to destroy.
+```
+
+Đối chiếu name `mcf-azure-vnet`, address space `10.30.0.0/16`, location `southeastasia` và nhóm `mcf-azure-rg`. Người thực hành đã xác nhận plan chạy đúng; code VNet đã được đọc lại, `fmt -check` và `validate` đạt. Chưa apply ở bước này.
+
+Tham khảo: [AzureRM 4.81.0 virtual network](https://github.com/hashicorp/terraform-provider-azurerm/blob/v4.81.0/website/docs/r/virtual_network.html.markdown).
+
+### 6.5. Khai báo subnet cho VM Azure
+
+Subnet chia không gian địa chỉ của VNet thành một mạng nhỏ hơn để gắn NIC của VM. Với VNet `10.30.0.0/16`, project dùng subnet `10.30.1.0/24`.
+
+Trong file `deploy/terraform/azure/network.tf`, giữ nguyên resource VNet và thêm block sau ở dưới, bên ngoài block VNet:
+
+```hcl
+resource "azurerm_subnet" "standby" {
+  name                 = "mcf-azure-subnet"
+  resource_group_name  = azurerm_resource_group.standby.name
+  virtual_network_name = azurerm_virtual_network.standby.name
+  address_prefixes     = ["10.30.1.0/24"]
+
+  default_outbound_access_enabled = false
+}
+```
+
+`virtual_network_name` tham chiếu VNet vừa khai báo; `address_prefixes` là danh sách CIDR của subnet và phải nằm trong không gian địa chỉ VNet. Terraform nhận dependency để tạo Resource Group, VNet rồi subnet theo đúng thứ tự.
+
+`default_outbound_access_enabled = false` tắt cơ chế outbound Internet ngầm của Azure trên subnet. Kiến trúc project sẽ gắn Public IP tĩnh trực tiếp vào NIC của VM ở bước sau để cung cấp kết nối Internet tường minh. Cờ này không quyết định cho phép truy cập Internet vào VM; việc đó còn phụ thuộc Public IP và NSG. Trong giai đoạn hiện tại chưa có VM cần kết nối Internet.
+
+Sau khi lưu, trong Git Bash đã chọn đúng subscription và export `ARM_SUBSCRIPTION_ID`, chạy:
+
+```bash
+terraform -chdir=deploy/terraform/azure fmt
+terraform -chdir=deploy/terraform/azure validate
+terraform -chdir=deploy/terraform/azure plan
+```
+
+Nếu mở terminal mới, kiểm tra subscription và export lại theo mục 6.2 trước plan. Do chưa apply các resource trước, plan dự kiến:
+
+```text
+Plan: 3 to add, 0 to change, 0 to destroy.
+```
+
+Ba resource gồm Resource Group, VNet và subnet. Đối chiếu subnet `mcf-azure-subnet`, CIDR `10.30.1.0/24`, thuộc VNet `mcf-azure-vnet` và cờ default outbound false. Người thực hành đã xác nhận chạy đúng; đã đọc lại code subnet và kiểm tra fmt/validate đạt. Chưa apply.
+
+Tham khảo: [AzureRM 4.81.0 subnet](https://github.com/hashicorp/terraform-provider-azurerm/blob/v4.81.0/website/docs/r/subnet.html.markdown), [Azure default và explicit outbound access](https://learn.microsoft.com/en-us/azure/virtual-network/ip-services/default-outbound-access).
+
+### 6.6. Khai báo Network Security Group
+
+Network Security Group (NSG) chứa các rule Allow/Deny cho traffic vào/ra. Có thể liên hệ vai trò kiểm soát truy cập của NSG với Security Group trên AWS; NSG có thêm cơ chế priority để xác định thứ tự xử lý rule. Các rule cho SSH và web được khai báo ở bước tiếp theo.
+
+Trong Git Bash tại thư mục gốc repository, tạo file:
+
+```bash
+touch deploy/terraform/azure/security.tf
+```
+
+Người thực hành tự điền vào `deploy/terraform/azure/security.tf`:
+
+```hcl
+resource "azurerm_network_security_group" "standby" {
+  name                = "mcf-azure-nsg"
+  location            = azurerm_resource_group.standby.location
+  resource_group_name = azurerm_resource_group.standby.name
+
+  tags = {
+    Project = "multi-cloud-failover"
+  }
+}
+```
+
+NSG dùng cùng region và Resource Group với mạng của project. Bước này mới khai báo nhóm, chưa có rule tùy chỉnh. Azure có các default rule trong NSG; trong số đó có cho phép traffic VirtualNetwork, cho phép outbound Internet và rule deny cuối cùng. Cho phép outbound ở lớp lọc NSG không thay thế cấu hình đường ra Internet; subnet vẫn tắt default outbound và VM sẽ dùng Public IP gắn NIC ở bước sau.
+
+NSG áp dụng cho tài nguyên sau khi được associate với subnet hoặc NIC. Thiết kế hiện tại sẽ associate NSG với NIC của VM; NIC và association được khai báo ở bước tiếp theo của lớp compute/network interface. Chỉ tạo NSG không tự động gắn nó vào VNet hoặc VM.
+
+Sau khi lưu, trong Git Bash đã chọn subscription và export theo mục 6.2, chạy:
+
+```bash
+terraform -chdir=deploy/terraform/azure fmt
+terraform -chdir=deploy/terraform/azure validate
+terraform -chdir=deploy/terraform/azure plan
+```
+
+Vì các resource trước chưa apply, kết quả dự kiến:
+
+```text
+Plan: 4 to add, 0 to change, 0 to destroy.
+```
+
+Gồm Resource Group, VNet, subnet và NSG. Đối chiếu tên `mcf-azure-nsg`, region `southeastasia`, nhóm `mcf-azure-rg` và tag project. Người thực hành xác nhận plan đúng; code NSG đã được đọc lại và fmt/validate đạt. Chưa apply.
+
+Tham khảo: [AzureRM 4.81.0 network security group](https://github.com/hashicorp/terraform-provider-azurerm/blob/v4.81.0/website/docs/r/network_security_group.html.markdown), [Azure NSG và default rules](https://learn.microsoft.com/en-us/azure/virtual-network/network-security-groups-overview).
+
+### 6.7. Giới hạn SSH từ public IPv4 của người quản trị
+
+Rule SSH cho phép TCP 22 từ public IPv4 hiện tại của laptop. Root Azure cần khai báo biến và giá trị riêng; các file trong root AWS không tự động được đọc khi chạy Terraform tại `deploy/terraform/azure`.
+
+Trong Git Bash tại thư mục gốc project, tạo hai file:
+
+```bash
+touch deploy/terraform/azure/variables.tf
+touch deploy/terraform/azure/terraform.tfvars
+```
+
+Tự nhập vào `deploy/terraform/azure/variables.tf`:
+
+```hcl
+variable "admin_cidr" {
+  description = "Public IPv4 CIDR allowed to SSH to the Azure host"
+  type        = string
+}
+```
+
+Xem public IPv4 của kết nối Internet laptop:
+
+```bash
+curl -4 -fsS https://checkip.amazonaws.com
+```
+
+Điền IP thực tế kèm `/32` vào `deploy/terraform/azure/terraform.tfvars`. Dòng dưới chỉ minh họa cấu trúc, phải thay IP mẫu bằng kết quả thực tế:
+
+```hcl
+admin_cidr = "203.0.113.10/32"
+```
+
+Địa chỉ `203.0.113.10` là IP tài liệu, không dùng để SSH thật. `/32` giới hạn một IPv4 nguồn. Nếu public IPv4 của laptop thay đổi, cập nhật giá trị trước khi tạo/cập nhật rule. Nếu cùng kết nối Internet với lần làm AWS, hai root có thể dùng cùng giá trị nhưng vẫn cần file tfvars riêng.
+
+Trong `deploy/terraform/azure/security.tf`, giữ NSG và thêm block ở bên ngoài resource NSG:
+
+```hcl
+resource "azurerm_network_security_rule" "ssh" {
+  name                        = "ssh-from-operator"
+  priority                    = 300
+  direction                   = "Inbound"
+  access                      = "Allow"
+  protocol                    = "Tcp"
+  source_port_range           = "*"
+  destination_port_range      = "22"
+  source_address_prefix       = var.admin_cidr
+  destination_address_prefix  = "*"
+  resource_group_name         = azurerm_resource_group.standby.name
+  network_security_group_name = azurerm_network_security_group.standby.name
+}
+```
+
+`source_address_prefix` giới hạn IP nguồn; `destination_port_range` là cổng SSH trên VM. `source_port_range="*"` cho phép cổng tạm mà SSH client chọn, không phải mở mọi cổng đích. Destination `*` là mọi địa chỉ đích trong phạm vi NSG được gắn; không thay thế giới hạn source `/32`. NSG sẽ được gắn vào NIC của VM ở bước sau.
+
+`priority=300` là thứ tự xử lý rule; số nhỏ được xét trước số lớn. Các rule tùy chỉnh cùng chiều cần priority riêng; HTTP/HTTPS sẽ dùng các giá trị khác. Tiếp tục dùng resource rule riêng, không trộn thêm block `security_rule` inline vào NSG.
+
+Kiểm tra ignore và cấu hình, trong terminal đã chọn subscription và export theo mục 6.2:
+
+```bash
+git check-ignore deploy/terraform/azure/terraform.tfvars
+terraform -chdir=deploy/terraform/azure fmt
+terraform -chdir=deploy/terraform/azure validate
+terraform -chdir=deploy/terraform/azure plan
+```
+
+Lệnh check-ignore cần in đường dẫn tfvars; file này được bỏ qua bởi quy tắc `*.tfvars` hiện có. Các file variables và security cần được đưa vào Git khi commit, tfvars được giữ local.
+
+Plan dự kiến:
+
+```text
+Plan: 5 to add, 0 to change, 0 to destroy.
+```
+
+Gồm bốn resource ở bước trước và `azurerm_network_security_rule.ssh`. Đọc lại source là IPv4 thực tế `/32`, TCP destination 22 và đúng NSG. Người thực hành đã xác nhận plan đúng; đã đối chiếu code variables/rule SSH, fmt/validate đạt và Git check-ignore xác nhận tfvars được bỏ qua. Chưa apply.
+
+Tham khảo: [AzureRM 4.81.0 network security rule](https://github.com/hashicorp/terraform-provider-azurerm/blob/v4.81.0/website/docs/r/network_security_rule.html.markdown).
+
+### 6.8. Cho phép HTTP và HTTPS vào web
+
+Thêm hai rule riêng cho TCP 80 và TCP 443. Web phục vụ người dùng Internet, nên source của hai rule là `Internet`; rule SSH ở mục trước tiếp tục dùng `var.admin_cidr`.
+
+Trong `deploy/terraform/azure/security.tf`, giữ nguyên NSG/rule SSH và thêm hai resource dưới đây ở bên ngoài các block đã có:
+
+```hcl
+resource "azurerm_network_security_rule" "http" {
+  name                        = "http-from-internet"
+  priority                    = 310
+  direction                   = "Inbound"
+  access                      = "Allow"
+  protocol                    = "Tcp"
+  source_port_range           = "*"
+  destination_port_range      = "80"
+  source_address_prefix       = "Internet"
+  destination_address_prefix  = "*"
+  resource_group_name         = azurerm_resource_group.standby.name
+  network_security_group_name = azurerm_network_security_group.standby.name
+}
+
+resource "azurerm_network_security_rule" "https" {
+  name                        = "https-from-internet"
+  priority                    = 320
+  direction                   = "Inbound"
+  access                      = "Allow"
+  protocol                    = "Tcp"
+  source_port_range           = "*"
+  destination_port_range      = "443"
+  source_address_prefix       = "Internet"
+  destination_address_prefix  = "*"
+  resource_group_name         = azurerm_resource_group.standby.name
+  network_security_group_name = azurerm_network_security_group.standby.name
+}
+```
+
+`Internet` là Azure service tag mô tả không gian địa chỉ Internet. Ba inbound rule hiện có priority khác nhau: SSH 300, HTTP 310, HTTPS 320. Rule khác cổng đích nên cho phép từng loại kết nối phù hợp. Mở TCP 443 tại NSG là cấu hình lớp mạng; chứng chỉ TLS và HTTPS Ingress sẽ được cấu hình ở giai đoạn tương ứng.
+
+Trong Git Bash đã chọn subscription và export theo mục 6.2, chạy:
+
+```bash
+terraform -chdir=deploy/terraform/azure fmt
+terraform -chdir=deploy/terraform/azure validate
+terraform -chdir=deploy/terraform/azure plan
+```
+
+Kết quả dự kiến:
+
+```text
+Plan: 7 to add, 0 to change, 0 to destroy.
+```
+
+Gồm Resource Group, VNet, subnet, NSG và ba inbound rule (SSH/HTTP/HTTPS). Kiểm tra SSH vẫn dùng source IPv4 quản trị `/32`, chỉ hai rule web dùng source `Internet`. Không thêm rule public cho PostgreSQL 5432 hoặc Kubernetes API 6443. Người thực hành đã xác nhận plan đúng; đã đọc lại hai rule HTTP/HTTPS và kiểm tra fmt/validate đạt. Chưa apply.
+
+Tham khảo: [AzureRM 4.81.0 network security rule](https://github.com/hashicorp/terraform-provider-azurerm/blob/v4.81.0/website/docs/r/network_security_rule.html.markdown).
+
+### 6.9. Khai báo Public IP tĩnh
+
+Azure Public IP là tài nguyên riêng, sẽ được gắn vào NIC của VM ở bước sau. Vai trò trong kiến trúc tương đương Elastic IP phía AWS: địa chỉ ổn định cho SSH, web, bản ghi DNS origin và endpoint WireGuard. IP thực tế được Azure cấp khi tạo resource; xóa rồi tạo lại không bảo đảm nhận cùng địa chỉ.
+
+Trong `deploy/terraform/azure/network.tf`, giữ VNet/subnet và thêm block dưới đây ở bên ngoài các resource hiện có:
+
+```hcl
+resource "azurerm_public_ip" "standby" {
+  name                = "mcf-azure-public-ip"
+  location            = azurerm_resource_group.standby.location
+  resource_group_name = azurerm_resource_group.standby.name
+  allocation_method   = "Static"
+  sku                 = "Standard"
+  ip_version          = "IPv4"
+  zones               = ["1", "2", "3"]
+
+  tags = {
+    Project = "multi-cloud-failover"
+  }
+}
+```
+
+`allocation_method="Static"` giữ địa chỉ trong vòng đời Public IP resource. `sku="Standard"` dùng Standard public IP với phương thức cấp Static. `zones=["1","2","3"]` khai báo Public IP zone-redundant ở Southeast Asia, hỗ trợ một VM được đặt trong một zone ở bước sau. Đây là cấu hình dự phòng zone của IP, không tạo ba VM hoặc làm cluster một node trở thành HA. Các restriction Zone 2 đã đọc trước đó thuộc hai VM SKU ứng viên, không phải quyết định chọn zone cho VM qua resource Public IP này.
+
+Trong Git Bash đã chọn subscription và export theo mục 6.2, chạy:
+
+```bash
+terraform -chdir=deploy/terraform/azure fmt
+terraform -chdir=deploy/terraform/azure validate
+terraform -chdir=deploy/terraform/azure plan
+```
+
+Kết quả dự kiến:
+
+```text
+Plan: 8 to add, 0 to change, 0 to destroy.
+```
+
+Gồm bảy resource trước và `azurerm_public_ip.standby`. IP thực tế hiển thị `(known after apply)`. Chưa apply hoặc tạo Public IP; bước tiếp theo khai báo NIC để nối subnet, Public IP và VM.
+
+Public IPv4 tĩnh là tài nguyên có tính phí sau khi được cấp theo chính sách billing Azure, kể cả khi VM bị stop/deallocate hoặc IP chưa gắn vào VM. Để tiết kiệm, tiếp tục hoàn thiện code và đọc plan trước khi tạo tài nguyên cần dùng cho buổi thực hành. Chưa đánh dấu Public IP/plan đạt cho tới khi có kết quả thực hành.
+
+Tham khảo: [AzureRM 4.81.0 public IP](https://github.com/hashicorp/terraform-provider-azurerm/blob/v4.81.0/website/docs/r/public_ip.html.markdown), [Azure Public IP và availability zones](https://learn.microsoft.com/en-us/azure/virtual-network/ip-services/public-ip-addresses), [Azure IP pricing và billing FAQ](https://azure.microsoft.com/en-us/pricing/details/ip-addresses/).
+
+## 7. Theo dõi tiến độ
 
 - [ ] Xác nhận Terraform, AWS CLI, Azure CLI và SSH chạy được trong Git Bash.
 - [x] Đăng nhập Azure CLI và xác nhận Azure for Students ở trạng thái Enabled, được chọn mặc định.
@@ -2188,7 +2745,21 @@ Tham khảo: [provider issue về EIP và replacement diff](https://github.com/h
 - [x] Đối chiếu giá AWS, lập ví dụ chi phí compute/EBS/EIP và định nghĩa cost proxy; chưa phải số đo Billing hoặc thí nghiệm.
 - [x] Apply compute thành công bốn resource mới; có đủ ba output với giá trị thực.
 - [x] Bỏ cờ public IP ở cấp instance theo mục 5.29 và xác nhận plan của root module chính báo No changes.
-- [ ] Nghiệm thu status checks, SSH và Ubuntu trên máy chủ AWS.
+- [x] Sau khi dọn lab, kiểm tra state trống và không còn EC2 chưa terminate/EBS mang tag project tại Singapore.
+- [x] Tạo lại hạ tầng AWS theo mục 5.30; output mới và EC2 running đã được đối chiếu.
+- [x] Xác nhận system, instance và attached EBS status checks đều ok trên EC2 mới.
+- [x] Kiểm tra plan sau lần apply tạo lại hạ tầng báo No changes.
+- [x] Nghiệm thu status checks, SSH và Ubuntu trên máy chủ AWS.
+- [x] Dọn AWS sau nghiệm thu để chuyển sang Azure; đối chiếu state, EC2, EBS, EIP, snapshot, NAT Gateway và tài nguyên mạng trong phạm vi kiểm tra tại Singapore.
+- [x] Tự tạo root Azure, khai báo `versions.tf` và chạy `terraform init`; lock file chọn AzureRM 4.81.0.
+- [x] Tạo `providers.tf` và kiểm tra fmt/validate đạt; hướng dẫn chọn subscription qua `ARM_SUBSCRIPTION_ID` tại mục 6.2.
+- [x] Khai báo Resource Group và kiểm tra plan đầu tiên đúng một resource tạo mới theo mục 6.3; chưa apply.
+- [x] Khai báo VNet Azure và kiểm tra plan hai resource tạo mới theo mục 6.4; chưa apply.
+- [x] Khai báo subnet Azure và kiểm tra plan ba resource tạo mới theo mục 6.5; chưa apply.
+- [x] Khai báo NSG Azure và kiểm tra plan bốn resource tạo mới theo mục 6.6; chưa apply.
+- [x] Khai báo admin CIDR và rule SSH Azure, xác nhận tfvars được ignore và plan năm resource tạo mới theo mục 6.7; chưa apply.
+- [x] Khai báo HTTP/HTTPS ingress Azure và kiểm tra plan bảy resource tạo mới theo mục 6.8; chưa apply.
+- [ ] Khai báo Static Standard Public IPv4 Azure và kiểm tra plan tám resource tạo mới theo mục 6.9.
 - [ ] Khai báo mạng và quy tắc truy cập của hai môi trường.
 - [ ] Khai báo compute, địa chỉ IP và đĩa.
 - [ ] Kiểm tra plan rồi triển khai các lớp hạ tầng.

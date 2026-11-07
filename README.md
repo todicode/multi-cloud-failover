@@ -18,13 +18,14 @@ The current implementation runs a complete local environment: two FastAPI instan
 | GHCR image publication | Validated |
 | Published image pull and runtime/database checks | Validated locally |
 | Published image verification on a separate CI runner | Validated |
-| AWS VPC, subnet, Internet Gateway, and public routing with Terraform | Deployed and validated |
-| AWS host Security Group and SSH/HTTP/HTTPS rules | Deployed and validated |
-| AWS EC2, SSH Key Pair, and Elastic IP | Deployed; SSH validation pending |
-| Azure infrastructure | Planned |
+| AWS VPC, subnet, Internet Gateway, and public routing with Terraform | Deployment validated; lab resources removed |
+| AWS host Security Group and SSH/HTTP/HTTPS rules | Deployment validated; lab resources removed |
+| AWS EC2, SSH Key Pair, and Elastic IP | Creation, status checks, and SSH validated; lab resources removed |
+| Azure Resource Group, VNet, subnet, and NSG with SSH/HTTP/HTTPS rules | Terraform plan validated; deployment pending |
+| Azure Public IP, NIC, and VM | Planned |
 | Cloud application deployment and failover | Planned |
 
-The AWS Terraform root module provisions networking, host access rules, EC2, SSH Key Pair, and Elastic IP in Singapore. The subnet AZ and Ubuntu AMI are pinned. Compute creation succeeded and the post-apply plan reports no changes; SSH acceptance is pending. Azure infrastructure and cloud workload deployment remain pending. The [roadmap](docs/ROADMAP.md) describes the remaining milestones.
+The AWS Terraform root module provisions networking, host access rules, EC2, SSH Key Pair, and Elastic IP in Singapore. The subnet AZ and Ubuntu AMI are pinned. Deployment, post-apply consistency checks, and SSH access were validated; lab resources were then removed to control costs. A separate Azure root module defines the Resource Group, VNet, subnet, and NSG with SSH/HTTP/HTTPS rules; its plan validates seven resource creations. Azure Public IP, NIC, VM, and cloud workload deployment remain pending. The [roadmap](docs/ROADMAP.md) describes the remaining milestones.
 
 ## Features
 
