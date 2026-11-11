@@ -1858,6 +1858,67 @@ sudo k3s kubectl -n issues describe pods -l job-name=postgres-clone
 
 Đối chiếu Secret, ConfigMap, trạng thái PVC, WireGuard và kết quả pg_basebackup trong log. Khi cần chạy lại một Job đã kết thúc, kiểm tra tình trạng bản clone trên PVC rồi xử lý nguyên nhân lỗi trước khi tạo lượt Job mới. Apply lại manifest của Job đã hoàn tất sẽ giữ Job hiện có.
 
+Người thực hành đã cung cấp output Azure xác nhận Job postgres-clone Complete, COMPLETIONS 1/1, DURATION 27s. PVC postgres-data Bound với volume pvc-d333bc1a-f740-4fa0-bbc9-b65c3e13369e, dung lượng 5Gi, RWO và StorageClass local-path-retain.
+
+### 7.21. Chạy PostgreSQL standby trên Azure bằng StatefulSet
+
+Trong Git Bash trên laptop tại thư mục gốc repository, tạo manifest Azure từ manifest AWS đã có.
+
+```bash
+cp deploy/kubernetes/postgres-aws.yaml deploy/kubernetes/postgres-azure.yaml
+```
+
+Trong file postgres-azure.yaml, đổi địa chỉ ở cả startupProbe và readinessProbe từ 10.200.29.1 thành 10.200.29.2. Mỗi probe cần có command sau.
+
+```yaml
+              command: ["pg_isready", "-h", "10.200.29.2", "-U", "taskflow", "-d", "taskflow"]
+```
+
+Thêm command ngay dưới image của container postgres. Đoạn command và args sau khi chỉnh cần có nội dung sau.
+
+```yaml
+          command:
+            - bash
+            - -ec
+            - |
+              test -f /var/lib/postgresql/data/.clone-complete
+              test "$(cat "$PGDATA/PG_VERSION")" = 17
+              exec docker-entrypoint.sh "$@"
+            - --
+          args: ["postgres", "-c", "config_file=/etc/postgresql/postgresql.conf"]
+```
+
+Hai kiểm tra đầu xác nhận marker hoàn thành clone và major version 17 trên PVC. bash -ec chạy đoạn kiểm tra rồi exec gọi entrypoint chính thức của image. Dấu -- được dùng làm giá trị $0 của Bash, còn "$@" nhận các phần tử args. Entrypoint sử dụng data directory đã clone và khởi động PostgreSQL với ConfigMap Azure. standby.signal cùng primary_conninfo đã được pg_basebackup -R tạo sẽ đưa PostgreSQL vào chế độ standby và cấu hình kết nối về AWS.
+
+StatefulSet tham chiếu Secret postgres-auth, ConfigMap postgres-config và PVC postgres-data của cluster Azure. Cùng đường dẫn mount dữ liệu giữ cho primary_conninfo tìm được replication.pgpass đã tạo bởi Job. Cơ chế kiểm tra vai trò khi reboot sau failover được bổ sung ở bước fencing/rejoin của giai đoạn phục hồi.
+
+Copy manifest đã chỉnh lên Azure từ Git Bash trên laptop.
+
+```bash
+MCF_AZURE_PUBLIC_IP="$(terraform -chdir=deploy/terraform/azure output -raw azure_public_ip)"
+scp -i ~/.ssh/mcf-lab \
+  deploy/kubernetes/postgres-azure.yaml \
+  "azureuser@$MCF_AZURE_PUBLIC_IP:"
+```
+
+Trong phiên SSH Azure, tạo StatefulSet và kiểm tra Pod.
+
+```bash
+sudo k3s kubectl apply -f /home/azureuser/postgres-azure.yaml
+sudo k3s kubectl -n issues rollout status statefulset/postgres --timeout=180s
+sudo k3s kubectl -n issues get pod postgres-0 -o wide
+```
+
+Mong đợi postgres-0 có READY 1/1 và STATUS Running trên node Azure. Với hostNetwork, IP của Pod là IP private host Azure. Truy vấn vai trò database trong Pod.
+
+```bash
+sudo k3s kubectl -n issues exec postgres-0 -- \
+  psql -X -U taskflow -d taskflow -P pager=off -c \
+  "SELECT pg_is_in_recovery() AS in_recovery, current_setting('transaction_read_only') AS read_only;"
+```
+
+Mong đợi in_recovery t và read_only on. Tiếp theo kiểm tra kết nối WAL receiver/sender và dữ liệu đã replay từ AWS. Nếu Pod gặp lỗi khởi động, đọc logs postgres-0 và describe pod để kiểm tra mount, file clone, password file và cấu hình PostgreSQL.
+
 ## 8. Tạm nghỉ và giữ môi trường lab
 
 ### 8.1. Dừng compute trên hai cloud
@@ -1999,7 +2060,8 @@ ConfigMap sau bước 7.7 cần có DATA bằng 2. Người thực hành đã cu
 - [ ] Áp dụng headless Service postgres-headless trên Azure và kiểm tra CLUSTER-IP None, port 5432/TCP.
 - [ ] Tạo Secret postgres-auth trên Azure với thông tin từ AWS, kiểm tra đủ ba key và kích thước dự kiến.
 - [ ] Tạo ConfigMap postgres-clone-script trên Azure, DATA bằng 1 để chuẩn bị Job clone.
-- [ ] Chạy Job postgres-clone trên Azure, xác nhận Base backup completed, Job 1/1 và PVC Bound.
+- [x] Chạy Job postgres-clone trên Azure, Job Complete 1/1 trong 27 giây và PVC Bound theo output người thực hành cung cấp.
+- [ ] Triển khai StatefulSet PostgreSQL Azure, Pod Running 1/1, in_recovery t và read_only on.
 - [ ] Triển khai PostgreSQL primary/standby và kiểm tra WAL streaming.
 - [ ] Triển khai ứng dụng bằng cùng image digest trên hai cluster.
 - [ ] Kiểm tra endpoint, vai trò database và dữ liệu nghiệp vụ đã replay.

@@ -1,0 +1,45 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: postgres-clone
+  namespace: issues
+spec:
+  backoffLimit: 0
+  activeDeadlineSeconds: 600
+  template:
+    spec:
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      restartPolicy: Never
+      containers:
+        - name: basebackup
+          image: postgres:17-bookworm@sha256:665dc7b37ac52a17e298511414c21d23ffa4e6a6ef6225b3e5d59c7afb35e994
+          command: ["bash", "/bootstrap/clone.sh"]
+          envFrom:
+            - secretRef:
+                name: postgres-replication
+          env:
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+            - name: SOURCE_DB_HOST
+              value: "10.200.29.1"
+          resources:
+            requests:
+              cpu: 200m
+              memory: 256Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+            - name: script
+              mountPath: /bootstrap
+              readOnly: true
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: postgres-data
+        - name: script
+          configMap:
+            name: postgres-clone-script
