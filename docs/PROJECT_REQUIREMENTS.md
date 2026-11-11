@@ -56,6 +56,37 @@ Baseline được chọn là cùng ứng dụng trên một môi trường AWS, 
 
 Baseline một môi trường không có đích failover. Khi chỉ số không áp dụng, ghi rõ N/A và so sánh downtime/recovery time phù hợp; không tự gán failover time bằng không. Một phương án thay thế khác có thể dùng nếu được thiết kế và đo rõ ràng, vì General Deliverables cho phép baseline hoặc alternative approach.
 
+### 4.1. Hai cấu hình so sánh được đề xuất
+
+| Thành phần | A: AWS-only baseline | B: AWS primary + Azure warm standby |
+|---|---|---|
+| Ứng dụng | Cùng image digest trên AWS | Cùng image digest trên AWS và Azure |
+| Primary | PostgreSQL trên AWS | PostgreSQL trên AWS |
+| Standby | Không có standby hoạt động | PostgreSQL Azure nhận WAL bất đồng bộ |
+| Đường truy cập | Hostname HTTPS chỉ trỏ tới AWS | Hostname HTTPS có cơ chế chuyển sang Azure sau khi writer được xác nhận |
+| Khi primary mất khả dụng | Chờ AWS/dịch vụ được khôi phục | Thực hiện fencing, promote Azure và chuyển traffic theo runbook |
+| Cost proxy | Tài nguyên phục vụ cấu hình AWS-only | Tài nguyên hai cloud và kết nối phục vụ warm standby |
+
+Tái sử dụng cùng Terraform AWS, image, schema và cấu hình ứng dụng của project. Baseline là một chế độ triển khai/thí nghiệm, không phải một web hoặc kiến trúc code mới. Giữ cấu hình AWS tương đương giữa A/B; ghi rõ phần replication và dịch vụ dự phòng chỉ có ở B.
+
+### 4.2. Kịch bản và điều kiện đo được đề xuất
+
+Các bước dưới đây là thiết kế thí nghiệm dự kiến, chưa phải kết quả đã đo hoặc yêu cầu số lượng run của đề bài:
+
+1. Chuẩn bị cùng dữ liệu khởi đầu, image digest, tài nguyên AWS, nguồn client đo và workload tạo/đọc issue. Client/probe đặt ngoài hai môi trường ứng dụng. Xác nhận writer và trạng thái hệ thống đúng trước mỗi lượt; B cần standby streaming khỏe.
+2. Đo steady state trước lỗi, rồi gây cùng một lỗi mất môi trường primary bằng cách stop EC2 AWS tại mốc đã định. Chốt trước cửa sổ quan sát và lịch cho phép khôi phục AWS, ví dụ giữ stopped 120 giây từ lúc xác nhận stopped rồi cho phép start; dùng cùng chính sách cho A/B và lưu cả thời điểm gọi API lẫn các chuyển trạng thái thực tế.
+3. A phục hồi trên AWS theo lịch và runbook; B thực hiện failover sang Azure sau khi xác nhận fencing. Khi AWS ở B được bật lại, giữ writer cũ bị chặn và làm rejoin theo runbook; việc máy running trở lại không cho phép bật writer cũ song song. Ghi rõ failover ở run là thủ công hay tự động; nếu thủ công, lưu mốc can thiệp của người vận hành.
+4. Đo thành công của thao tác ghi/đọc từ phía client, không chỉ process liveness. Lưu downtime, recovery/failover time phù hợp, latency, request lỗi và kiểm chứng các write đã được ACK còn tồn tại sau phục hồi.
+5. Đề xuất lặp năm lượt cho mỗi cấu hình, reset về trạng thái bắt đầu đã xác định sau mỗi lượt. Tổng hợp các run và dữ liệu thô; nếu không phục hồi trong cửa sổ đo, ghi rõ downtime ít nhất bằng khoảng đã quan sát và recovery time chưa xác định, không ghi một con số phục hồi giả.
+
+Với A, cột failover time là N/A; thời gian phục hồi tại AWS và downtime vẫn đo được. Với B, đo thêm timeline phát hiện lỗi, fencing, promote, writer-ready và client phục hồi qua hostname. Không giả định trước B nhanh hơn hoặc không mất dữ liệu; kết luận dựa vào số đo và điều kiện thực tế.
+
+Chi phí phải dùng cùng khoảng thời gian và phạm vi: compute-hours nhân đơn giá tương ứng, disk, public IP và traffic liên quan; xác định rõ có tính DNS và hệ đo chung hay không. Nếu giữ Azure disk/IP khi chạy baseline dù VM đã deallocate, phần chi phí giữ lab vẫn thuộc chi phí thực tế và phải ghi riêng. Cost proxy của kiến trúc AWS-only là mô hình so sánh, không được trình bày thành hóa đơn thực tế khi vẫn giữ tài nguyên ngoài cấu hình đó.
+
+Script tạo lỗi, workload, reset và tính chỉ số sẽ được viết khi bắt đầu giai đoạn 9; chưa tạo thêm file hướng dẫn giai đoạn 9 trong bước xác định phạm vi này. Nguyên tắc đo từ phía người dùng, quan sát lỗi và phục hồi có thể tham chiếu [AWS resiliency testing](https://docs.aws.amazon.com/wellarchitected/latest/reliability-pillar/rel_testing_resiliency_failure_injection_resiliency.html).
+
+### 4.3. Quy ước chỉ số
+
 Các quy ước cần chốt trong giai đoạn đo đạc:
 
 - **Failover time:** xác định mốc bắt đầu/kết thúc; tách phát hiện lỗi, điều khiển failover và thời điểm client nhận dịch vụ phục hồi khi cần.
@@ -83,10 +114,21 @@ RPO/mất acknowledged writes, replication lag, split-brain prevention, rejoin v
 
 Các phần hướng dẫn theo giai đoạn chỉ được bổ sung khi bắt đầu giai đoạn đó. Tài liệu yêu cầu này giữ phạm vi tham chiếu toàn project, không phải tuyên bố đã triển khai hoặc đo xong các giai đoạn sau.
 
+### 5.1. Quy mô node và phạm vi high availability
+
+Đề tài 29 và General Deliverables trong PDF yêu cầu hai môi trường hoặc cluster độc lập, không quy định ba node cho mỗi cluster. Hướng dẫn triển khai bổ sung của học phần có nội dung "Deploy a multi-node cloud service". Project diễn giải yêu cầu này ở cấp dịch vụ phân tán: một VM AWS và một VM Azure là hai máy độc lập, cùng tham gia hệ thống ứng dụng/database và cơ chế phục hồi. Đây là diễn giải phạm vi triển khai, không phải xác nhận rằng mỗi Kubernetes cluster đã đáp ứng một yêu cầu multi-node riêng. Nếu tiêu chí nghiệm thu được làm rõ là mỗi cluster Kubernetes phải multi-node, cần điều chỉnh topology trước triển khai tương ứng.
+
+Thiết kế hiện tại dùng một K3s server node cho mỗi cloud. K3s hỗ trợ single-node cluster chạy đầy đủ control plane và workload. Mục tiêu được kiểm chứng là phục hồi dịch vụ khi mất toàn bộ một môi trường; từng cluster hiện có một điểm lỗi tại VM đó và không có control-plane HA nội bộ. Giới hạn này cần được nêu rõ trong kiến trúc, báo cáo và phân tích trade-off.
+
+Nếu mở rộng sang K3s control-plane HA bằng embedded etcd, cần tối thiểu ba server node trong mỗi cluster. Một control plane cộng hai worker không tạo control-plane HA. Việc tăng số node cũng không tự hoàn thành thiết kế HA cho PostgreSQL và persistent storage; các phần đó cần được xem xét riêng. Chỉ mở rộng khi phạm vi đồ án yêu cầu hoặc cần thêm thí nghiệm so sánh.
+
+Tham khảo kỹ thuật: [K3s single-node cluster](https://docs.k3s.io/quick-start), [K3s embedded etcd HA](https://docs.k3s.io/datastore/ha-embedded).
+
 ## 6. Trạng thái nghiệm thu hiện tại
 
 - Local application/database, container packaging và CI/registry đã có kết quả kiểm tra trong hướng dẫn giai đoạn 1-3.
-- AWS networking, Security Group và compute đã tạo; plan sau apply báo No changes, kết nối SSH chưa được nghiệm thu theo hướng dẫn giai đoạn 4.
+- Hạ tầng AWS và Azure đã được triển khai và nghiệm thu độc lập qua status/agent checks, post-apply plan No changes và SSH/Ubuntu. Sau lượt dọn lab, hai môi trường đã được tạo lại để thực hành giai đoạn 5.
+- AWS và Azure đã cài K3s v1.35.1+k3s1, nghiệm thu node Ready, các Pod hệ thống và StorageClass theo kết quả người thực hành cung cấp. WireGuard đã có handshake, route qua wg0 và ping hai chiều thành công. Bước tiếp theo là triển khai database và ứng dụng trên hai cloud.
 - Chưa nghiệm thu S1 trên hai cloud thực tế, traffic failover cloud hoặc tình huống mất hoàn toàn một môi trường cloud.
 - Chưa nghiệm thu baseline cloud, bộ số đo cloud lặp lại được, biểu đồ và phân tích kết quả. Bảng giá/công thức hiện có là chuẩn bị cost proxy.
 - Báo cáo cuối kỳ và demo tổng thể chưa hoàn thành.

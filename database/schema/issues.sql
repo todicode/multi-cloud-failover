@@ -4,10 +4,12 @@ CREATE TABLE IF NOT EXISTS issues (
     status TEXT NOT NULL CHECK(status IN ('open','closed')),
     version INTEGER NOT NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now());
+
 CREATE TABLE IF NOT EXISTS comments (
     id UUID PRIMARY KEY, issue_id UUID NOT NULL REFERENCES issues(id),
     author TEXT NOT NULL, body TEXT NOT NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT now());
 CREATE INDEX IF NOT EXISTS comments_issue_idx ON comments(issue_id, created_at);
+
 CREATE TABLE IF NOT EXISTS issue_history (
     id BIGSERIAL PRIMARY KEY, issue_id UUID NOT NULL REFERENCES issues(id),
     request_id UUID NOT NULL UNIQUE, action TEXT NOT NULL,

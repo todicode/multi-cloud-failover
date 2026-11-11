@@ -18,14 +18,17 @@ The current implementation runs a complete local environment: two FastAPI instan
 | GHCR image publication | Validated |
 | Published image pull and runtime/database checks | Validated locally |
 | Published image verification on a separate CI runner | Validated |
-| AWS VPC, subnet, Internet Gateway, and public routing with Terraform | Deployment validated; lab resources removed |
-| AWS host Security Group and SSH/HTTP/HTTPS rules | Deployment validated; lab resources removed |
-| AWS EC2, SSH Key Pair, and Elastic IP | Creation, status checks, and SSH validated; lab resources removed |
-| Azure Resource Group, VNet, subnet, and NSG with SSH/HTTP/HTTPS rules | Deployment validated; lab resources removed |
-| Azure Static Public IP, NIC, and Ubuntu VM | Creation, post-apply plan, and SSH validated; lab resources removed |
+| AWS VPC, subnet, Internet Gateway, and public routing with Terraform | Deployment validated; recreated for Stage 5 |
+| AWS host Security Group and SSH/HTTP/HTTPS rules | Deployment validated; recreated for Stage 5 |
+| AWS EC2, SSH Key Pair, and Elastic IP | Recreated; status checks and SSH validated |
+| AWS single-node K3s cluster | Node Ready, system Pods and StorageClass verified |
+| Azure Resource Group, VNet, subnet, and NSG with SSH/HTTP/HTTPS rules | Deployment validated; recreated for Stage 5 |
+| Azure Static Public IP, NIC, and Ubuntu VM | Recreated; VM state and SSH validated |
+| Azure single-node K3s cluster | Node Ready, system Pods and StorageClass verified |
+| WireGuard tunnel between AWS and Azure | Peer handshakes, tunnel routes, and bidirectional ping verified |
 | Cloud application deployment and failover | Planned |
 
-The AWS Terraform root module provisions networking, host access rules, EC2, SSH Key Pair, and Elastic IP in Singapore. The subnet AZ and Ubuntu AMI are pinned. Deployment, post-apply consistency checks, and SSH access were validated. A separate Azure root module deployed eleven resources covering the Resource Group, VNet, subnet, NSG and access rules, Static Public IP, NIC, and Ubuntu VM. Its image version and VM zone are pinned; the post-apply plan reported no changes and SSH access was validated. Lab resources on both clouds were subsequently removed to control costs; Terraform configuration and local state are retained for recreation. Cloud K3s, database replication, application deployment, and failover remain planned. The [roadmap](docs/ROADMAP.md) describes the remaining milestones.
+The AWS Terraform root module provisions networking, host access rules, EC2, SSH Key Pair, and Elastic IP in Singapore. The subnet AZ and Ubuntu AMI are pinned. Deployment, post-apply consistency checks, and SSH access were validated. A separate Azure root module deployed eleven resources covering the Resource Group, VNet, subnet, NSG and access rules, Static Public IP, NIC, and Ubuntu VM. Its image version and VM zone are pinned, and deployment and SSH access were validated. Both environments were recreated for Stage 5. Each cloud now runs an independent single-node K3s v1.35.1+k3s1 cluster, with node readiness, system components, and the default local-path StorageClass verified. Peer-restricted UDP rules and a WireGuard tunnel are configured, with handshakes, routes, and bidirectional ping verified. Cloud database replication, application deployment, and failover are the remaining deployment milestones. The [roadmap](docs/ROADMAP.md) tracks progress.
 
 ## Features
 
@@ -104,7 +107,8 @@ The [accepted CI run](https://github.com/todicode/multi-cloud-failover/actions/r
 - [Stage 1: local application and database instructions](docs/instruction/giaidoan1_ungdung_database_local.md)
 - [Stage 2: application container packaging](docs/instruction/giaidoan2_docker_hoa_ungdung.md)
 - [Stage 3: CI and container registry instructions](docs/instruction/giaidoan3_ci_va_container_registry.md)
-- [Stage 4: AWS/Azure infrastructure with Terraform (in progress)](docs/instruction/giaidoan4_ha_tang_aws_azure_terraform.md)
+- [Stage 4: AWS/Azure infrastructure with Terraform](docs/instruction/giaidoan4_ha_tang_aws_azure_terraform.md)
+- [Stage 5: K3s and cloud workloads (in progress)](docs/instruction/giaidoan5_k3s_va_trien_khai_workload.md)
 - [Architecture and consistency model](docs/ARCHITECTURE.md)
 - [Local setup and operations](docs/LOCAL_DEVELOPMENT.md)
 - [Failover and recovery runbook](docs/DISASTER_RECOVERY.md)

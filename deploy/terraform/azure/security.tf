@@ -49,3 +49,17 @@ resource "azurerm_network_security_rule" "https" {
   resource_group_name         = azurerm_resource_group.standby.name
   network_security_group_name = azurerm_network_security_group.standby.name
 }
+
+resource "azurerm_network_security_rule" "wireguard" {
+  name                        = "wireguard-from-aws"
+  priority                    = 330
+  direction                   = "Inbound"
+  access                      = "Allow"
+  protocol                    = "Udp"
+  source_port_range           = "*"
+  destination_port_range      = "51820"
+  source_address_prefix       = var.wireguard_peer_cidr
+  destination_address_prefix  = "*"
+  resource_group_name         = azurerm_resource_group.standby.name
+  network_security_group_name = azurerm_network_security_group.standby.name
+}

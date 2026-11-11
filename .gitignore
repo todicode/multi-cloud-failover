@@ -23,6 +23,7 @@ id_ed25519*
 *.auto.tfvars
 *.auto.tfvars.json
 *.tfplan
+*.tfplan~
 crash.log
 
 # Python

@@ -42,3 +42,12 @@ resource "aws_vpc_security_group_ingress_rule" "https" {
   from_port         = 443
   to_port           = 443
 }
+
+resource "aws_vpc_security_group_ingress_rule" "wireguard" {
+  security_group_id = aws_security_group.primary.id
+  description       = "Allow WireGuard from Azure peer"
+  cidr_ipv4         = var.wireguard_peer_cidr
+  ip_protocol       = "udp"
+  from_port         = 51820
+  to_port           = 51820
+}
