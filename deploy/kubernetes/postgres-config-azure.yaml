@@ -1,0 +1,22 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: postgres-config
+  namespace: issues
+data:
+  postgresql.conf: |
+    listen_addresses = '127.0.0.1,10.200.29.2'
+    port = 5432
+    hba_file = '/etc/postgresql/pg_hba.conf'
+    wal_level = replica
+    max_wal_senders = 10
+    wal_keep_size = '128MB'
+    hot_standby = on
+    password_encryption = 'scram-sha-256'
+  pg_hba.conf: |
+    local all taskflow trust
+    host all all 127.0.0.1/32 scram-sha-256
+    host taskflow taskflow 10.42.0.0/16 scram-sha-256
+    host taskflow taskflow 10.200.29.1/32 scram-sha-256
+    host taskflow taskflow 10.200.29.2/32 scram-sha-256
+    host replication replicator 10.200.29.1/32 scram-sha-256

@@ -1642,6 +1642,222 @@ sudo k3s kubectl -n issues get configmap postgres-config
 
 Mong đợi ConfigMap postgres-config có DATA bằng 2, tương ứng postgresql.conf và pg_hba.conf. Kiểm tra này xác nhận resource đã được lưu vào cluster. Sau khi tạo Pod, kiểm tra cấu hình hiệu lực bằng SQL như phía AWS.
 
+Người thực hành đã cung cấp output Azure xác nhận ConfigMap postgres-config được tạo và DATA bằng 2.
+
+### 7.17. Tạo headless Service PostgreSQL trên Azure
+
+Dùng lại deploy/kubernetes/postgres-headless.yaml đã áp dụng trên AWS. Service này có clusterIP None và selector app postgres. StatefulSet Azure sẽ sử dụng tên postgres-headless tại trường serviceName để cung cấp định danh mạng ổn định cho Pod.
+
+Trong Git Bash trên laptop tại thư mục gốc repository, copy manifest lên Azure.
+
+```bash
+MCF_AZURE_PUBLIC_IP="$(terraform -chdir=deploy/terraform/azure output -raw azure_public_ip)"
+scp -i ~/.ssh/mcf-lab \
+  deploy/kubernetes/postgres-headless.yaml \
+  "azureuser@$MCF_AZURE_PUBLIC_IP:"
+```
+
+Trong phiên SSH Azure, áp dụng và kiểm tra Service.
+
+```bash
+sudo k3s kubectl apply -f /home/azureuser/postgres-headless.yaml
+sudo k3s kubectl -n issues get service postgres-headless
+```
+
+Mong đợi Service postgres-headless có TYPE ClusterIP, CLUSTER-IP None và PORT(S) 5432/TCP. Giá trị None thể hiện đây là headless Service. Khi có Pod khớp selector, Kubernetes quản lý các endpoint tương ứng.
+
+PostgreSQL dùng hostNetwork và lắng nghe trên loopback cùng IP WireGuard. Service dành cho ứng dụng sẽ được cấu hình riêng bằng EndpointSlice trỏ tới IP WireGuard Azure ở bước triển khai ứng dụng.
+
+### 7.18. Chuẩn bị Secret đăng nhập database trên Azure
+
+Full physical backup bằng pg_basebackup sao chép toàn bộ PostgreSQL database cluster, gồm các role và thông tin mật khẩu. Secret postgres-auth trên Azure cần giữ cùng POSTGRES_DB, POSTGRES_USER và POSTGRES_PASSWORD như AWS để cấu hình workload và ứng dụng khớp với dữ liệu được clone. Mật khẩu PostgreSQL có hiệu lực trên standby được kế thừa từ bản clone.
+
+Trong Git Bash trên laptop tại thư mục gốc repository, lấy Public IP hiện tại của hai máy.
+
+```bash
+MCF_AWS_PUBLIC_IP="$(terraform -chdir=deploy/terraform/aws output -raw aws_public_ip)"
+MCF_AZURE_PUBLIC_IP="$(terraform -chdir=deploy/terraform/azure output -raw azure_public_ip)"
+```
+
+Chuyển nội dung file postgres.env trên AWS vào Secret postgres-auth của cluster Azure.
+
+```bash
+MCF_POSTGRES_ENV="$(ssh -i ~/.ssh/mcf-lab "ubuntu@$MCF_AWS_PUBLIC_IP" \
+  'sudo cat /etc/mcf/postgres.env')" &&
+  printf '%s\n' "$MCF_POSTGRES_ENV" | \
+  ssh -i ~/.ssh/mcf-lab "azureuser@$MCF_AZURE_PUBLIC_IP" \
+    'sudo k3s kubectl -n issues create secret generic postgres-auth --from-env-file=/dev/stdin'
+
+unset MCF_POSTGRES_ENV
+```
+
+Cách truyền qua biến shell, pipe và SSH giống mục 7.15. Mong đợi secret/postgres-auth created. Private key có passphrase có thể yêu cầu mở khóa cho mỗi kết nối.
+
+Trong phiên SSH Azure, kiểm tra metadata của hai Secret cần dùng khi triển khai standby.
+
+```bash
+sudo k3s kubectl -n issues describe secret postgres-auth
+sudo k3s kubectl -n issues describe secret postgres-replication
+```
+
+Secret postgres-auth cần có POSTGRES_DB 8 bytes, POSTGRES_USER 8 bytes và POSTGRES_PASSWORD 64 bytes. Secret postgres-replication cần có REPLICATION_USER 10 bytes và REPLICATION_PASSWORD 64 bytes. Kiểm tra này xác nhận các key và kích thước dự kiến. Việc xác thực thực tế với AWS được kiểm tra khi chạy bước clone tiếp theo.
+
+### 7.19. Chuẩn bị script clone database trên Azure
+
+Tạo file deploy/kubernetes/postgres-clone-script.yaml trên laptop. ConfigMap này chứa script được Job clone gọi ở bước tiếp theo. Job sẽ mount PVC postgres-data và lấy biến môi trường từ Secret postgres-replication. PGDATA được Job đặt thành /var/lib/postgresql/data/pgdata, SOURCE_DB_HOST là IP WireGuard AWS.
+
+```yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: postgres-clone-script
+  namespace: issues
+data:
+  clone.sh: |
+    set -eu
+
+    if [ -f "$PGDATA/PG_VERSION" ]; then
+      test -f /var/lib/postgresql/data/.clone-complete
+      echo "Existing completed clone found"
+      exit 0
+    fi
+
+    install -d -o postgres -g postgres -m 700 "$PGDATA"
+    test -z "$(ls -A "$PGDATA")"
+
+    umask 077
+    PGPASSFILE=/var/lib/postgresql/data/replication.pgpass
+    printf '%s:5432:replication:%s:%s\n' \
+      "$SOURCE_DB_HOST" "$REPLICATION_USER" "$REPLICATION_PASSWORD" \
+      > "$PGPASSFILE"
+    chown postgres:postgres "$PGPASSFILE"
+    chmod 600 "$PGPASSFILE"
+
+    gosu postgres pg_basebackup \
+      -d "host=$SOURCE_DB_HOST port=5432 user=$REPLICATION_USER passfile=$PGPASSFILE application_name=mcf-azure-standby connect_timeout=10" \
+      -D "$PGDATA" -R -X stream -c fast -w
+
+    test "$(cat "$PGDATA/PG_VERSION")" = 17
+    test -f "$PGDATA/standby.signal"
+    touch /var/lib/postgresql/data/.clone-complete
+    echo "Base backup completed"
+```
+
+set -e dừng script khi một lệnh kiểm tra hoặc clone lỗi, set -u yêu cầu các biến được tham chiếu đã được khai báo. Script kiểm tra marker .clone-complete khi gặp data directory đã có PG_VERSION. Với thư mục chuẩn bị clone mới, nội dung phải trống. Khi gặp dữ liệu dở dang, đọc log và kiểm tra PVC trước khi chọn phương án phục hồi.
+
+Script tạo password file trên PVC với quyền 600, owner postgres. Mật khẩu được lấy từ Secret ở thời điểm Job chạy. Tham số passfile được đưa vào connection string để pg_basebackup -R ghi đường dẫn này vào cấu hình kết nối standby. Khi triển khai StatefulSet Azure, cùng PVC sẽ được mount tại cùng đường dẫn để PostgreSQL tiếp tục sử dụng password file.
+
+pg_basebackup kết nối AWS qua WireGuard bằng role replicator. -D chọn data directory, -R tạo standby.signal và ghi thông tin kết nối vào postgresql.auto.conf, -X stream lấy WAL song song với base backup, -c fast yêu cầu checkpoint nhanh và -w dùng xác thực đã chuẩn bị qua password file. gosu chạy pg_basebackup dưới user hệ điều hành postgres. Marker .clone-complete được tạo sau khi lệnh clone thành công và hai kiểm tra cuối đạt yêu cầu.
+
+Trong Git Bash trên laptop tại thư mục gốc repository, copy manifest lên Azure.
+
+```bash
+MCF_AZURE_PUBLIC_IP="$(terraform -chdir=deploy/terraform/azure output -raw azure_public_ip)"
+scp -i ~/.ssh/mcf-lab \
+  deploy/kubernetes/postgres-clone-script.yaml \
+  "azureuser@$MCF_AZURE_PUBLIC_IP:"
+```
+
+Trong phiên SSH Azure, lưu script vào ConfigMap.
+
+```bash
+sudo k3s kubectl apply -f /home/azureuser/postgres-clone-script.yaml
+sudo k3s kubectl -n issues get configmap postgres-clone-script
+```
+
+Mong đợi ConfigMap postgres-clone-script có DATA bằng 1. Lệnh apply lưu nội dung script, việc chạy pg_basebackup bắt đầu khi tạo Job ở bước tiếp theo.
+
+### 7.20. Chạy Job clone PostgreSQL từ AWS sang Azure
+
+Tạo file deploy/kubernetes/postgres-clone-azure.yaml trên laptop. Job dùng cùng image PostgreSQL đã cố định trên AWS, mount PVC postgres-data của Azure và chạy script clone.sh từ ConfigMap postgres-clone-script.
+
+```yaml
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: postgres-clone
+  namespace: issues
+spec:
+  backoffLimit: 0
+  activeDeadlineSeconds: 600
+  template:
+    spec:
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      restartPolicy: Never
+      containers:
+        - name: basebackup
+          image: postgres:17-bookworm@sha256:665dc7b37ac52a17e298511414c21d23ffa4e6a6ef6225b3e5d59c7afb35e994
+          command: ["bash", "/bootstrap/clone.sh"]
+          envFrom:
+            - secretRef:
+                name: postgres-replication
+          env:
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+            - name: SOURCE_DB_HOST
+              value: "10.200.29.1"
+          resources:
+            requests:
+              cpu: 200m
+              memory: 256Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+            - name: script
+              mountPath: /bootstrap
+              readOnly: true
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: postgres-data
+        - name: script
+          configMap:
+            name: postgres-clone-script
+```
+
+hostNetwork cho Pod sử dụng mạng host Azure, gồm route qua wg0 đến 10.200.29.1. Kết nối đi qua tunnel với source 10.200.29.2, khớp rule replication trên PostgreSQL AWS. Secret cung cấp REPLICATION_USER và REPLICATION_PASSWORD cho script. PVC lưu bản sao dữ liệu để StatefulSet sử dụng tiếp sau khi Job hoàn tất.
+
+restartPolicy Never kết thúc container khi script thoát. backoffLimit 0 đánh dấu Job thất bại khi Pod lỗi, giữ kết quả để kiểm tra trước khi chạy lại. activeDeadlineSeconds 600 giới hạn thời gian hoạt động của Job ở mức mười phút cho dữ liệu lab hiện tại. Khi Job thành công, Kubernetes ghi nhận completion và giữ Pod để đọc log.
+
+Trong Git Bash trên laptop tại thư mục gốc repository, copy manifest lên Azure.
+
+```bash
+MCF_AZURE_PUBLIC_IP="$(terraform -chdir=deploy/terraform/azure output -raw azure_public_ip)"
+scp -i ~/.ssh/mcf-lab \
+  deploy/kubernetes/postgres-clone-azure.yaml \
+  "azureuser@$MCF_AZURE_PUBLIC_IP:"
+```
+
+Trong phiên SSH Azure, tạo Job và theo dõi log.
+
+```bash
+sudo k3s kubectl apply -f /home/azureuser/postgres-clone-azure.yaml
+sudo k3s kubectl -n issues logs -f job/postgres-clone --pod-running-timeout=180s
+```
+
+Lượt clone đầu tiên thành công cần có dòng Base backup completed. Kiểm tra trạng thái Job và PVC sau khi log kết thúc.
+
+```bash
+sudo k3s kubectl -n issues get job postgres-clone
+sudo k3s kubectl -n issues get pvc postgres-data
+```
+
+Mong đợi Job COMPLETIONS 1/1 và PVC Bound. Đây là checkpoint hoàn thành bản sao ban đầu và các file cấu hình standby. Việc chạy PostgreSQL Azure và xác nhận WAL streaming liên tục được thực hiện ở bước StatefulSet tiếp theo.
+
+Nếu Job thất bại hoặc Pod còn Pending, dùng metadata và log để xác định bước lỗi.
+
+```bash
+sudo k3s kubectl -n issues describe job postgres-clone
+sudo k3s kubectl -n issues get pods -l job-name=postgres-clone
+sudo k3s kubectl -n issues describe pods -l job-name=postgres-clone
+```
+
+Đối chiếu Secret, ConfigMap, trạng thái PVC, WireGuard và kết quả pg_basebackup trong log. Khi cần chạy lại một Job đã kết thúc, kiểm tra tình trạng bản clone trên PVC rồi xử lý nguyên nhân lỗi trước khi tạo lượt Job mới. Apply lại manifest của Job đã hoàn tất sẽ giữ Job hiện có.
+
 ## 8. Tạm nghỉ và giữ môi trường lab
 
 ### 8.1. Dừng compute trên hai cloud
@@ -1779,7 +1995,11 @@ ConfigMap sau bước 7.7 cần có DATA bằng 2. Người thực hành đã cu
 - [x] Gán mật khẩu replication và kiểm tra SCRAM, scram_password t theo output người thực hành cung cấp.
 - [x] Áp dụng namespace, StorageClass Retain và PVC PostgreSQL trên Azure trước khi clone standby theo output người thực hành cung cấp.
 - [ ] Tạo Secret postgres-replication trên Azure, kiểm tra đủ hai key và kích thước dự kiến.
-- [ ] Tạo và áp dụng ConfigMap PostgreSQL Azure, DATA bằng 2 với listen_addresses chứa IP WireGuard Azure.
+- [x] Tạo và áp dụng ConfigMap PostgreSQL Azure, DATA bằng 2 với listen_addresses chứa IP WireGuard Azure theo manifest local và output người thực hành cung cấp.
+- [ ] Áp dụng headless Service postgres-headless trên Azure và kiểm tra CLUSTER-IP None, port 5432/TCP.
+- [ ] Tạo Secret postgres-auth trên Azure với thông tin từ AWS, kiểm tra đủ ba key và kích thước dự kiến.
+- [ ] Tạo ConfigMap postgres-clone-script trên Azure, DATA bằng 1 để chuẩn bị Job clone.
+- [ ] Chạy Job postgres-clone trên Azure, xác nhận Base backup completed, Job 1/1 và PVC Bound.
 - [ ] Triển khai PostgreSQL primary/standby và kiểm tra WAL streaming.
 - [ ] Triển khai ứng dụng bằng cùng image digest trên hai cluster.
 - [ ] Kiểm tra endpoint, vai trò database và dữ liệu nghiệp vụ đã replay.
@@ -1804,6 +2024,7 @@ ConfigMap sau bước 7.7 cần có DATA bằng 2. Người thực hành đã cu
 - [Kubernetes PersistentVolumeClaims](https://kubernetes.io/docs/concepts/storage/persistent-volumes/#persistentvolumeclaims).
 - [Kubernetes Secrets with kubectl](https://kubernetes.io/docs/tasks/configmap-secret/managing-secret-using-kubectl/).
 - [Kubernetes StatefulSets](https://kubernetes.io/docs/concepts/workloads/controllers/statefulset/).
+- [Kubernetes Jobs](https://kubernetes.io/docs/concepts/workloads/controllers/job/).
 - [Kubernetes headless Services](https://kubernetes.io/docs/concepts/services-networking/service/#headless-services).
 - [PostgreSQL 17 replication parameters](https://www.postgresql.org/docs/17/runtime-config-replication.html).
 - [PostgreSQL 17 connection parameters](https://www.postgresql.org/docs/17/runtime-config-connection.html).
@@ -1817,6 +2038,8 @@ ConfigMap sau bước 7.7 cần có DATA bằng 2. Người thực hành đã cu
 - [PostgreSQL 17 CREATE ROLE](https://www.postgresql.org/docs/17/sql-createrole.html).
 - [PostgreSQL 17 ALTER ROLE](https://www.postgresql.org/docs/17/sql-alterrole.html).
 - [PostgreSQL 17 streaming replication](https://www.postgresql.org/docs/17/warm-standby.html#STREAMING-REPLICATION).
+- [PostgreSQL 17 pg_basebackup](https://www.postgresql.org/docs/17/app-pgbasebackup.html).
+- [PostgreSQL 17 password file](https://www.postgresql.org/docs/17/libpq-pgpass.html).
 - [AWS EC2 stop and start](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/Stop_Start.html).
 - [AWS EC2 instance states and billing](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/ec2-instance-lifecycle.html).
 - [Azure VM states and billing](https://learn.microsoft.com/en-us/azure/virtual-machines/states-billing).
