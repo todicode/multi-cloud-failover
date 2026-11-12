@@ -62,12 +62,40 @@ git status --short
 
 Mong đợi versions.tf có khối terraform và required_providers giống file AWS của chính repository. Các file Terraform được người thực hành tạo từng bước; hướng dẫn này được mở rộng theo tiến độ thực hành.
 
+### 4.1. Cấu hình AWS provider cho root module DNS
+
+Sau khi chuẩn bị thư mục và hai file ở mục 4, tạo file deploy/terraform/dns/providers.tf với nội dung sau.
+
+```hcl
+provider "aws" {
+  region  = "ap-southeast-1"
+  profile = "default"
+}
+```
+
+profile default chọn cấu hình AWS CLI đã dùng cho hạ tầng AWS của project. region ap-southeast-1 là region mặc định của provider trong root module này. Route 53 public DNS sử dụng endpoint toàn cục, hosted zone quản lý tên miền độc lập với vị trí VM AWS/Azure.
+
+### 4.2. Khởi tạo và kiểm tra cấu hình Terraform DNS
+
+Trong Git Bash trên laptop tại thư mục gốc repository, chạy lần lượt các lệnh sau.
+
+```bash
+terraform -chdir=deploy/terraform/dns fmt
+terraform -chdir=deploy/terraform/dns init
+terraform -chdir=deploy/terraform/dns validate
+```
+
+fmt chuẩn hóa định dạng file Terraform. init chuẩn bị working directory và cài AWS provider theo dependency lock file. validate kiểm tra cú pháp, schema và tính nhất quán của cấu hình đã khai báo. Hai thông báo mong đợi là Terraform has been successfully initialized! và Success! The configuration is valid.
+
+Checkpoint này xác nhận root module DNS sẵn sàng để bổ sung resource hosted zone. Thao tác tạo hosted zone sẽ được thực hiện bằng plan/apply sau khi viết resource ở bước tiếp theo.
+
 ## 5. Theo dõi tiến độ
 
 - [x] Nghiệm thu đầu ra giai đoạn 5 và bắt đầu hướng dẫn DNS/HTTPS.
 - [x] Xác định tên miền todicode.tech và tra cứu NS, hostname dự kiến, hosted zone trong tài khoản AWS.
 - [x] Chọn nhánh mcf.todicode.tech và ba hostname app, aws, azure cho đồ án.
 - [ ] Chuẩn bị Terraform root module DNS và provider lock file theo mục 4.
+- [ ] Tạo providers.tf và chạy init/validate thành công cho root module DNS.
 - [ ] Tạo public hosted zone mcf.todicode.tech bằng Terraform.
 - [ ] Delegate nhánh mcf từ DNS gốc tới Route 53 và kiểm tra DNS.
 - [ ] Tạo record cho hai origin và đường truy cập ứng dụng chung.
@@ -79,3 +107,6 @@ Mong đợi versions.tf có khối terraform và required_providers giống file
 - [Route 53 public hosted zones](https://docs.aws.amazon.com/Route53/latest/DeveloperGuide/CreatingHostedZone.html).
 - [Route 53 subdomain delegation](https://docs.aws.amazon.com/Route53/latest/DeveloperGuide/CreatingNewSubdomain.html).
 - [Terraform dependency lock file](https://developer.hashicorp.com/terraform/language/files/dependency-lock).
+- [Terraform init](https://developer.hashicorp.com/terraform/cli/commands/init).
+- [Terraform validate](https://developer.hashicorp.com/terraform/cli/commands/validate).
+- [Route 53 service endpoints](https://docs.aws.amazon.com/general/latest/gr/r53.html).
