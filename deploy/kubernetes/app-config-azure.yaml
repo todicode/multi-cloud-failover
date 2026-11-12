@@ -1,0 +1,10 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: issues-app-config
+  namespace: issues
+data:
+  APP_ENV: "azure"
+  APP_REGION: "southeastasia"
+  APP_VERSION: "v0.1.0"
+  COMMIT_SHA: "c56fd3f30baee50fa779607dc0fb1a2133b53a9d"

@@ -44,9 +44,9 @@ The implementation sequence completes the required Azure background, then builds
 
 ## In progress: cluster and workload preparation
 
-The [Stage 5 guide](instruction/giaidoan5_k3s_va_trien_khai_workload.md) records recreation and K3s v1.35.1+k3s1 installation on AWS and Azure. The operator verified node readiness, system Pods, and the default local-path StorageClass on both clouds. WireGuard is configured with peer-restricted UDP rules, and handshake, routing, and bidirectional ping checks passed. The next step is PostgreSQL deployment and replication over the tunnel. Commands and acceptance evidence are added as each step begins.
+The [Stage 5 guide](instruction/giaidoan5_k3s_va_trien_khai_workload.md) records recreation and K3s v1.35.1+k3s1 installation on AWS and Azure. Node readiness, system Pods, WireGuard handshakes, and bidirectional tunnel connectivity passed acceptance. PostgreSQL primary/standby deployment, retained PVCs, WAL streaming, and replay of a new probe record have been verified. Both clusters run the same application image digest. Internal HTTP checks through each application Service confirmed environment, region, version, commit, database connectivity, and the expected writer-health responses.
 
-The lab has resumed after AWS PostgreSQL storage, credentials, and configuration preparation. AWS EC2 is running with both status checks passed, and the Azure VM is running. Post-restart K3s, WireGuard, and PostgreSQL ConfigMap checks are the next acceptance step before workload deployment. The operator uses an interactive SSH session to unlock the passphrase-protected key.
+The remaining Stage 5 acceptance steps cover public HTTP access through Traefik and an issue created on the AWS web application becoming visible on Azure. Hostname/TLS configuration, cloud traffic failover, observability, and recovery experiments follow in their respective phases. Commands and acceptance evidence are added as each step begins.
 
 ## Milestones
 

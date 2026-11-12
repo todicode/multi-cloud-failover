@@ -1,0 +1,14 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: issues-app
+  namespace: issues
+spec:
+  type: ClusterIP
+  selector:
+    app: issues-app
+  ports:
+    - name: http
+      protocol: TCP
+      port: 80
+      targetPort: http

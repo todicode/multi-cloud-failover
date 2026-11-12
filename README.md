@@ -9,7 +9,7 @@ The current implementation runs a complete local environment: two FastAPI instan
 | Capability | Status |
 |---|---|
 | Issues application and PostgreSQL persistence | Implemented |
-| Primary/standby streaming replication | Validated locally |
+| Primary/standby streaming replication | Validated locally and across AWS/Azure over WireGuard |
 | Shared URL and write-aware routing | Validated locally |
 | Switchover, failover, rejoin, and failback | Validated locally |
 | Local watcher and read/write probes | Validated locally |
@@ -26,9 +26,10 @@ The current implementation runs a complete local environment: two FastAPI instan
 | Azure Static Public IP, NIC, and Ubuntu VM | Recreated; VM state and SSH validated |
 | Azure single-node K3s cluster | Node Ready, system Pods and StorageClass verified |
 | WireGuard tunnel between AWS and Azure | Peer handshakes, tunnel routes, and bidirectional ping verified |
-| Cloud application deployment and failover | Planned |
+| Cloud application deployment | Same image digest running on both K3s clusters; internal HTTP and database-role checks passed |
+| Cloud traffic failover and recovery | Planned |
 
-The AWS Terraform root module provisions networking, host access rules, EC2, SSH Key Pair, and Elastic IP in Singapore. The subnet AZ and Ubuntu AMI are pinned. Deployment, post-apply consistency checks, and SSH access were validated. A separate Azure root module deployed eleven resources covering the Resource Group, VNet, subnet, NSG and access rules, Static Public IP, NIC, and Ubuntu VM. Its image version and VM zone are pinned, and deployment and SSH access were validated. Both environments were recreated for Stage 5. Each cloud now runs an independent single-node K3s v1.35.1+k3s1 cluster, with node readiness, system components, and the default local-path StorageClass verified. Peer-restricted UDP rules and a WireGuard tunnel are configured, with handshakes, routes, and bidirectional ping verified. Cloud database replication, application deployment, and failover are the remaining deployment milestones. The [roadmap](docs/ROADMAP.md) tracks progress.
+The AWS Terraform root module provisions networking, host access rules, EC2, SSH Key Pair, and Elastic IP in Singapore. The subnet AZ and Ubuntu AMI are pinned. Deployment, post-apply consistency checks, and SSH access were validated. A separate Azure root module provisions the Resource Group, VNet, subnet, NSG and access rules, Static Public IP, NIC, and Ubuntu VM. Its image version and VM zone are pinned, and deployment and SSH access were validated. Both environments were recreated for Stage 5. Each cloud runs an independent single-node K3s v1.35.1+k3s1 cluster. PostgreSQL 17 uses retained local storage and asynchronous WAL streaming over a peer-restricted WireGuard tunnel. A new probe record written on AWS was read on Azure. Both clusters run the same application image digest, with internal HTTP checks confirming the expected version, environment, primary/standby roles, and writer health. Public HTTP access and business-workload acceptance are in progress. Cloud traffic failover and recovery remain planned. The [roadmap](docs/ROADMAP.md) tracks progress.
 
 ## Features
 

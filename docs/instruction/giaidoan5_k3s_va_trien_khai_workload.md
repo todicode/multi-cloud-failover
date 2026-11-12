@@ -2199,7 +2199,7 @@ sudo k3s kubectl -n issues delete pod postgres-service-check
 
 Người thực hành đã xác nhận Pod client ở mục 7.26 kết nối qua Service thành công trên cả hai cluster, với địa chỉ server và vai trò database đúng dự kiến.
 
-Chọn image ứng dụng từ workflow run [43090850035](https://github.com/todicode/multi-cloud-failover/actions/runs/43090850035) của commit c56fd3f30baee50fa779607dc0fb1a2133b53a9d. Đã đọc GitHub Actions API xác nhận cả ba job test, container và verify-image success. Đã đối chiếu manifest GHCR của tag commit, tính lại SHA-256 của manifest và kiểm tra config image có platform linux/amd64, user appuser cùng label revision đúng commit.
+Theo lựa chọn của người thực hành, giữ image ứng dụng từ workflow run [43090850035](https://github.com/todicode/multi-cloud-failover/actions/runs/43090850035) của commit c56fd3f30baee50fa779607dc0fb1a2133b53a9d. Đã đọc GitHub Actions API xác nhận cả ba job test, container và verify-image success. Đã đối chiếu manifest GHCR của tag commit, tính lại SHA-256 của manifest và kiểm tra config image có platform linux/amd64, user appuser cùng label revision đúng commit.
 
 Tham chiếu image được chọn để dùng chung cho hai cluster ở bước Deployment tiếp theo.
 
@@ -2272,6 +2272,291 @@ sudo k3s kubectl -n issues get configmap issues-app-config
 ```
 
 Mong đợi ConfigMap issues-app-config có DATA bằng 4 trên mỗi cluster. Checkpoint này xác nhận cấu hình runtime đã được lưu để Deployment sử dụng ở bước tiếp theo.
+
+### 7.28. Tạo Deployment ứng dụng và chạy trên AWS
+
+Tạo file deploy/kubernetes/app-deployment.yaml trên laptop. Manifest này dùng image digest và ConfigMap tương ứng với commit c56fd3f đã chọn. Mỗi cluster sẽ sử dụng ConfigMap issues-app-config, Secret postgres-auth và Service postgres của chính cluster đó.
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: issues-app
+  namespace: issues
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: issues-app
+  template:
+    metadata:
+      labels:
+        app: issues-app
+    spec:
+      containers:
+        - name: app
+          image: ghcr.io/todicode/multi-cloud-failover@sha256:2d7cf831e50eb1c693082dc9e4f7dbf76ded557fa512a249ba68df7995b6b10e
+          ports:
+            - name: http
+              containerPort: 8080
+          envFrom:
+            - configMapRef:
+                name: issues-app-config
+            - secretRef:
+                name: postgres-auth
+          env:
+            - name: DATABASE_URL
+              value: "postgresql://$(POSTGRES_USER):$(POSTGRES_PASSWORD)@postgres:5432/$(POSTGRES_DB)"
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          startupProbe:
+            httpGet:
+              path: /health/live
+              port: http
+            periodSeconds: 5
+            timeoutSeconds: 2
+            failureThreshold: 30
+          livenessProbe:
+            httpGet:
+              path: /health/live
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 2
+          readinessProbe:
+            httpGet:
+              path: /api/database/status
+              port: http
+            periodSeconds: 5
+            timeoutSeconds: 5
+```
+
+Deployment quản lý một replica Pod có label app issues-app. Container chạy Uvicorn trên port 8080 theo CMD của image. envFrom nạp cấu hình nhận diện từ ConfigMap và thông tin database từ Secret. Kubernetes mở rộng các tham chiếu $(POSTGRES_USER), $(POSTGRES_PASSWORD) và $(POSTGRES_DB) khi tạo biến DATABASE_URL. Trong lab, mật khẩu PostgreSQL được sinh bằng openssl rand -hex 32 nên phù hợp với chuỗi URI đang dùng.
+
+startupProbe chờ HTTP process khởi động, livenessProbe kiểm tra process tiếp tục phục vụ HTTP. readinessProbe dùng /api/database/status, endpoint trả 200 khi ứng dụng truy vấn được database ở vai trò primary hoặc standby, và 503 khi kết nối database lỗi. Endpoint /health/database kiểm tra điều kiện writable primary và được dùng cho health check writer ở giai đoạn DNS failover.
+
+Trong Git Bash trên laptop tại thư mục gốc repository, copy manifest lên AWS.
+
+```bash
+MCF_AWS_PUBLIC_IP="$(terraform -chdir=deploy/terraform/aws output -raw aws_public_ip)"
+scp -i ~/.ssh/mcf-lab \
+  deploy/kubernetes/app-deployment.yaml \
+  "ubuntu@$MCF_AWS_PUBLIC_IP:"
+```
+
+Trong phiên SSH AWS, tạo Deployment và theo dõi rollout.
+
+```bash
+sudo k3s kubectl apply -f /home/ubuntu/app-deployment.yaml
+sudo k3s kubectl -n issues rollout status deployment/issues-app --timeout=180s
+sudo k3s kubectl -n issues get pods -l app=issues-app -o wide
+```
+
+Mong đợi rollout hoàn tất và một Pod issues-app có READY 1/1, STATUS Running. Readiness thành công xác nhận ứng dụng kết nối được PostgreSQL qua DATABASE_URL tại cluster AWS. Nếu cần chẩn đoán, đọc logs và describe Pod theo label app issues-app để kiểm tra image pull, ConfigMap, Secret và probe. Bước tiếp theo triển khai cùng manifest lên Azure rồi kiểm tra endpoint ứng dụng.
+
+Người thực hành đã cung cấp output AWS xác nhận Deployment issues-app rollout thành công. Pod issues-app-f8fb495f5-thvkw Running 1/1, 0 restart, IP 10.42.0.21 trên node mcf-aws-primary. Readiness đã đạt với endpoint /api/database/status trong manifest hiện tại.
+
+### 7.29. Triển khai cùng ứng dụng trên Azure
+
+Dùng deploy/kubernetes/app-deployment.yaml đã áp dụng trên AWS để triển khai lên cluster Azure. Deployment tham chiếu ConfigMap issues-app-config có APP_ENV azure và APP_REGION southeastasia, Secret postgres-auth và Service postgres của cluster Azure. EndpointSlice tại Azure ánh xạ Service database đến 10.200.29.2:5432. Image được chọn là cùng digest ứng với commit c56fd3f.
+
+Trong Git Bash trên laptop tại thư mục gốc repository, copy manifest lên Azure.
+
+```bash
+MCF_AZURE_PUBLIC_IP="$(terraform -chdir=deploy/terraform/azure output -raw azure_public_ip)"
+scp -i ~/.ssh/mcf-lab \
+  deploy/kubernetes/app-deployment.yaml \
+  "azureuser@$MCF_AZURE_PUBLIC_IP:"
+```
+
+Trong phiên SSH Azure, tạo Deployment và theo dõi rollout.
+
+```bash
+sudo k3s kubectl apply -f /home/azureuser/app-deployment.yaml
+sudo k3s kubectl -n issues rollout status deployment/issues-app --timeout=180s
+sudo k3s kubectl -n issues get pods -l app=issues-app -o wide
+```
+
+Mong đợi rollout hoàn tất, một Pod issues-app có READY 1/1 và STATUS Running trên node mcf-azure-standby. Readiness /api/database/status trả 200 khi ứng dụng kết nối được PostgreSQL standby. Các thao tác đọc dữ liệu được phục vụ bởi database Azure, còn quyền ghi phụ thuộc vai trò thực tế của PostgreSQL và write barrier trong code ứng dụng.
+
+Sau khi Pod Ready, kiểm tra image được khai báo trên Deployment Azure.
+
+```bash
+sudo k3s kubectl -n issues get deployment issues-app \
+  -o jsonpath='{.spec.template.spec.containers[0].image}{"\n"}'
+```
+
+Mong đợi ghcr.io/todicode/multi-cloud-failover@sha256:2d7cf831e50eb1c693082dc9e4f7dbf76ded557fa512a249ba68df7995b6b10e. Checkpoint này ghi nhận image cấu hình trên Deployment và trạng thái Pod. Các endpoint /version, vai trò database và chức năng web được nghiệm thu qua HTTP ở bước tiếp theo.
+
+Người thực hành đã cung cấp output Azure xác nhận Deployment issues-app rollout thành công. Pod issues-app-f8fb495f5-lf458 Running 1/1, 0 restart, IP 10.42.0.21 trên node mcf-azure-standby. Truy vấn Deployment trả về image digest sha256:2d7cf831e50eb1c693082dc9e4f7dbf76ded557fa512a249ba68df7995b6b10e đúng bản đã chọn.
+
+### 7.30. Tạo Service cho web trên hai cluster
+
+Tạo file deploy/kubernetes/app-service.yaml trên laptop với nội dung sau.
+
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: issues-app
+  namespace: issues
+spec:
+  type: ClusterIP
+  selector:
+    app: issues-app
+  ports:
+    - name: http
+      protocol: TCP
+      port: 80
+      targetPort: http
+```
+
+Service chọn các Pod có label app issues-app trong namespace issues. port 80 là port của Service, targetPort http tham chiếu containerPort 8080 được đặt tên http trong Deployment. Kubernetes quản lý EndpointSlice của Service theo các Pod khớp selector và trạng thái readiness. Service có ClusterIP nội bộ của từng cluster.
+
+Trong Git Bash trên laptop tại thư mục gốc repository, copy cùng manifest lên cả hai máy.
+
+```bash
+MCF_AWS_PUBLIC_IP="$(terraform -chdir=deploy/terraform/aws output -raw aws_public_ip)"
+MCF_AZURE_PUBLIC_IP="$(terraform -chdir=deploy/terraform/azure output -raw azure_public_ip)"
+
+scp -i ~/.ssh/mcf-lab \
+  deploy/kubernetes/app-service.yaml \
+  "ubuntu@$MCF_AWS_PUBLIC_IP:"
+
+scp -i ~/.ssh/mcf-lab \
+  deploy/kubernetes/app-service.yaml \
+  "azureuser@$MCF_AZURE_PUBLIC_IP:"
+```
+
+Trong phiên SSH AWS, áp dụng Service rồi kiểm tra địa chỉ và backend.
+
+```bash
+sudo k3s kubectl apply -f /home/ubuntu/app-service.yaml
+sudo k3s kubectl -n issues get service issues-app
+sudo k3s kubectl -n issues get endpointslice -l kubernetes.io/service-name=issues-app
+```
+
+Trong phiên SSH Azure, áp dụng Service rồi kiểm tra địa chỉ và backend.
+
+```bash
+sudo k3s kubectl apply -f /home/azureuser/app-service.yaml
+sudo k3s kubectl -n issues get service issues-app
+sudo k3s kubectl -n issues get endpointslice -l kubernetes.io/service-name=issues-app
+```
+
+Mong đợi Service issues-app có TYPE ClusterIP và PORT(S) 80/TCP. EndpointSlice do Kubernetes tạo cần có port 8080 và địa chỉ Pod issues-app hiện tại trong cluster tương ứng. Đây là checkpoint ánh xạ Service đến Pod web. Truy cập HTTP qua Service và từ laptop được kiểm tra ở các bước tiếp theo.
+
+### 7.31. Kiểm tra HTTP qua Service trên từng cloud
+
+Trong mỗi phiên SSH AWS và Azure, lấy ClusterIP của Service issues-app thuộc cluster đang thao tác.
+
+```bash
+MCF_APP_SERVICE_IP="$(sudo k3s kubectl -n issues get service issues-app -o jsonpath='{.spec.clusterIP}')"
+```
+
+Sau đó chạy các lệnh sau trong cùng phiên SSH. Thực hiện một lượt trên AWS và một lượt trên Azure.
+
+```bash
+curl -fsS --max-time 10 -w '\n' "http://$MCF_APP_SERVICE_IP/health/live"
+curl -fsS --max-time 10 -w '\n' "http://$MCF_APP_SERVICE_IP/version"
+curl -fsS --max-time 10 -w '\n' "http://$MCF_APP_SERVICE_IP/api/database/status"
+curl -sS --max-time 10 -w '\nHTTP %{http_code}\n' "http://$MCF_APP_SERVICE_IP/health/database"
+```
+
+Lệnh lấy ClusterIP chạy riêng trên từng máy vì mỗi Service được quản lý trong cluster tương ứng. Request HTTP từ host đi qua Service issues-app port 80 đến Pod ứng dụng port 8080. -w thêm newline để tách JSON của từng request, lệnh cuối in thêm HTTP status code.
+
+Kết quả mong đợi khi AWS đang là writer và Azure là standby.
+
+| Kiểm tra | AWS | Azure |
+|---|---|---|
+| /health/live | status alive | status alive |
+| /version environment | aws | azure |
+| /version region | ap-southeast-1 | southeastasia |
+| /version version | v0.1.0 | v0.1.0 |
+| /version commit_sha | c56fd3f30baee50fa779607dc0fb1a2133b53a9d | c56fd3f30baee50fa779607dc0fb1a2133b53a9d |
+| /api/database/status connected | true | true |
+| /api/database/status role | primary | standby |
+| /api/database/status writable | true | false |
+| /api/database/status replication_connected | — | true |
+| /health/database HTTP status | 200 | 503 |
+
+Lệnh cuối dùng -sS để hiển thị body và HTTP status khi kiểm tra writer health. HTTP 503 kèm role standby, writable false và connected true trên Azure phản ánh trạng thái standby hiện tại. Endpoint /api/database/status là readiness của Pod web, còn /health/database cung cấp health của writable primary cho bước định tuyến failover.
+
+Checkpoint đạt khi nhận diện môi trường, phiên bản, kết nối database và trạng thái writer đúng trên cả hai cloud. Bước tiếp theo chuẩn bị truy cập web từ laptop và nghiệm thu dữ liệu nghiệp vụ qua hai ứng dụng.
+
+Người thực hành đã cung cấp kết quả HTTP qua Service trên cả hai cloud. AWS trả environment aws, region ap-southeast-1, role primary, writable true, writes_paused false và /health/database HTTP 200. Azure trả environment azure, region southeastasia, role standby, writable false, replication_connected true và /health/database HTTP 503. Hai web cùng trả version v0.1.0, commit_sha c56fd3f30baee50fa779607dc0fb1a2133b53a9d. Trong các output được cung cấp, current_lsn AWS và receive_lsn/replay_lsn Azure cùng là 0/30005D0 tại thời điểm kiểm tra.
+
+### 7.32. Tạo Ingress HTTP để truy cập web từ laptop
+
+Dùng Traefik đã được cài cùng K3s để tiếp nhận HTTP trên port 80 của mỗi host và chuyển request đến Service issues-app. Cấu hình bước này phục vụ nghiệm thu qua Public IP. Hostname và TLS được cấu hình trong giai đoạn DNS/HTTPS tiếp theo.
+
+Tạo file deploy/kubernetes/app-ingress-http.yaml trên laptop với nội dung sau.
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: issues-app
+  namespace: issues
+spec:
+  ingressClassName: traefik
+  rules:
+    - http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: issues-app
+                port:
+                  number: 80
+```
+
+ingressClassName chọn Traefik làm controller xử lý rule. Path / với Prefix bao phủ giao diện, static assets và các API của ứng dụng. Rule áp dụng cho các hostname truy cập tới địa chỉ Ingress, phù hợp với việc mở bằng Public IP ở bước này. Backend là Service issues-app port 80 của cùng cluster.
+
+Trong Git Bash trên laptop tại thư mục gốc repository, copy cùng manifest lên hai máy.
+
+```bash
+MCF_AWS_PUBLIC_IP="$(terraform -chdir=deploy/terraform/aws output -raw aws_public_ip)"
+MCF_AZURE_PUBLIC_IP="$(terraform -chdir=deploy/terraform/azure output -raw azure_public_ip)"
+
+scp -i ~/.ssh/mcf-lab \
+  deploy/kubernetes/app-ingress-http.yaml \
+  "ubuntu@$MCF_AWS_PUBLIC_IP:"
+
+scp -i ~/.ssh/mcf-lab \
+  deploy/kubernetes/app-ingress-http.yaml \
+  "azureuser@$MCF_AZURE_PUBLIC_IP:"
+```
+
+Trong phiên SSH AWS, áp dụng và kiểm tra Ingress.
+
+```bash
+sudo k3s kubectl apply -f /home/ubuntu/app-ingress-http.yaml
+sudo k3s kubectl -n issues get ingress issues-app
+```
+
+Trong phiên SSH Azure, áp dụng và kiểm tra Ingress.
+
+```bash
+sudo k3s kubectl apply -f /home/azureuser/app-ingress-http.yaml
+sudo k3s kubectl -n issues get ingress issues-app
+```
+
+Mong đợi Ingress issues-app có CLASS traefik, HOSTS * và PORTS 80. Đọc URL web tương ứng từ Git Bash trên laptop.
+
+```bash
+printf 'AWS: http://%s/issues.html\nAzure: http://%s/issues.html\n' \
+  "$MCF_AWS_PUBLIC_IP" "$MCF_AZURE_PUBLIC_IP"
+```
+
+Mở hai URL vừa in bằng trình duyệt laptop. Luồng request là laptop → Public IP port 80 → Traefik → Service issues-app port 80 → Pod FastAPI port 8080. Dùng HTTP trong lượt nghiệm thu này. Bước tiếp theo tạo issue trên web AWS và đối chiếu dữ liệu hiển thị trên web Azure.
+
+Nếu cần chẩn đoán kết nối, xem IngressClass traefik, Pod Traefik và Service/EndpointSlice ứng dụng, rồi đối chiếu rule inbound HTTP 80 đã khai báo trong Terraform AWS/Azure.
 
 ## 8. Tạm nghỉ và giữ môi trường lab
 
@@ -2422,9 +2707,14 @@ ConfigMap sau bước 7.7 cần có DATA bằng 2. Người thực hành đã cu
 - [x] Tạo Service postgres trên AWS và Azure để chuẩn bị kết nối database từ ứng dụng theo xác nhận của người thực hành.
 - [x] Áp dụng EndpointSlice postgres-wireguard ở mỗi cluster, xác nhận đúng endpoint IP WireGuard và port 5432 theo xác nhận của người thực hành.
 - [x] Chạy Pod client ở cả hai cluster, kiểm tra DNS postgres, đăng nhập qua Service và vai trò database đúng từng cloud theo xác nhận của người thực hành.
-- [x] Chọn image ứng dụng từ CI run 43090850035 đã thành công, đối chiếu GHCR manifest digest, platform, user và revision.
-- [ ] Tạo ConfigMap issues-app-config trên AWS và Azure với bốn key nhận diện môi trường, region, version và commit.
-- [ ] Triển khai ứng dụng bằng cùng image digest trên hai cluster.
+- [x] Theo lựa chọn của người thực hành, giữ image ứng dụng từ CI run 43090850035 đã thành công, đối chiếu GHCR manifest digest, platform, user và revision.
+- [x] Tạo ConfigMap issues-app-config trên AWS và Azure, các giá trị nhận diện được xác nhận qua /version trên hai cloud.
+- [x] Tạo Deployment issues-app trên AWS bằng image digest đã chọn và xác nhận Pod Ready 1/1 theo output người thực hành cung cấp.
+- [x] Triển khai cùng Deployment issues-app trên Azure, Pod Running 1/1 và image digest đúng bản đã chọn theo output người thực hành cung cấp.
+- [x] Triển khai ứng dụng bằng cùng image digest trên hai cluster theo manifest và kết quả rollout người thực hành cung cấp.
+- [x] Tạo Service issues-app trên hai cluster, xác nhận đường kết nối HTTP tới web theo output người thực hành cung cấp.
+- [x] Kiểm tra HTTP qua Service trên hai cloud, version, commit, vai trò database và writer health 200/503 đúng dự kiến theo output người thực hành cung cấp.
+- [ ] Tạo Ingress HTTP Traefik trên hai cluster và mở được hai giao diện từ laptop qua Public IP.
 - [ ] Kiểm tra endpoint, vai trò database và dữ liệu nghiệp vụ đã replay.
 
 ## 10. Tài liệu kỹ thuật
@@ -2448,6 +2738,8 @@ ConfigMap sau bước 7.7 cần có DATA bằng 2. Người thực hành đã cu
 - [Kubernetes Secrets with kubectl](https://kubernetes.io/docs/tasks/configmap-secret/managing-secret-using-kubectl/).
 - [Kubernetes StatefulSets](https://kubernetes.io/docs/concepts/workloads/controllers/statefulset/).
 - [Kubernetes Jobs](https://kubernetes.io/docs/concepts/workloads/controllers/job/).
+- [Kubernetes dependent environment variables](https://kubernetes.io/docs/tasks/inject-data-application/define-interdependent-environment-variables/).
+- [Kubernetes startup, liveness and readiness probes](https://kubernetes.io/docs/tasks/configure-pod-container/configure-liveness-readiness-startup-probes/).
 - [Kubernetes headless Services](https://kubernetes.io/docs/concepts/services-networking/service/#headless-services).
 - [Kubernetes Services and manually managed EndpointSlices](https://kubernetes.io/docs/concepts/services-networking/service/#services-without-selectors).
 - [Kubernetes EndpointSlices](https://kubernetes.io/docs/concepts/services-networking/endpoint-slices/).
