@@ -1919,6 +1919,360 @@ sudo k3s kubectl -n issues exec postgres-0 -- \
 
 Mong đợi in_recovery t và read_only on. Tiếp theo kiểm tra kết nối WAL receiver/sender và dữ liệu đã replay từ AWS. Nếu Pod gặp lỗi khởi động, đọc logs postgres-0 và describe pod để kiểm tra mount, file clone, password file và cấu hình PostgreSQL.
 
+Người thực hành đã cung cấp output Azure xác nhận StatefulSet postgres rollout hoàn tất, Pod postgres-0 Running 1/1 với 0 restart trên node mcf-azure-standby, IP 10.30.1.4. SQL trả về in_recovery t và read_only on.
+
+### 7.22. Kiểm tra WAL sender và receiver giữa hai cloud
+
+Trong phiên SSH AWS, đọc trạng thái kết nối của standby từ PostgreSQL primary.
+
+```bash
+sudo k3s kubectl -n issues exec postgres-0 -- \
+  psql -X -U taskflow -d taskflow -P pager=off -c \
+  "SELECT application_name, client_addr, state, sync_state FROM pg_stat_replication;"
+```
+
+Mong đợi một dòng có application_name mcf-azure-standby, client_addr 10.200.29.2, state streaming và sync_state async. application_name được truyền từ bước pg_basebackup và ghi vào primary_conninfo. client_addr thể hiện địa chỉ WireGuard Azure mà AWS thấy trên kết nối replication. async là chế độ replication bất đồng bộ của lab.
+
+Trong phiên SSH Azure, kiểm tra WAL receiver đang kết nối tới primary nào.
+
+```bash
+sudo k3s kubectl -n issues exec postgres-0 -- \
+  psql -X -U taskflow -d taskflow -P pager=off -c \
+  "SELECT status, sender_host, sender_port FROM pg_stat_wal_receiver;"
+```
+
+Mong đợi một dòng có status streaming, sender_host 10.200.29.1 và sender_port 5432. Azure chủ động mở kết nối TCP đến PostgreSQL AWS qua WireGuard. WAL sender phía AWS truyền WAL trên kết nối này, WAL receiver phía Azure nhận WAL để standby replay.
+
+Checkpoint đạt khi hai phía cùng thể hiện trạng thái streaming với đúng IP WireGuard. Trạng thái này phản ánh kết nối tại thời điểm truy vấn. Kiểm chứng một thay đổi dữ liệu mới trên AWS được replay sang Azure được thực hiện ở bước tiếp theo.
+
+Nếu kết quả trống hoặc khác dự kiến, đọc log PostgreSQL Azure để xác định trạng thái kết nối, xác thực hoặc WAL cần phục hồi.
+
+```bash
+sudo k3s kubectl -n issues logs postgres-0 --tail=60
+```
+
+Người thực hành đã xác nhận các kiểm tra WAL sender và receiver ở mục 7.22 cho kết quả đúng dự kiến.
+
+### 7.23. Ghi trên AWS và kiểm tra dữ liệu được replay sang Azure
+
+Dùng bảng probe_pings đã có trong schema để lưu bản ghi kiểm tra replication. Mỗi lần chạy tạo run_id mới bằng UUID ngẫu nhiên để đối chiếu đúng thay đổi vừa thực hiện.
+
+Trong phiên SSH AWS, thêm một bản ghi rồi đọc các giá trị vừa được lưu.
+
+```bash
+sudo k3s kubectl -n issues exec postgres-0 -- \
+  psql -X -U taskflow -d taskflow -v ON_ERROR_STOP=1 -P pager=off -c \
+  "INSERT INTO probe_pings (run_id, seq, environment)
+   VALUES ('stage5-wal-' || gen_random_uuid()::text, 1, 'aws')
+   RETURNING run_id, seq, environment, created_at;"
+```
+
+Ghi lại đầy đủ run_id từ output AWS, cùng seq, environment và created_at. gen_random_uuid tạo UUID ngẫu nhiên; phép nối chuỗi || thêm tiền tố stage5-wal-. RETURNING trả lại chính bản ghi vừa insert. psql mặc định autocommit cho lệnh này.
+
+Trong phiên SSH Azure, thay DAN_RUN_ID_TU_AWS bằng đúng run_id vừa nhận rồi truy vấn.
+
+```bash
+sudo k3s kubectl -n issues exec postgres-0 -- \
+  psql -X -U taskflow -d taskflow -P pager=off -c \
+  "SELECT run_id, seq, environment, created_at
+   FROM probe_pings
+   WHERE run_id = 'DAN_RUN_ID_TU_AWS';"
+```
+
+Mong đợi một dòng có đủ bốn giá trị giống bản ghi AWS. environment vẫn là aws vì giá trị đó được lưu khi ghi trên primary và được replication chuyển sang standby. created_at là thời điểm tạo bản ghi ở AWS. Với replication bất đồng bộ, nếu truy vấn ngay cho 0 rows, chờ vài giây rồi chạy lại SELECT với cùng run_id.
+
+Luồng nghiệm thu là INSERT trên AWS → PostgreSQL ghi WAL → truyền WAL qua WireGuard → Azure replay WAL → SELECT thấy bản ghi trên Azure. Kết quả này xác nhận dữ liệu mới đã được replay tại thời điểm kiểm tra. Các chỉ số mất acknowledged writes, RPO và failover được đo trong giai đoạn thí nghiệm tương ứng.
+
+Người thực hành đã cung cấp kết quả SELECT trên Azure có run_id stage5-wal-30993431-b44b-49b2-971b-1755e6b73423, seq 1, environment aws và created_at 2026-11-12 15:37:59.460877+00. Bản ghi được tạo theo bước INSERT trên AWS rồi đọc từ standby Azure.
+
+### 7.24. Tạo Service postgres cho ứng dụng trên hai cluster
+
+Ứng dụng sẽ kết nối database bằng hostname postgres và port 5432 trong namespace issues. Tạo Service postgres ở mỗi cluster, sau đó cấu hình EndpointSlice riêng để ánh xạ đến IP WireGuard của PostgreSQL tại cloud tương ứng. Service postgres-headless đã tạo phục vụ định danh mạng của StatefulSet.
+
+Tạo file deploy/kubernetes/postgres-service.yaml trên laptop với nội dung sau.
+
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+  namespace: issues
+spec:
+  ports:
+    - name: postgres
+      protocol: TCP
+      port: 5432
+      targetPort: 5432
+```
+
+Service dùng type ClusterIP mặc định. Kubernetes cấp địa chỉ IP nội bộ cho Service. Đích backend được quản lý bằng EndpointSlice thủ công ở bước tiếp theo, phù hợp với cấu hình PostgreSQL lắng nghe trên IP WireGuard. Tại AWS, đích là 10.200.29.1:5432. Tại Azure, đích là 10.200.29.2:5432.
+
+Trong Git Bash trên laptop tại thư mục gốc repository, copy cùng manifest lên cả hai máy.
+
+```bash
+MCF_AWS_PUBLIC_IP="$(terraform -chdir=deploy/terraform/aws output -raw aws_public_ip)"
+MCF_AZURE_PUBLIC_IP="$(terraform -chdir=deploy/terraform/azure output -raw azure_public_ip)"
+
+scp -i ~/.ssh/mcf-lab \
+  deploy/kubernetes/postgres-service.yaml \
+  "ubuntu@$MCF_AWS_PUBLIC_IP:"
+
+scp -i ~/.ssh/mcf-lab \
+  deploy/kubernetes/postgres-service.yaml \
+  "azureuser@$MCF_AZURE_PUBLIC_IP:"
+```
+
+Trong phiên SSH AWS, tạo và kiểm tra Service.
+
+```bash
+sudo k3s kubectl apply -f /home/ubuntu/postgres-service.yaml
+sudo k3s kubectl -n issues get service postgres
+```
+
+Trong phiên SSH Azure, tạo và kiểm tra Service.
+
+```bash
+sudo k3s kubectl apply -f /home/azureuser/postgres-service.yaml
+sudo k3s kubectl -n issues get service postgres
+```
+
+Mong đợi Service postgres có TYPE ClusterIP, một CLUSTER-IP nội bộ và PORT(S) 5432/TCP trên mỗi cluster. Checkpoint này xác nhận Service đã được tạo. Kết nối database qua Service được nghiệm thu sau khi bổ sung EndpointSlice và chạy client trong namespace issues.
+
+### 7.25. Ánh xạ Service postgres tới IP WireGuard bằng EndpointSlice
+
+Tạo file deploy/kubernetes/postgres-endpoint-aws.yaml trên laptop với nội dung sau.
+
+```yaml
+apiVersion: discovery.k8s.io/v1
+kind: EndpointSlice
+metadata:
+  name: postgres-wireguard
+  namespace: issues
+  labels:
+    kubernetes.io/service-name: postgres
+    endpointslice.kubernetes.io/managed-by: cluster-admins
+addressType: IPv4
+ports:
+  - name: postgres
+    protocol: TCP
+    port: 5432
+endpoints:
+  - addresses:
+      - "10.200.29.1"
+    conditions:
+      ready: true
+```
+
+Label kubernetes.io/service-name liên kết EndpointSlice với Service postgres cùng namespace. Port name postgres khớp với tên port trong Service. Label managed-by ghi nhận EndpointSlice do người vận hành quản lý. Địa chỉ endpoint là IP WireGuard mà PostgreSQL AWS đang lắng nghe. ready true khai báo endpoint đủ điều kiện để Service định tuyến traffic; kết nối thực tế sẽ được kiểm tra bằng client ở bước tiếp theo.
+
+Trong Git Bash trên laptop, tạo file Azure từ file AWS.
+
+```bash
+cp deploy/kubernetes/postgres-endpoint-aws.yaml deploy/kubernetes/postgres-endpoint-azure.yaml
+```
+
+Trong file postgres-endpoint-azure.yaml, đổi địa chỉ trong endpoints thành 10.200.29.2.
+
+```yaml
+endpoints:
+  - addresses:
+      - "10.200.29.2"
+    conditions:
+      ready: true
+```
+
+Mỗi cluster có EndpointSlice postgres-wireguard riêng. Ứng dụng trong namespace issues của AWS kết nối postgres:5432 sẽ đi đến 10.200.29.1:5432. Cùng hostname trong cluster Azure sẽ đi đến 10.200.29.2:5432.
+
+Trong Git Bash trên laptop tại thư mục gốc repository, copy file tương ứng lên từng cloud.
+
+```bash
+MCF_AWS_PUBLIC_IP="$(terraform -chdir=deploy/terraform/aws output -raw aws_public_ip)"
+MCF_AZURE_PUBLIC_IP="$(terraform -chdir=deploy/terraform/azure output -raw azure_public_ip)"
+
+scp -i ~/.ssh/mcf-lab \
+  deploy/kubernetes/postgres-endpoint-aws.yaml \
+  "ubuntu@$MCF_AWS_PUBLIC_IP:"
+
+scp -i ~/.ssh/mcf-lab \
+  deploy/kubernetes/postgres-endpoint-azure.yaml \
+  "azureuser@$MCF_AZURE_PUBLIC_IP:"
+```
+
+Trong phiên SSH AWS, áp dụng EndpointSlice và kiểm tra địa chỉ endpoint.
+
+```bash
+sudo k3s kubectl apply -f /home/ubuntu/postgres-endpoint-aws.yaml
+sudo k3s kubectl -n issues get endpointslice -l kubernetes.io/service-name=postgres
+```
+
+Trong phiên SSH Azure, áp dụng EndpointSlice và kiểm tra địa chỉ endpoint.
+
+```bash
+sudo k3s kubectl apply -f /home/azureuser/postgres-endpoint-azure.yaml
+sudo k3s kubectl -n issues get endpointslice -l kubernetes.io/service-name=postgres
+```
+
+Mong đợi EndpointSlice postgres-wireguard có ADDRESSTYPE IPv4, PORTS 5432 và ENDPOINTS là 10.200.29.1 trên AWS hoặc 10.200.29.2 trên Azure. Checkpoint này xác nhận ánh xạ backend đã được lưu trong cluster. Việc phân giải DNS, định tuyến Service và đăng nhập database từ Pod ứng dụng được nghiệm thu ở bước client kế tiếp.
+
+### 7.26. Kiểm tra kết nối database từ Pod qua Service postgres
+
+Tạo file deploy/kubernetes/postgres-service-check.yaml trên laptop. Pod client dùng mạng Pod mặc định trong namespace issues, lấy thông tin đăng nhập từ Secret postgres-auth và kết nối qua hostname postgres. Script đọc DNS, chuẩn bị password file rồi chạy truy vấn trạng thái database.
+
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: postgres-service-check
+  namespace: issues
+spec:
+  restartPolicy: Never
+  activeDeadlineSeconds: 120
+  containers:
+    - name: psql
+      image: postgres:17-bookworm@sha256:665dc7b37ac52a17e298511414c21d23ffa4e6a6ef6225b3e5d59c7afb35e994
+      envFrom:
+        - secretRef:
+            name: postgres-auth
+      command: ["bash", "-ec"]
+      args:
+        - |
+          set -eu
+          getent hosts postgres
+          umask 077
+          printf 'postgres:5432:%s:%s:%s\n' \
+            "$POSTGRES_DB" "$POSTGRES_USER" "$POSTGRES_PASSWORD" \
+            > /tmp/pgpass
+          export PGPASSFILE=/tmp/pgpass
+          export PGCONNECT_TIMEOUT=5
+          exec psql -X -w -h postgres -p 5432 \
+            -U "$POSTGRES_USER" -d "$POSTGRES_DB" \
+            -v ON_ERROR_STOP=1 -P pager=off -c \
+            "SELECT inet_server_addr() AS server_ip, pg_is_in_recovery() AS in_recovery, current_setting('transaction_read_only') AS read_only;"
+```
+
+getent hosts kiểm tra phân giải tên postgres trong namespace issues. Password file được tạo từ Secret với quyền 600 qua umask 077; PGPASSFILE chỉ đường dẫn cho psql. PGCONNECT_TIMEOUT giới hạn thời gian thiết lập kết nối. Pod chạy một lần và kết thúc khi truy vấn hoàn tất, với activeDeadlineSeconds 120 giới hạn tổng thời gian hoạt động của lượt kiểm tra.
+
+Trong Git Bash trên laptop tại thư mục gốc repository, copy cùng manifest lên cả hai máy.
+
+```bash
+MCF_AWS_PUBLIC_IP="$(terraform -chdir=deploy/terraform/aws output -raw aws_public_ip)"
+MCF_AZURE_PUBLIC_IP="$(terraform -chdir=deploy/terraform/azure output -raw azure_public_ip)"
+
+scp -i ~/.ssh/mcf-lab \
+  deploy/kubernetes/postgres-service-check.yaml \
+  "ubuntu@$MCF_AWS_PUBLIC_IP:"
+
+scp -i ~/.ssh/mcf-lab \
+  deploy/kubernetes/postgres-service-check.yaml \
+  "azureuser@$MCF_AZURE_PUBLIC_IP:"
+```
+
+Trong phiên SSH AWS, chạy client và xem kết quả.
+
+```bash
+sudo k3s kubectl apply -f /home/ubuntu/postgres-service-check.yaml
+sudo k3s kubectl -n issues logs -f postgres-service-check --pod-running-timeout=120s
+sudo k3s kubectl -n issues get pod postgres-service-check
+```
+
+Trong phiên SSH Azure, chạy client và xem kết quả.
+
+```bash
+sudo k3s kubectl apply -f /home/azureuser/postgres-service-check.yaml
+sudo k3s kubectl -n issues logs -f postgres-service-check --pod-running-timeout=120s
+sudo k3s kubectl -n issues get pod postgres-service-check
+```
+
+Mong đợi getent in ra ClusterIP của Service postgres tại cluster tương ứng. Kết quả SQL phía AWS cần có server_ip 10.200.29.1, in_recovery f và read_only off. Phía Azure cần có server_ip 10.200.29.2, in_recovery t và read_only on. Pod kiểm tra kết thúc với STATUS Completed; lúc này READY 0/1 phù hợp với container đã chạy xong.
+
+Kết quả thành công xác nhận chuỗi Pod client → DNS postgres → Service ClusterIP → EndpointSlice → PostgreSQL lắng nghe trên IP WireGuard, đồng thời kiểm tra được đăng nhập bằng Secret. Với database cùng host của cluster một node, IP WireGuard đóng vai trò địa chỉ listener nội bộ host. Kết nối WAL giữa hai host sử dụng tunnel liên cloud.
+
+Sau khi ghi nhận kết quả, có thể dọn Pod client trong từng phiên SSH bằng lệnh sau.
+
+```bash
+sudo k3s kubectl -n issues delete pod postgres-service-check
+```
+
+Để kiểm tra lại, tạo lại Pod client từ manifest. Nếu lần chạy lỗi, đọc log và describe pod trước khi dọn để đối chiếu DNS, Secret, EndpointSlice và rule xác thực PostgreSQL.
+
+### 7.27. Chuẩn bị cấu hình nhận diện ứng dụng cho AWS và Azure
+
+Người thực hành đã xác nhận Pod client ở mục 7.26 kết nối qua Service thành công trên cả hai cluster, với địa chỉ server và vai trò database đúng dự kiến.
+
+Chọn image ứng dụng từ workflow run [43090850035](https://github.com/todicode/multi-cloud-failover/actions/runs/43090850035) của commit c56fd3f30baee50fa779607dc0fb1a2133b53a9d. Đã đọc GitHub Actions API xác nhận cả ba job test, container và verify-image success. Đã đối chiếu manifest GHCR của tag commit, tính lại SHA-256 của manifest và kiểm tra config image có platform linux/amd64, user appuser cùng label revision đúng commit.
+
+Tham chiếu image được chọn để dùng chung cho hai cluster ở bước Deployment tiếp theo.
+
+```text
+ghcr.io/todicode/multi-cloud-failover@sha256:2d7cf831e50eb1c693082dc9e4f7dbf76ded557fa512a249ba68df7995b6b10e
+```
+
+Tạo file deploy/kubernetes/app-config-aws.yaml trên laptop với nội dung sau.
+
+```yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: issues-app-config
+  namespace: issues
+data:
+  APP_ENV: "aws"
+  APP_REGION: "ap-southeast-1"
+  APP_VERSION: "v0.1.0"
+  COMMIT_SHA: "c56fd3f30baee50fa779607dc0fb1a2133b53a9d"
+```
+
+Ứng dụng đọc các biến này khi process khởi động. APP_ENV xác định môi trường phục vụ request và được ghi vào header X-Served-By. APP_REGION, APP_VERSION và COMMIT_SHA được trả về qua endpoint /version. COMMIT_SHA khớp revision của image đã chọn. Khi chọn image từ bản build mới, đối chiếu lại revision và cập nhật cấu hình tương ứng trước rollout.
+
+Trong Git Bash trên laptop, tạo cấu hình Azure từ file AWS.
+
+```bash
+cp deploy/kubernetes/app-config-aws.yaml deploy/kubernetes/app-config-azure.yaml
+```
+
+Trong file app-config-azure.yaml, đặt APP_ENV thành azure và APP_REGION thành southeastasia. Phần data cần có nội dung sau.
+
+```yaml
+data:
+  APP_ENV: "azure"
+  APP_REGION: "southeastasia"
+  APP_VERSION: "v0.1.0"
+  COMMIT_SHA: "c56fd3f30baee50fa779607dc0fb1a2133b53a9d"
+```
+
+Mỗi cluster có ConfigMap issues-app-config riêng. Thông tin đăng nhập database đã có trong Secret postgres-auth. Deployment sẽ tham chiếu ConfigMap và Secret khi cấu hình môi trường container.
+
+Trong Git Bash trên laptop tại thư mục gốc repository, copy file tương ứng lên từng máy.
+
+```bash
+MCF_AWS_PUBLIC_IP="$(terraform -chdir=deploy/terraform/aws output -raw aws_public_ip)"
+MCF_AZURE_PUBLIC_IP="$(terraform -chdir=deploy/terraform/azure output -raw azure_public_ip)"
+
+scp -i ~/.ssh/mcf-lab \
+  deploy/kubernetes/app-config-aws.yaml \
+  "ubuntu@$MCF_AWS_PUBLIC_IP:"
+
+scp -i ~/.ssh/mcf-lab \
+  deploy/kubernetes/app-config-azure.yaml \
+  "azureuser@$MCF_AZURE_PUBLIC_IP:"
+```
+
+Trong phiên SSH AWS, áp dụng và kiểm tra ConfigMap.
+
+```bash
+sudo k3s kubectl apply -f /home/ubuntu/app-config-aws.yaml
+sudo k3s kubectl -n issues get configmap issues-app-config
+```
+
+Trong phiên SSH Azure, áp dụng và kiểm tra ConfigMap.
+
+```bash
+sudo k3s kubectl apply -f /home/azureuser/app-config-azure.yaml
+sudo k3s kubectl -n issues get configmap issues-app-config
+```
+
+Mong đợi ConfigMap issues-app-config có DATA bằng 4 trên mỗi cluster. Checkpoint này xác nhận cấu hình runtime đã được lưu để Deployment sử dụng ở bước tiếp theo.
+
 ## 8. Tạm nghỉ và giữ môi trường lab
 
 ### 8.1. Dừng compute trên hai cloud
@@ -2061,8 +2415,15 @@ ConfigMap sau bước 7.7 cần có DATA bằng 2. Người thực hành đã cu
 - [ ] Tạo Secret postgres-auth trên Azure với thông tin từ AWS, kiểm tra đủ ba key và kích thước dự kiến.
 - [ ] Tạo ConfigMap postgres-clone-script trên Azure, DATA bằng 1 để chuẩn bị Job clone.
 - [x] Chạy Job postgres-clone trên Azure, Job Complete 1/1 trong 27 giây và PVC Bound theo output người thực hành cung cấp.
-- [ ] Triển khai StatefulSet PostgreSQL Azure, Pod Running 1/1, in_recovery t và read_only on.
-- [ ] Triển khai PostgreSQL primary/standby và kiểm tra WAL streaming.
+- [x] Triển khai StatefulSet PostgreSQL Azure, Pod Running 1/1, in_recovery t và read_only on theo output người thực hành cung cấp.
+- [x] Xác nhận WAL sender AWS và WAL receiver Azure đều streaming qua đúng IP WireGuard, chế độ async theo xác nhận của người thực hành.
+- [x] Triển khai PostgreSQL primary/standby và kiểm tra WAL streaming theo kết quả vai trò database và xác nhận của người thực hành.
+- [x] Ghi bản ghi probe_pings mới trên AWS và đọc lại trên Azure với run_id tương ứng, seq 1 và environment aws theo kết quả người thực hành cung cấp.
+- [x] Tạo Service postgres trên AWS và Azure để chuẩn bị kết nối database từ ứng dụng theo xác nhận của người thực hành.
+- [x] Áp dụng EndpointSlice postgres-wireguard ở mỗi cluster, xác nhận đúng endpoint IP WireGuard và port 5432 theo xác nhận của người thực hành.
+- [x] Chạy Pod client ở cả hai cluster, kiểm tra DNS postgres, đăng nhập qua Service và vai trò database đúng từng cloud theo xác nhận của người thực hành.
+- [x] Chọn image ứng dụng từ CI run 43090850035 đã thành công, đối chiếu GHCR manifest digest, platform, user và revision.
+- [ ] Tạo ConfigMap issues-app-config trên AWS và Azure với bốn key nhận diện môi trường, region, version và commit.
 - [ ] Triển khai ứng dụng bằng cùng image digest trên hai cluster.
 - [ ] Kiểm tra endpoint, vai trò database và dữ liệu nghiệp vụ đã replay.
 
@@ -2088,6 +2449,8 @@ ConfigMap sau bước 7.7 cần có DATA bằng 2. Người thực hành đã cu
 - [Kubernetes StatefulSets](https://kubernetes.io/docs/concepts/workloads/controllers/statefulset/).
 - [Kubernetes Jobs](https://kubernetes.io/docs/concepts/workloads/controllers/job/).
 - [Kubernetes headless Services](https://kubernetes.io/docs/concepts/services-networking/service/#headless-services).
+- [Kubernetes Services and manually managed EndpointSlices](https://kubernetes.io/docs/concepts/services-networking/service/#services-without-selectors).
+- [Kubernetes EndpointSlices](https://kubernetes.io/docs/concepts/services-networking/endpoint-slices/).
 - [PostgreSQL 17 replication parameters](https://www.postgresql.org/docs/17/runtime-config-replication.html).
 - [PostgreSQL 17 connection parameters](https://www.postgresql.org/docs/17/runtime-config-connection.html).
 - [PostgreSQL 17 pg_hba.conf](https://www.postgresql.org/docs/17/auth-pg-hba-conf.html).
@@ -2102,6 +2465,8 @@ ConfigMap sau bước 7.7 cần có DATA bằng 2. Người thực hành đã cu
 - [PostgreSQL 17 streaming replication](https://www.postgresql.org/docs/17/warm-standby.html#STREAMING-REPLICATION).
 - [PostgreSQL 17 pg_basebackup](https://www.postgresql.org/docs/17/app-pgbasebackup.html).
 - [PostgreSQL 17 password file](https://www.postgresql.org/docs/17/libpq-pgpass.html).
+- [PostgreSQL 17 replication monitoring views](https://www.postgresql.org/docs/17/monitoring-stats.html#MONITORING-PG-STAT-REPLICATION-VIEW).
+- [PostgreSQL 17 UUID functions](https://www.postgresql.org/docs/17/functions-uuid.html).
 - [AWS EC2 stop and start](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/Stop_Start.html).
 - [AWS EC2 instance states and billing](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/ec2-instance-lifecycle.html).
 - [Azure VM states and billing](https://learn.microsoft.com/en-us/azure/virtual-machines/states-billing).

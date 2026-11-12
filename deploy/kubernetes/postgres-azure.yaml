@@ -1,0 +1,68 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: postgres
+  namespace: issues
+spec:
+  serviceName: postgres-headless
+  replicas: 1
+  selector:
+    matchLabels:
+      app: postgres
+  template:
+    metadata:
+      labels:
+        app: postgres
+    spec:
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      terminationGracePeriodSeconds: 60
+      containers:
+        - name: postgres
+          image: postgres:17-bookworm@sha256:665dc7b37ac52a17e298511414c21d23ffa4e6a6ef6225b3e5d59c7afb35e994
+          command:
+            - bash
+            - -ec
+            - |
+              test -f /var/lib/postgresql/data/.clone-complete
+              test "$(cat "$PGDATA/PG_VERSION")" = 17
+              exec docker-entrypoint.sh "$@"
+            - --
+          args: ["postgres", "-c", "config_file=/etc/postgresql/postgresql.conf"]
+          envFrom:
+            - secretRef:
+                name: postgres-auth
+          env:
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+          resources:
+            requests:
+              cpu: 200m
+              memory: 256Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi
+          startupProbe:
+            exec:
+              command: ["pg_isready", "-h", "10.200.29.2", "-U", "taskflow", "-d", "taskflow"]
+            periodSeconds: 5
+            timeoutSeconds: 5
+            failureThreshold: 60
+          readinessProbe:
+            exec:
+              command: ["pg_isready", "-h", "10.200.29.2", "-U", "taskflow", "-d", "taskflow"]
+            periodSeconds: 5
+            timeoutSeconds: 5
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+            - name: config
+              mountPath: /etc/postgresql
+              readOnly: true
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: postgres-data
+        - name: config
+          configMap:
+            name: postgres-config

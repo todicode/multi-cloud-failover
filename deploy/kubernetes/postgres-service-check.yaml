@@ -1,0 +1,29 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: postgres-service-check
+  namespace: issues
+spec:
+  restartPolicy: Never
+  activeDeadlineSeconds: 120
+  containers:
+    - name: psql
+      image: postgres:17-bookworm@sha256:665dc7b37ac52a17e298511414c21d23ffa4e6a6ef6225b3e5d59c7afb35e994
+      envFrom:
+        - secretRef:
+            name: postgres-auth
+      command: ["bash", "-ec"]
+      args:
+        - |
+          set -eu
+          getent hosts postgres
+          umask 077
+          printf 'postgres:5432:%s:%s:%s\n' \
+            "$POSTGRES_DB" "$POSTGRES_USER" "$POSTGRES_PASSWORD" \
+            > /tmp/pgpass
+          export PGPASSFILE=/tmp/pgpass
+          export PGCONNECT_TIMEOUT=5
+          exec psql -X -w -h postgres -p 5432 \
+            -U "$POSTGRES_USER" -d "$POSTGRES_DB" \
+            -v ON_ERROR_STOP=1 -P pager=off -c \
+            "SELECT inet_server_addr() AS server_ip, pg_is_in_recovery() AS in_recovery, current_setting('transaction_read_only') AS read_only;"
