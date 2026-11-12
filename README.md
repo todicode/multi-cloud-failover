@@ -111,6 +111,7 @@ The [accepted CI run](https://github.com/todicode/multi-cloud-failover/actions/r
 - [Stage 4: AWS/Azure infrastructure with Terraform](docs/instruction/giaidoan4_ha_tang_aws_azure_terraform.md)
 - [Stage 5: K3s and cloud workloads](docs/instruction/giaidoan5_k3s_va_trien_khai_workload.md)
 - [Stage 6: DNS and HTTPS (in progress)](docs/instruction/giaidoan6_dns_va_https.md)
+- [Kubernetes manifests grouped by component](deploy/kubernetes/)
 - [Architecture and consistency model](docs/ARCHITECTURE.md)
 - [Local setup and operations](docs/LOCAL_DEVELOPMENT.md)
 - [Failover and recovery runbook](docs/DISASTER_RECOVERY.md)

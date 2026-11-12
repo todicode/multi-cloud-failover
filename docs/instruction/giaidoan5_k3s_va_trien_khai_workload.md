@@ -927,13 +927,18 @@ Trong output ping, `icmp_seq` đánh số từng request, `time` là thời gian
 
 Namespace `issues` nhóm các tài nguyên của ứng dụng và database trong từng cluster. Bắt đầu trên AWS, sau đó dùng cùng manifest cho Azure. Lưu các manifest Kubernetes có thể tái sử dụng trong `deploy/kubernetes/` tại repository.
 
+Các manifest được nhóm theo thành phần. Thư mục common chứa Namespace và StorageClass, database chứa PostgreSQL cùng cấu hình replication, app chứa ứng dụng và đường truy cập HTTP, checks chứa Pod kiểm tra kết nối.
+
 Trong Git Bash trên laptop, từ thư mục gốc project, tạo thư mục chứa manifest.
 
 ```bash
-mkdir -p deploy/kubernetes
+mkdir -p deploy/kubernetes/common \
+  deploy/kubernetes/database \
+  deploy/kubernetes/app \
+  deploy/kubernetes/checks
 ```
 
-Tự tạo file `deploy/kubernetes/namespace.yaml` với nội dung sau.
+Tự tạo file `deploy/kubernetes/common/namespace.yaml` với nội dung sau.
 
 ```yaml
 apiVersion: v1
@@ -948,7 +953,7 @@ Trong Git Bash trên laptop, lấy Public IP AWS hiện tại từ state và chu
 
 ```bash
 MCF_AWS_PUBLIC_IP="$(terraform -chdir=deploy/terraform/aws output -raw aws_public_ip)"
-scp -i ~/.ssh/mcf-lab deploy/kubernetes/namespace.yaml "ubuntu@$MCF_AWS_PUBLIC_IP:namespace.yaml"
+scp -i ~/.ssh/mcf-lab deploy/kubernetes/common/namespace.yaml "ubuntu@$MCF_AWS_PUBLIC_IP:namespace.yaml"
 ```
 
 `scp` sao chép file qua SSH. Lệnh trên đưa manifest từ laptop tới file `/home/ubuntu/namespace.yaml` trên EC2.
@@ -968,11 +973,11 @@ Ghi nhận kết quả thực tế của namespace AWS trước khi chuyển san
 
 ### 7.2. Áp dụng namespace trên Azure
 
-Dùng file `deploy/kubernetes/namespace.yaml` đã tạo ở mục 7.1. Trong Git Bash trên laptop tại thư mục gốc repository, lấy Public IP Azure hiện tại và copy manifest lên VM.
+Dùng file `deploy/kubernetes/common/namespace.yaml` đã tạo ở mục 7.1. Trong Git Bash trên laptop tại thư mục gốc repository, lấy Public IP Azure hiện tại và copy manifest lên VM.
 
 ```bash
 MCF_AZURE_PUBLIC_IP="$(terraform -chdir=deploy/terraform/azure output -raw azure_public_ip)"
-scp -i ~/.ssh/mcf-lab deploy/kubernetes/namespace.yaml "azureuser@$MCF_AZURE_PUBLIC_IP:namespace.yaml"
+scp -i ~/.ssh/mcf-lab deploy/kubernetes/common/namespace.yaml "azureuser@$MCF_AZURE_PUBLIC_IP:namespace.yaml"
 ```
 
 File được đặt tại `/home/azureuser/namespace.yaml` trên Azure. Trong phiên SSH Azure, áp dụng và kiểm tra.
@@ -992,7 +997,7 @@ Sau khi xác nhận namespace đã có trên cả AWS và Azure, bước tiếp 
 
 StorageClass mô tả cách cấp phát persistent volume và policy thu hồi volume. Tạo class `local-path-retain` dùng provisioner local-path đã có trong K3s, với reclaim policy `Retain`.
 
-Trên laptop, tự tạo file `deploy/kubernetes/storageclass.yaml` với nội dung sau.
+Trên laptop, tự tạo file `deploy/kubernetes/common/storageclass.yaml` với nội dung sau.
 
 ```yaml
 apiVersion: storage.k8s.io/v1
@@ -1012,7 +1017,7 @@ Trong Git Bash trên laptop tại thư mục gốc repository, copy manifest lê
 
 ```bash
 MCF_AWS_PUBLIC_IP="$(terraform -chdir=deploy/terraform/aws output -raw aws_public_ip)"
-scp -i ~/.ssh/mcf-lab deploy/kubernetes/storageclass.yaml "ubuntu@$MCF_AWS_PUBLIC_IP:storageclass.yaml"
+scp -i ~/.ssh/mcf-lab deploy/kubernetes/common/storageclass.yaml "ubuntu@$MCF_AWS_PUBLIC_IP:storageclass.yaml"
 ```
 
 Trong phiên SSH AWS, áp dụng và kiểm tra StorageClass.
@@ -1030,7 +1035,7 @@ Ghi nhận kết quả tạo StorageClass AWS trước khi tạo PVC dữ liệu
 
 PVC (PersistentVolumeClaim) khai báo yêu cầu persistent storage cho workload. PostgreSQL sẽ tham chiếu PVC `postgres-data` trong namespace `issues` để lưu dữ liệu qua các lần tạo lại Pod.
 
-Trên laptop, tự tạo file `deploy/kubernetes/postgres-pvc.yaml` với nội dung sau.
+Trên laptop, tự tạo file `deploy/kubernetes/database/postgres-pvc.yaml` với nội dung sau.
 
 ```yaml
 apiVersion: v1
@@ -1053,7 +1058,7 @@ Trong Git Bash trên laptop tại thư mục gốc repository, copy manifest lê
 
 ```bash
 MCF_AWS_PUBLIC_IP="$(terraform -chdir=deploy/terraform/aws output -raw aws_public_ip)"
-scp -i ~/.ssh/mcf-lab deploy/kubernetes/postgres-pvc.yaml "ubuntu@$MCF_AWS_PUBLIC_IP:postgres-pvc.yaml"
+scp -i ~/.ssh/mcf-lab deploy/kubernetes/database/postgres-pvc.yaml "ubuntu@$MCF_AWS_PUBLIC_IP:postgres-pvc.yaml"
 ```
 
 Trong phiên SSH AWS, áp dụng và đọc trạng thái PVC.
@@ -1110,7 +1115,7 @@ Mong đợi Secret type `Opaque`, ba key `POSTGRES_DB`, `POSTGRES_USER`, `POSTGR
 
 ### 7.6. Tạo ConfigMap tham số PostgreSQL phía AWS
 
-ConfigMap `postgres-config` chứa cấu hình PostgreSQL để mount vào Pod ở bước triển khai StatefulSet. Trên laptop, tự tạo file `deploy/kubernetes/postgres-config-aws.yaml` với nội dung sau.
+ConfigMap `postgres-config` chứa cấu hình PostgreSQL để mount vào Pod ở bước triển khai StatefulSet. Trên laptop, tự tạo file `deploy/kubernetes/database/postgres-config-aws.yaml` với nội dung sau.
 
 ```yaml
 apiVersion: v1
@@ -1147,7 +1152,7 @@ Trong Git Bash trên laptop tại thư mục gốc repository, copy file lên AW
 
 ```bash
 MCF_AWS_PUBLIC_IP="$(terraform -chdir=deploy/terraform/aws output -raw aws_public_ip)"
-scp -i ~/.ssh/mcf-lab deploy/kubernetes/postgres-config-aws.yaml "ubuntu@$MCF_AWS_PUBLIC_IP:postgres-config-aws.yaml"
+scp -i ~/.ssh/mcf-lab deploy/kubernetes/database/postgres-config-aws.yaml "ubuntu@$MCF_AWS_PUBLIC_IP:postgres-config-aws.yaml"
 ```
 
 Trong phiên SSH AWS, áp dụng và kiểm tra ConfigMap.
@@ -1161,7 +1166,7 @@ Lượt đầu mong đợi `configmap/postgres-config created`, còn lệnh get 
 
 ### 7.7. Bổ sung pg_hba.conf cho AWS
 
-`pg_hba.conf` định nghĩa các kết nối được phép đăng nhập theo loại kết nối, database, user, địa chỉ nguồn và phương thức xác thực. Trên laptop, cập nhật file `deploy/kubernetes/postgres-config-aws.yaml` thành nội dung sau.
+`pg_hba.conf` định nghĩa các kết nối được phép đăng nhập theo loại kết nối, database, user, địa chỉ nguồn và phương thức xác thực. Trên laptop, cập nhật file `deploy/kubernetes/database/postgres-config-aws.yaml` thành nội dung sau.
 
 ```yaml
 apiVersion: v1
@@ -1200,7 +1205,7 @@ Trong Git Bash trên laptop, copy lại file đã cập nhật lên AWS.
 
 ```bash
 MCF_AWS_PUBLIC_IP="$(terraform -chdir=deploy/terraform/aws output -raw aws_public_ip)"
-scp -i ~/.ssh/mcf-lab deploy/kubernetes/postgres-config-aws.yaml "ubuntu@$MCF_AWS_PUBLIC_IP:postgres-config-aws.yaml"
+scp -i ~/.ssh/mcf-lab deploy/kubernetes/database/postgres-config-aws.yaml "ubuntu@$MCF_AWS_PUBLIC_IP:postgres-config-aws.yaml"
 ```
 
 Trong phiên SSH AWS, cập nhật và đọc ConfigMap.
@@ -1217,7 +1222,7 @@ Mong đợi apply hiện `configured` và ConfigMap có DATA bằng 2. Nội dun
 
 Service `postgres-headless` được dùng làm governing Service của StatefulSet PostgreSQL. StatefulSet ở bước tiếp theo sẽ tham chiếu tên này qua trường `serviceName` để thiết lập định danh mạng của Pod.
 
-Trên laptop, tự tạo file `deploy/kubernetes/postgres-headless.yaml` với nội dung sau.
+Trên laptop, tự tạo file `deploy/kubernetes/database/postgres-headless.yaml` với nội dung sau.
 
 ```yaml
 apiVersion: v1
@@ -1244,7 +1249,7 @@ Trong Git Bash trên laptop tại thư mục gốc repository, copy manifest lê
 
 ```bash
 MCF_AWS_PUBLIC_IP="$(terraform -chdir=deploy/terraform/aws output -raw aws_public_ip)"
-scp -i ~/.ssh/mcf-lab deploy/kubernetes/postgres-headless.yaml "ubuntu@$MCF_AWS_PUBLIC_IP:postgres-headless.yaml"
+scp -i ~/.ssh/mcf-lab deploy/kubernetes/database/postgres-headless.yaml "ubuntu@$MCF_AWS_PUBLIC_IP:postgres-headless.yaml"
 ```
 
 Trong phiên SSH AWS, tạo và kiểm tra Service.
@@ -1260,7 +1265,7 @@ Lượt đầu mong đợi `service/postgres-headless created`. Output get cần
 
 Tạo StatefulSet một replica sử dụng các tài nguyên đã chuẩn bị. Image được chọn là PostgreSQL 17 trên Debian Bookworm, ghim digest để dùng lại cùng image khi triển khai Azure. Metadata registry đã đối chiếu ngày 2026-11-12 cho biết PG_VERSION `17.11-1.pgdg12+2`.
 
-Trên laptop, tự tạo file `deploy/kubernetes/postgres-aws.yaml` với nội dung sau.
+Trên laptop, tự tạo file `deploy/kubernetes/database/postgres-aws.yaml` với nội dung sau.
 
 ```yaml
 apiVersion: apps/v1
@@ -1335,7 +1340,7 @@ Trong Git Bash trên laptop, copy file lên AWS.
 
 ```bash
 MCF_AWS_PUBLIC_IP="$(terraform -chdir=deploy/terraform/aws output -raw aws_public_ip)"
-scp -i ~/.ssh/mcf-lab deploy/kubernetes/postgres-aws.yaml "ubuntu@$MCF_AWS_PUBLIC_IP:postgres-aws.yaml"
+scp -i ~/.ssh/mcf-lab deploy/kubernetes/database/postgres-aws.yaml "ubuntu@$MCF_AWS_PUBLIC_IP:postgres-aws.yaml"
 ```
 
 Trong phiên SSH AWS, áp dụng và đợi StatefulSet sẵn sàng.
@@ -1524,9 +1529,9 @@ Trong Git Bash trên laptop tại thư mục gốc repository, copy các file l�
 ```bash
 MCF_AZURE_PUBLIC_IP="$(terraform -chdir=deploy/terraform/azure output -raw azure_public_ip)"
 scp -i ~/.ssh/mcf-lab \
-  deploy/kubernetes/namespace.yaml \
-  deploy/kubernetes/storageclass.yaml \
-  deploy/kubernetes/postgres-pvc.yaml \
+  deploy/kubernetes/common/namespace.yaml \
+  deploy/kubernetes/common/storageclass.yaml \
+  deploy/kubernetes/database/postgres-pvc.yaml \
   "azureuser@$MCF_AZURE_PUBLIC_IP:"
 ```
 
@@ -1593,7 +1598,7 @@ Mong đợi Secret Opaque có REPLICATION_USER 10 bytes và REPLICATION_PASSWORD
 
 ### 7.16. Tạo ConfigMap PostgreSQL phía Azure
 
-Tạo file deploy/kubernetes/postgres-config-azure.yaml trên laptop với nội dung sau.
+Tạo file deploy/kubernetes/database/postgres-config-azure.yaml trên laptop với nội dung sau.
 
 ```yaml
 apiVersion: v1
@@ -1629,7 +1634,7 @@ Trong Git Bash trên laptop tại thư mục gốc repository, copy manifest lê
 ```bash
 MCF_AZURE_PUBLIC_IP="$(terraform -chdir=deploy/terraform/azure output -raw azure_public_ip)"
 scp -i ~/.ssh/mcf-lab \
-  deploy/kubernetes/postgres-config-azure.yaml \
+  deploy/kubernetes/database/postgres-config-azure.yaml \
   "azureuser@$MCF_AZURE_PUBLIC_IP:"
 ```
 
@@ -1646,14 +1651,14 @@ Người thực hành đã cung cấp output Azure xác nhận ConfigMap postgre
 
 ### 7.17. Tạo headless Service PostgreSQL trên Azure
 
-Dùng lại deploy/kubernetes/postgres-headless.yaml đã áp dụng trên AWS. Service này có clusterIP None và selector app postgres. StatefulSet Azure sẽ sử dụng tên postgres-headless tại trường serviceName để cung cấp định danh mạng ổn định cho Pod.
+Dùng lại deploy/kubernetes/database/postgres-headless.yaml đã áp dụng trên AWS. Service này có clusterIP None và selector app postgres. StatefulSet Azure sẽ sử dụng tên postgres-headless tại trường serviceName để cung cấp định danh mạng ổn định cho Pod.
 
 Trong Git Bash trên laptop tại thư mục gốc repository, copy manifest lên Azure.
 
 ```bash
 MCF_AZURE_PUBLIC_IP="$(terraform -chdir=deploy/terraform/azure output -raw azure_public_ip)"
 scp -i ~/.ssh/mcf-lab \
-  deploy/kubernetes/postgres-headless.yaml \
+  deploy/kubernetes/database/postgres-headless.yaml \
   "azureuser@$MCF_AZURE_PUBLIC_IP:"
 ```
 
@@ -1704,7 +1709,7 @@ Secret postgres-auth cần có POSTGRES_DB 8 bytes, POSTGRES_USER 8 bytes và PO
 
 ### 7.19. Chuẩn bị script clone database trên Azure
 
-Tạo file deploy/kubernetes/postgres-clone-script.yaml trên laptop. ConfigMap này chứa script được Job clone gọi ở bước tiếp theo. Job sẽ mount PVC postgres-data và lấy biến môi trường từ Secret postgres-replication. PGDATA được Job đặt thành /var/lib/postgresql/data/pgdata, SOURCE_DB_HOST là IP WireGuard AWS.
+Tạo file deploy/kubernetes/database/postgres-clone-script.yaml trên laptop. ConfigMap này chứa script được Job clone gọi ở bước tiếp theo. Job sẽ mount PVC postgres-data và lấy biến môi trường từ Secret postgres-replication. PGDATA được Job đặt thành /var/lib/postgresql/data/pgdata, SOURCE_DB_HOST là IP WireGuard AWS.
 
 ```yaml
 apiVersion: v1
@@ -1754,7 +1759,7 @@ Trong Git Bash trên laptop tại thư mục gốc repository, copy manifest lê
 ```bash
 MCF_AZURE_PUBLIC_IP="$(terraform -chdir=deploy/terraform/azure output -raw azure_public_ip)"
 scp -i ~/.ssh/mcf-lab \
-  deploy/kubernetes/postgres-clone-script.yaml \
+  deploy/kubernetes/database/postgres-clone-script.yaml \
   "azureuser@$MCF_AZURE_PUBLIC_IP:"
 ```
 
@@ -1769,7 +1774,7 @@ Mong đợi ConfigMap postgres-clone-script có DATA bằng 1. Lệnh apply lưu
 
 ### 7.20. Chạy Job clone PostgreSQL từ AWS sang Azure
 
-Tạo file deploy/kubernetes/postgres-clone-azure.yaml trên laptop. Job dùng cùng image PostgreSQL đã cố định trên AWS, mount PVC postgres-data của Azure và chạy script clone.sh từ ConfigMap postgres-clone-script.
+Tạo file deploy/kubernetes/database/postgres-clone-azure.yaml trên laptop. Job dùng cùng image PostgreSQL đã cố định trên AWS, mount PVC postgres-data của Azure và chạy script clone.sh từ ConfigMap postgres-clone-script.
 
 ```yaml
 apiVersion: batch/v1
@@ -1828,7 +1833,7 @@ Trong Git Bash trên laptop tại thư mục gốc repository, copy manifest lê
 ```bash
 MCF_AZURE_PUBLIC_IP="$(terraform -chdir=deploy/terraform/azure output -raw azure_public_ip)"
 scp -i ~/.ssh/mcf-lab \
-  deploy/kubernetes/postgres-clone-azure.yaml \
+  deploy/kubernetes/database/postgres-clone-azure.yaml \
   "azureuser@$MCF_AZURE_PUBLIC_IP:"
 ```
 
@@ -1865,7 +1870,7 @@ Người thực hành đã cung cấp output Azure xác nhận Job postgres-clon
 Trong Git Bash trên laptop tại thư mục gốc repository, tạo manifest Azure từ manifest AWS đã có.
 
 ```bash
-cp deploy/kubernetes/postgres-aws.yaml deploy/kubernetes/postgres-azure.yaml
+cp deploy/kubernetes/database/postgres-aws.yaml deploy/kubernetes/database/postgres-azure.yaml
 ```
 
 Trong file postgres-azure.yaml, đổi địa chỉ ở cả startupProbe và readinessProbe từ 10.200.29.1 thành 10.200.29.2. Mỗi probe cần có command sau.
@@ -1897,7 +1902,7 @@ Copy manifest đã chỉnh lên Azure từ Git Bash trên laptop.
 ```bash
 MCF_AZURE_PUBLIC_IP="$(terraform -chdir=deploy/terraform/azure output -raw azure_public_ip)"
 scp -i ~/.ssh/mcf-lab \
-  deploy/kubernetes/postgres-azure.yaml \
+  deploy/kubernetes/database/postgres-azure.yaml \
   "azureuser@$MCF_AZURE_PUBLIC_IP:"
 ```
 
@@ -1989,7 +1994,7 @@ Người thực hành đã cung cấp kết quả SELECT trên Azure có run_id 
 
 Ứng dụng sẽ kết nối database bằng hostname postgres và port 5432 trong namespace issues. Tạo Service postgres ở mỗi cluster, sau đó cấu hình EndpointSlice riêng để ánh xạ đến IP WireGuard của PostgreSQL tại cloud tương ứng. Service postgres-headless đã tạo phục vụ định danh mạng của StatefulSet.
 
-Tạo file deploy/kubernetes/postgres-service.yaml trên laptop với nội dung sau.
+Tạo file deploy/kubernetes/database/postgres-service.yaml trên laptop với nội dung sau.
 
 ```yaml
 apiVersion: v1
@@ -2014,11 +2019,11 @@ MCF_AWS_PUBLIC_IP="$(terraform -chdir=deploy/terraform/aws output -raw aws_publi
 MCF_AZURE_PUBLIC_IP="$(terraform -chdir=deploy/terraform/azure output -raw azure_public_ip)"
 
 scp -i ~/.ssh/mcf-lab \
-  deploy/kubernetes/postgres-service.yaml \
+  deploy/kubernetes/database/postgres-service.yaml \
   "ubuntu@$MCF_AWS_PUBLIC_IP:"
 
 scp -i ~/.ssh/mcf-lab \
-  deploy/kubernetes/postgres-service.yaml \
+  deploy/kubernetes/database/postgres-service.yaml \
   "azureuser@$MCF_AZURE_PUBLIC_IP:"
 ```
 
@@ -2040,7 +2045,7 @@ Mong đợi Service postgres có TYPE ClusterIP, một CLUSTER-IP nội bộ và
 
 ### 7.25. Ánh xạ Service postgres tới IP WireGuard bằng EndpointSlice
 
-Tạo file deploy/kubernetes/postgres-endpoint-aws.yaml trên laptop với nội dung sau.
+Tạo file deploy/kubernetes/database/postgres-endpoint-aws.yaml trên laptop với nội dung sau.
 
 ```yaml
 apiVersion: discovery.k8s.io/v1
@@ -2068,7 +2073,7 @@ Label kubernetes.io/service-name liên kết EndpointSlice với Service postgre
 Trong Git Bash trên laptop, tạo file Azure từ file AWS.
 
 ```bash
-cp deploy/kubernetes/postgres-endpoint-aws.yaml deploy/kubernetes/postgres-endpoint-azure.yaml
+cp deploy/kubernetes/database/postgres-endpoint-aws.yaml deploy/kubernetes/database/postgres-endpoint-azure.yaml
 ```
 
 Trong file postgres-endpoint-azure.yaml, đổi địa chỉ trong endpoints thành 10.200.29.2.
@@ -2090,11 +2095,11 @@ MCF_AWS_PUBLIC_IP="$(terraform -chdir=deploy/terraform/aws output -raw aws_publi
 MCF_AZURE_PUBLIC_IP="$(terraform -chdir=deploy/terraform/azure output -raw azure_public_ip)"
 
 scp -i ~/.ssh/mcf-lab \
-  deploy/kubernetes/postgres-endpoint-aws.yaml \
+  deploy/kubernetes/database/postgres-endpoint-aws.yaml \
   "ubuntu@$MCF_AWS_PUBLIC_IP:"
 
 scp -i ~/.ssh/mcf-lab \
-  deploy/kubernetes/postgres-endpoint-azure.yaml \
+  deploy/kubernetes/database/postgres-endpoint-azure.yaml \
   "azureuser@$MCF_AZURE_PUBLIC_IP:"
 ```
 
@@ -2116,7 +2121,7 @@ Mong đợi EndpointSlice postgres-wireguard có ADDRESSTYPE IPv4, PORTS 5432 v�
 
 ### 7.26. Kiểm tra kết nối database từ Pod qua Service postgres
 
-Tạo file deploy/kubernetes/postgres-service-check.yaml trên laptop. Pod client dùng mạng Pod mặc định trong namespace issues, lấy thông tin đăng nhập từ Secret postgres-auth và kết nối qua hostname postgres. Script đọc DNS, chuẩn bị password file rồi chạy truy vấn trạng thái database.
+Tạo file deploy/kubernetes/checks/postgres-service-check.yaml trên laptop. Pod client dùng mạng Pod mặc định trong namespace issues, lấy thông tin đăng nhập từ Secret postgres-auth và kết nối qua hostname postgres. Script đọc DNS, chuẩn bị password file rồi chạy truy vấn trạng thái database.
 
 ```yaml
 apiVersion: v1
@@ -2159,11 +2164,11 @@ MCF_AWS_PUBLIC_IP="$(terraform -chdir=deploy/terraform/aws output -raw aws_publi
 MCF_AZURE_PUBLIC_IP="$(terraform -chdir=deploy/terraform/azure output -raw azure_public_ip)"
 
 scp -i ~/.ssh/mcf-lab \
-  deploy/kubernetes/postgres-service-check.yaml \
+  deploy/kubernetes/checks/postgres-service-check.yaml \
   "ubuntu@$MCF_AWS_PUBLIC_IP:"
 
 scp -i ~/.ssh/mcf-lab \
-  deploy/kubernetes/postgres-service-check.yaml \
+  deploy/kubernetes/checks/postgres-service-check.yaml \
   "azureuser@$MCF_AZURE_PUBLIC_IP:"
 ```
 
@@ -2207,7 +2212,7 @@ Tham chiếu image được chọn để dùng chung cho hai cluster ở bước
 ghcr.io/todicode/multi-cloud-failover@sha256:2d7cf831e50eb1c693082dc9e4f7dbf76ded557fa512a249ba68df7995b6b10e
 ```
 
-Tạo file deploy/kubernetes/app-config-aws.yaml trên laptop với nội dung sau.
+Tạo file deploy/kubernetes/app/app-config-aws.yaml trên laptop với nội dung sau.
 
 ```yaml
 apiVersion: v1
@@ -2227,7 +2232,7 @@ data:
 Trong Git Bash trên laptop, tạo cấu hình Azure từ file AWS.
 
 ```bash
-cp deploy/kubernetes/app-config-aws.yaml deploy/kubernetes/app-config-azure.yaml
+cp deploy/kubernetes/app/app-config-aws.yaml deploy/kubernetes/app/app-config-azure.yaml
 ```
 
 Trong file app-config-azure.yaml, đặt APP_ENV thành azure và APP_REGION thành southeastasia. Phần data cần có nội dung sau.
@@ -2249,11 +2254,11 @@ MCF_AWS_PUBLIC_IP="$(terraform -chdir=deploy/terraform/aws output -raw aws_publi
 MCF_AZURE_PUBLIC_IP="$(terraform -chdir=deploy/terraform/azure output -raw azure_public_ip)"
 
 scp -i ~/.ssh/mcf-lab \
-  deploy/kubernetes/app-config-aws.yaml \
+  deploy/kubernetes/app/app-config-aws.yaml \
   "ubuntu@$MCF_AWS_PUBLIC_IP:"
 
 scp -i ~/.ssh/mcf-lab \
-  deploy/kubernetes/app-config-azure.yaml \
+  deploy/kubernetes/app/app-config-azure.yaml \
   "azureuser@$MCF_AZURE_PUBLIC_IP:"
 ```
 
@@ -2275,7 +2280,7 @@ Mong đợi ConfigMap issues-app-config có DATA bằng 4 trên mỗi cluster. C
 
 ### 7.28. Tạo Deployment ứng dụng và chạy trên AWS
 
-Tạo file deploy/kubernetes/app-deployment.yaml trên laptop. Manifest này dùng image digest và ConfigMap tương ứng với commit c56fd3f đã chọn. Mỗi cluster sẽ sử dụng ConfigMap issues-app-config, Secret postgres-auth và Service postgres của chính cluster đó.
+Tạo file deploy/kubernetes/app/app-deployment.yaml trên laptop. Manifest này dùng image digest và ConfigMap tương ứng với commit c56fd3f đã chọn. Mỗi cluster sẽ sử dụng ConfigMap issues-app-config, Secret postgres-auth và Service postgres của chính cluster đó.
 
 ```yaml
 apiVersion: apps/v1
@@ -2344,7 +2349,7 @@ Trong Git Bash trên laptop tại thư mục gốc repository, copy manifest lê
 ```bash
 MCF_AWS_PUBLIC_IP="$(terraform -chdir=deploy/terraform/aws output -raw aws_public_ip)"
 scp -i ~/.ssh/mcf-lab \
-  deploy/kubernetes/app-deployment.yaml \
+  deploy/kubernetes/app/app-deployment.yaml \
   "ubuntu@$MCF_AWS_PUBLIC_IP:"
 ```
 
@@ -2362,14 +2367,14 @@ Người thực hành đã cung cấp output AWS xác nhận Deployment issues-a
 
 ### 7.29. Triển khai cùng ứng dụng trên Azure
 
-Dùng deploy/kubernetes/app-deployment.yaml đã áp dụng trên AWS để triển khai lên cluster Azure. Deployment tham chiếu ConfigMap issues-app-config có APP_ENV azure và APP_REGION southeastasia, Secret postgres-auth và Service postgres của cluster Azure. EndpointSlice tại Azure ánh xạ Service database đến 10.200.29.2:5432. Image được chọn là cùng digest ứng với commit c56fd3f.
+Dùng deploy/kubernetes/app/app-deployment.yaml đã áp dụng trên AWS để triển khai lên cluster Azure. Deployment tham chiếu ConfigMap issues-app-config có APP_ENV azure và APP_REGION southeastasia, Secret postgres-auth và Service postgres của cluster Azure. EndpointSlice tại Azure ánh xạ Service database đến 10.200.29.2:5432. Image được chọn là cùng digest ứng với commit c56fd3f.
 
 Trong Git Bash trên laptop tại thư mục gốc repository, copy manifest lên Azure.
 
 ```bash
 MCF_AZURE_PUBLIC_IP="$(terraform -chdir=deploy/terraform/azure output -raw azure_public_ip)"
 scp -i ~/.ssh/mcf-lab \
-  deploy/kubernetes/app-deployment.yaml \
+  deploy/kubernetes/app/app-deployment.yaml \
   "azureuser@$MCF_AZURE_PUBLIC_IP:"
 ```
 
@@ -2396,7 +2401,7 @@ Người thực hành đã cung cấp output Azure xác nhận Deployment issues
 
 ### 7.30. Tạo Service cho web trên hai cluster
 
-Tạo file deploy/kubernetes/app-service.yaml trên laptop với nội dung sau.
+Tạo file deploy/kubernetes/app/app-service.yaml trên laptop với nội dung sau.
 
 ```yaml
 apiVersion: v1
@@ -2424,11 +2429,11 @@ MCF_AWS_PUBLIC_IP="$(terraform -chdir=deploy/terraform/aws output -raw aws_publi
 MCF_AZURE_PUBLIC_IP="$(terraform -chdir=deploy/terraform/azure output -raw azure_public_ip)"
 
 scp -i ~/.ssh/mcf-lab \
-  deploy/kubernetes/app-service.yaml \
+  deploy/kubernetes/app/app-service.yaml \
   "ubuntu@$MCF_AWS_PUBLIC_IP:"
 
 scp -i ~/.ssh/mcf-lab \
-  deploy/kubernetes/app-service.yaml \
+  deploy/kubernetes/app/app-service.yaml \
   "azureuser@$MCF_AZURE_PUBLIC_IP:"
 ```
 
@@ -2494,7 +2499,7 @@ Người thực hành đã cung cấp kết quả HTTP qua Service trên cả ha
 
 Dùng Traefik đã được cài cùng K3s để tiếp nhận HTTP trên port 80 của mỗi host và chuyển request đến Service issues-app. Cấu hình bước này phục vụ nghiệm thu qua Public IP. Hostname và TLS được cấu hình trong giai đoạn DNS/HTTPS tiếp theo.
 
-Tạo file deploy/kubernetes/app-ingress-http.yaml trên laptop với nội dung sau.
+Tạo file deploy/kubernetes/app/app-ingress-http.yaml trên laptop với nội dung sau.
 
 ```yaml
 apiVersion: networking.k8s.io/v1
@@ -2525,11 +2530,11 @@ MCF_AWS_PUBLIC_IP="$(terraform -chdir=deploy/terraform/aws output -raw aws_publi
 MCF_AZURE_PUBLIC_IP="$(terraform -chdir=deploy/terraform/azure output -raw azure_public_ip)"
 
 scp -i ~/.ssh/mcf-lab \
-  deploy/kubernetes/app-ingress-http.yaml \
+  deploy/kubernetes/app/app-ingress-http.yaml \
   "ubuntu@$MCF_AWS_PUBLIC_IP:"
 
 scp -i ~/.ssh/mcf-lab \
-  deploy/kubernetes/app-ingress-http.yaml \
+  deploy/kubernetes/app/app-ingress-http.yaml \
   "azureuser@$MCF_AZURE_PUBLIC_IP:"
 ```
 
