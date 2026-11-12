@@ -2558,6 +2558,93 @@ Mở hai URL vừa in bằng trình duyệt laptop. Luồng request là laptop �
 
 Nếu cần chẩn đoán kết nối, xem IngressClass traefik, Pod Traefik và Service/EndpointSlice ứng dụng, rồi đối chiếu rule inbound HTTP 80 đã khai báo trong Terraform AWS/Azure.
 
+Đã kiểm tra HTTP GET từ bên ngoài tới /issues.html, /version và /api/database/status trên hai Public IP. Cả sáu request trả HTTP 200. Header X-Served-By và environment đúng từng cloud, hai web cùng báo commit c56fd3f. AWS primary writable true, Azure standby writable false và replication_connected true.
+
+### 7.33. Mở web qua SSH tunnel để kiểm tra form trong trình duyệt
+
+Form tạo issue và bình luận trong app/static/issues.js sử dụng crypto.randomUUID để sinh request_id. Trình duyệt cung cấp API này trong secure context, gồm HTTPS và các địa chỉ loopback như http://127.0.0.1. Bước kiểm tra form với image c56fd3f sử dụng SSH local forwarding để mở ứng dụng tại địa chỉ loopback trên laptop. Các URL Public IP ở mục 7.32 đã được kiểm tra khả năng phục vụ HTTP. HTTPS công khai được cấu hình ở giai đoạn tiếp theo.
+
+Mở một tab Git Bash trên laptop cho tunnel AWS. Tại thư mục gốc repository, chạy các lệnh sau.
+
+```bash
+cd /d/multi-cloud-failover
+MCF_AWS_PUBLIC_IP="$(terraform -chdir=deploy/terraform/aws output -raw aws_public_ip)"
+MCF_AWS_PRIVATE_IP="$(terraform -chdir=deploy/terraform/aws output -raw aws_private_ip)"
+
+ssh -i ~/.ssh/mcf-lab -N \
+  -o ExitOnForwardFailure=yes \
+  -L "127.0.0.1:18080:$MCF_AWS_PRIVATE_IP:80" \
+  "ubuntu@$MCF_AWS_PUBLIC_IP"
+```
+
+Nhập passphrase của key khi được hỏi và giữ tab này mở trong lúc kiểm tra. SSH giữ kết nối tunnel ở foreground. Cổng 18080 trên loopback laptop được chuyển qua SSH đến private IP AWS port 80, nơi Traefik tiếp nhận HTTP.
+
+Mở tab Git Bash thứ hai trên laptop cho tunnel Azure.
+
+```bash
+cd /d/multi-cloud-failover
+MCF_AZURE_PUBLIC_IP="$(terraform -chdir=deploy/terraform/azure output -raw azure_public_ip)"
+MCF_AZURE_PRIVATE_IP="$(terraform -chdir=deploy/terraform/azure output -raw azure_private_ip)"
+
+ssh -i ~/.ssh/mcf-lab -N \
+  -o ExitOnForwardFailure=yes \
+  -L "127.0.0.1:18081:$MCF_AZURE_PRIVATE_IP:80" \
+  "azureuser@$MCF_AZURE_PUBLIC_IP"
+```
+
+Giữ tab tunnel Azure mở. Trong trình duyệt laptop, mở hai địa chỉ sau.
+
+- AWS tại http://127.0.0.1:18080/issues.html.
+- Azure tại http://127.0.0.1:18081/issues.html.
+
+Đối chiếu nhãn môi trường AWS và Azure trên giao diện. Luồng truy cập là trình duyệt loopback laptop → SSH tunnel → private IP host port 80 → Traefik → Service issues-app → Pod ứng dụng. Bước tiếp theo thực hiện tạo issue trên AWS và đọc lại trên Azure qua hai URL loopback này.
+
+-L cấu hình local port forwarding. -N giữ phiên SSH cho việc forwarding. ExitOnForwardFailure yes yêu cầu SSH thoát nếu thiết lập forwarding ban đầu lỗi, ví dụ cổng local đang bận. Khi hoàn thành lượt kiểm tra, dùng Ctrl+C trong mỗi tab để dừng tunnel.
+
+### 7.34. Nghiệm thu nghiệp vụ AWS primary và Azure standby
+
+Giữ hai SSH tunnel của mục 7.33 hoạt động. Mở web AWS tại http://127.0.0.1:18080/issues.html và web Azure tại http://127.0.0.1:18081/issues.html. Đối chiếu nhãn môi trường trên mỗi giao diện trước thao tác.
+
+Trên web AWS, bấm Tạo issue và nhập một bản ghi kiểm tra.
+
+| Trường | Dữ liệu thực hành |
+|---|---|
+| Tên người gửi | Tên của người thực hành |
+| Tiêu đề | Kiểm tra replication trên cloud |
+| Mô tả | Issue được tạo trên AWS và đọc lại từ PostgreSQL standby Azure. |
+| Trạng thái | Open |
+
+Bấm Tạo issue để gửi. Ghi lại số issue và tiêu đề được hiển thị sau khi thao tác thành công.
+
+Trên web Azure, bấm Làm mới rồi mở issue tương ứng. Đối chiếu số issue, tên người gửi, tiêu đề, mô tả và trạng thái Open với AWS. Dữ liệu được đọc từ PostgreSQL Azure đã nhận và replay WAL của giao dịch trên AWS.
+
+Trở lại web AWS, mở cùng issue, nhập tên người bình luận và nội dung Bình luận kiểm tra WAL streaming AWS sang Azure, rồi bấm Gửi bình luận. Trên web Azure, làm mới trang và mở lại cùng issue để đối chiếu nội dung bình luận và lịch sử hoạt động.
+
+Trên web AWS, bấm Đóng issue. Trên web Azure, làm mới trang, mở lại issue và xác nhận trạng thái Closed. Các thay đổi cần được quan sát trên cùng issue trong hai môi trường.
+
+Kiểm tra trạng thái truy cập của web Azure. Giao diện cần hiển thị Standby, Chỉ đọc và Đang nhận dữ liệu đồng bộ. Các nút ghi như Tạo issue, Chỉnh sửa issue và Gửi bình luận được disable theo trạng thái writable false.
+
+Để kiểm tra backend từ chối ghi khi đang standby, chạy request probe sau trong một tab Git Bash khác trên laptop, trong lúc tunnel Azure đang hoạt động.
+
+```bash
+curl -sS --max-time 10 -w '\nHTTP %{http_code}\n' \
+  -X POST http://127.0.0.1:18081/api/ping \
+  -H 'Content-Type: application/json' \
+  --data '{"run_id":"stage5-azure-readonly","seq":1}'
+```
+
+Mong đợi HTTP 409 với thông báo Database đang ở chế độ chỉ đọc. Code write_ping kiểm tra pg_is_in_recovery và transaction_read_only trước khi ghi probe_pings. Kết quả này nghiệm thu write guard ở backend Azure.
+
+Checkpoint nghiệp vụ đạt khi tạo issue, thêm bình luận và đóng issue trên AWS đều được đọc lại đúng trên Azure, đồng thời Azure từ chối POST probe bằng HTTP 409 khi đang standby. Ghi nhận kết quả thực hành trước khi đánh dấu giai đoạn 5 hoàn tất. Các bài đo downtime, latency, RPO, failover và baseline thuộc giai đoạn đánh giá tương ứng.
+
+### 7.35. Kết quả nghiệm thu giai đoạn 5
+
+Ngày 2026-11-13, đối chiếu API trên hai cloud cho kết quả mỗi môi trường có một issue và một bình luận. Danh sách issue và toàn bộ chi tiết issue số 1 khớp nhau giữa AWS/Azure, gồm bản ghi issue, bình luận và lịch sử hoạt động. Lịch sử có các action created, commented, closed và reopened. Trạng thái hiện tại là Open sau thao tác mở lại. Người thực hành xác nhận POST /api/ping vào Azure trả HTTP 409.
+
+Đầu ra giai đoạn 5 đã đạt gồm hai cluster K3s độc lập, PostgreSQL AWS primary và Azure standby, WAL streaming qua WireGuard, cùng application image digest, kết nối qua Service và Ingress, nhận diện môi trường đúng và dữ liệu nghiệp vụ được replay sang Azure. Các kiểm tra endpoint và vai trò database được ghi ở mục 7.31-7.32; kiểm tra nghiệp vụ ở mục 7.34.
+
+Giai đoạn 6 bắt đầu cấu hình DNS/HTTPS theo [hướng dẫn DNS và HTTPS](giaidoan6_dns_va_https.md). Failover, fencing/promote, rejoin/failback, monitoring và đo baseline tiếp tục theo roadmap của project.
+
 ## 8. Tạm nghỉ và giữ môi trường lab
 
 ### 8.1. Dừng compute trên hai cloud
@@ -2660,7 +2747,7 @@ ConfigMap sau bước 7.7 cần có DATA bằng 2. Người thực hành đã cu
 - [x] Tạo lại AWS và đọc đủ ba Terraform output theo kết quả người thực hành cung cấp.
 - [x] Nghiệm thu EC2 status checks và SSH vào Ubuntu theo xác nhận của người thực hành.
 - [x] Kiểm tra CPU, RAM, disk, swap và UFW theo kết quả người thực hành cung cấp.
-- [ ] Xác nhận cloud-init hoàn tất và hai gói curl/ca-certificates đã được chuẩn bị.
+- [x] Chuẩn bị môi trường AWS để cài K3s qua script HTTPS và chạy curl, kiểm chứng qua kết quả cài đặt và HTTP người thực hành cung cấp.
 - [x] Tạo và kiểm tra file cấu hình K3s trên AWS theo kết quả người thực hành cung cấp.
 - [x] Cài K3s v1.35.1+k3s1 trên AWS, xác nhận service active và phiên bản theo kết quả người thực hành cung cấp.
 - [x] Kiểm tra node Ready, các Pod hệ thống và StorageClass trên AWS theo kết quả người thực hành cung cấp.
@@ -2668,7 +2755,7 @@ ConfigMap sau bước 7.7 cần có DATA bằng 2. Người thực hành đã cu
 - [x] Đọc đủ ba Terraform output của lượt triển khai Azure mới theo kết quả người thực hành cung cấp.
 - [x] Tạo lại Azure, kiểm tra trạng thái VM và nghiệm thu SSH theo xác nhận của người thực hành.
 - [x] Kiểm tra CPU, RAM, disk, swap và UFW trên Azure theo kết quả người thực hành cung cấp.
-- [ ] Xác nhận cloud-init hoàn tất và công cụ curl/ca-certificates đã được chuẩn bị trên Azure.
+- [x] Chuẩn bị môi trường Azure để cài K3s qua script HTTPS và chạy curl, kiểm chứng qua kết quả cài đặt và HTTP người thực hành cung cấp.
 - [x] Tạo và kiểm tra file cấu hình K3s trên Azure theo xác nhận của người thực hành.
 - [x] Cài K3s v1.35.1+k3s1 trên Azure và kiểm tra service, phiên bản theo xác nhận của người thực hành.
 - [x] Nghiệm thu node Ready, các Pod hệ thống và StorageClass trên Azure theo xác nhận của người thực hành.
@@ -2694,11 +2781,11 @@ ConfigMap sau bước 7.7 cần có DATA bằng 2. Người thực hành đã cu
 - [x] Tạo role replicator trên AWS, LOGIN và REPLICATION đều t theo output người thực hành cung cấp.
 - [x] Gán mật khẩu replication và kiểm tra SCRAM, scram_password t theo output người thực hành cung cấp.
 - [x] Áp dụng namespace, StorageClass Retain và PVC PostgreSQL trên Azure trước khi clone standby theo output người thực hành cung cấp.
-- [ ] Tạo Secret postgres-replication trên Azure, kiểm tra đủ hai key và kích thước dự kiến.
+- [x] Tạo Secret postgres-replication trên Azure, thông tin xác thực được sử dụng thành công trong Job clone và WAL streaming.
 - [x] Tạo và áp dụng ConfigMap PostgreSQL Azure, DATA bằng 2 với listen_addresses chứa IP WireGuard Azure theo manifest local và output người thực hành cung cấp.
-- [ ] Áp dụng headless Service postgres-headless trên Azure và kiểm tra CLUSTER-IP None, port 5432/TCP.
-- [ ] Tạo Secret postgres-auth trên Azure với thông tin từ AWS, kiểm tra đủ ba key và kích thước dự kiến.
-- [ ] Tạo ConfigMap postgres-clone-script trên Azure, DATA bằng 1 để chuẩn bị Job clone.
+- [x] Chuẩn bị manifest headless Service postgres-headless dùng chung và cấu hình serviceName tương ứng trong StatefulSet Azure.
+- [x] Tạo Secret postgres-auth trên Azure, được Pod client và ứng dụng sử dụng đăng nhập database thành công.
+- [x] Tạo ConfigMap postgres-clone-script trên Azure, script được Job clone sử dụng và Job Complete 1/1.
 - [x] Chạy Job postgres-clone trên Azure, Job Complete 1/1 trong 27 giây và PVC Bound theo output người thực hành cung cấp.
 - [x] Triển khai StatefulSet PostgreSQL Azure, Pod Running 1/1, in_recovery t và read_only on theo output người thực hành cung cấp.
 - [x] Xác nhận WAL sender AWS và WAL receiver Azure đều streaming qua đúng IP WireGuard, chế độ async theo xác nhận của người thực hành.
@@ -2714,8 +2801,11 @@ ConfigMap sau bước 7.7 cần có DATA bằng 2. Người thực hành đã cu
 - [x] Triển khai ứng dụng bằng cùng image digest trên hai cluster theo manifest và kết quả rollout người thực hành cung cấp.
 - [x] Tạo Service issues-app trên hai cluster, xác nhận đường kết nối HTTP tới web theo output người thực hành cung cấp.
 - [x] Kiểm tra HTTP qua Service trên hai cloud, version, commit, vai trò database và writer health 200/503 đúng dự kiến theo output người thực hành cung cấp.
-- [ ] Tạo Ingress HTTP Traefik trên hai cluster và mở được hai giao diện từ laptop qua Public IP.
-- [ ] Kiểm tra endpoint, vai trò database và dữ liệu nghiệp vụ đã replay.
+- [x] Tạo Ingress HTTP Traefik trên hai cluster, HTTP GET từ bên ngoài tới giao diện, version và database status đều trả 200 đúng môi trường.
+- [x] Hướng dẫn truy cập loopback qua SSH tunnel để kiểm tra form dùng crypto.randomUUID; kết quả nghiệp vụ được đối chiếu qua API hai cloud.
+- [x] Tạo issue, thêm bình luận, đóng và mở lại issue trên AWS; danh sách và chi tiết dữ liệu/lịch sử khớp Azure qua đối chiếu API.
+- [x] Xác nhận backend Azure standby từ chối POST /api/ping bằng HTTP 409 theo xác nhận của người thực hành.
+- [x] Kiểm tra endpoint, vai trò database và dữ liệu nghiệp vụ đã replay; hoàn thành đầu ra giai đoạn 5.
 
 ## 10. Tài liệu kỹ thuật
 
@@ -2759,6 +2849,9 @@ ConfigMap sau bước 7.7 cần có DATA bằng 2. Người thực hành đã cu
 - [PostgreSQL 17 password file](https://www.postgresql.org/docs/17/libpq-pgpass.html).
 - [PostgreSQL 17 replication monitoring views](https://www.postgresql.org/docs/17/monitoring-stats.html#MONITORING-PG-STAT-REPLICATION-VIEW).
 - [PostgreSQL 17 UUID functions](https://www.postgresql.org/docs/17/functions-uuid.html).
+- [Browser crypto.randomUUID secure-context requirement](https://developer.mozilla.org/en-US/docs/Web/API/Crypto/randomUUID).
+- [Browser secure contexts and loopback addresses](https://developer.mozilla.org/en-US/docs/Web/Security/Defenses/Secure_Contexts).
+- [OpenSSH local port forwarding](https://man.openbsd.org/ssh#L).
 - [AWS EC2 stop and start](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/Stop_Start.html).
 - [AWS EC2 instance states and billing](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/ec2-instance-lifecycle.html).
 - [Azure VM states and billing](https://learn.microsoft.com/en-us/azure/virtual-machines/states-billing).

@@ -128,8 +128,9 @@ Tham khảo kỹ thuật: [K3s single-node cluster](https://docs.k3s.io/quick-st
 
 - Local application/database, container packaging và CI/registry đã có kết quả kiểm tra trong hướng dẫn giai đoạn 1-3.
 - Hạ tầng AWS và Azure đã được triển khai và nghiệm thu độc lập qua status/agent checks, post-apply plan No changes và SSH/Ubuntu. Sau lượt dọn lab, hai môi trường đã được tạo lại để thực hành giai đoạn 5.
-- AWS và Azure đã cài K3s v1.35.1+k3s1, nghiệm thu node Ready, các Pod hệ thống và StorageClass theo kết quả người thực hành cung cấp. WireGuard đã có handshake, route qua wg0 và ping hai chiều thành công. Bước tiếp theo là triển khai database và ứng dụng trên hai cloud.
-- Chưa nghiệm thu S1 trên hai cloud thực tế, traffic failover cloud hoặc tình huống mất hoàn toàn một môi trường cloud.
+- AWS và Azure đã cài K3s v1.35.1+k3s1, nghiệm thu node Ready, các Pod hệ thống và StorageClass. WireGuard, PostgreSQL primary/standby, WAL streaming và cùng application image digest trên hai cloud đã được kiểm tra. HTTP xác nhận đúng môi trường, phiên bản và vai trò database.
+- S1 đã có bằng chứng triển khai cùng ứng dụng trên hai môi trường độc lập. Danh sách issue, chi tiết, bình luận và lịch sử tạo/đóng/mở lại khớp nhau qua API AWS/Azure; người thực hành xác nhận Azure standby từ chối ghi bằng HTTP 409. Đầu ra giai đoạn 5 đã đạt, giai đoạn 6 bắt đầu DNS/HTTPS.
+- Traffic failover cloud và tình huống mất hoàn toàn một môi trường được thực hiện trong giai đoạn phục hồi tiếp theo để nghiệm thu S2/S3.
 - Chưa nghiệm thu baseline cloud, bộ số đo cloud lặp lại được, biểu đồ và phân tích kết quả. Bảng giá/công thức hiện có là chuẩn bị cost proxy.
 - Báo cáo cuối kỳ và demo tổng thể chưa hoàn thành.
 

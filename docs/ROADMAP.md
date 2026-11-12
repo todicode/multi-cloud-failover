@@ -42,11 +42,15 @@ The Azure root module deployed eleven resources covering the Resource Group, VNe
 
 The implementation sequence completes the required Azure background, then builds and validates AWS infrastructure with Terraform before Azure. Infrastructure code stays in this repository under `deploy/terraform/`. AWS and Azure use separate root modules under `deploy/terraform/aws/` and `deploy/terraform/azure/`, with separate local state for the single-operator lab. State and saved plans are excluded from version control, and provider lock files are committed. Both clouds have been recreated for Stage 5, and each host runs an independent single-node K3s cluster.
 
-## In progress: cluster and workload preparation
+## Completed: cloud clusters and workloads
 
 The [Stage 5 guide](instruction/giaidoan5_k3s_va_trien_khai_workload.md) records recreation and K3s v1.35.1+k3s1 installation on AWS and Azure. Node readiness, system Pods, WireGuard handshakes, and bidirectional tunnel connectivity passed acceptance. PostgreSQL primary/standby deployment, retained PVCs, WAL streaming, and replay of a new probe record have been verified. Both clusters run the same application image digest. Internal HTTP checks through each application Service confirmed environment, region, version, commit, database connectivity, and the expected writer-health responses.
 
-The remaining Stage 5 acceptance steps cover public HTTP access through Traefik and an issue created on the AWS web application becoming visible on Azure. Hostname/TLS configuration, cloud traffic failover, observability, and recovery experiments follow in their respective phases. Commands and acceptance evidence are added as each step begins.
+Public HTTP GET checks through Traefik passed for the UI, version, and database status on both clouds. API comparisons confirmed matching issue details, comments, and create/close/reopen history between AWS and Azure. The operator confirmed HTTP 409 for a write probe against the Azure standby. Browser form checks use SSH forwarding to loopback origins to satisfy the current UI's crypto.randomUUID secure-context requirement. Stage 5 acceptance is complete.
+
+## In progress: DNS and HTTPS
+
+The [Stage 6 guide](instruction/giaidoan6_dns_va_https.md) prepares a dedicated mcf.todicode.tech DNS branch for this project, with app, aws, and azure hostnames. The parent domain currently uses Orderbox nameservers. The plan delegates the project branch to a Route 53 public hosted zone, then configures origin records, the shared hostname, certificates, and HTTPS Ingress. The DNS Terraform root module is introduced incrementally alongside the existing AWS and Azure modules. Commands and acceptance evidence are added as each step begins.
 
 ## Milestones
 
