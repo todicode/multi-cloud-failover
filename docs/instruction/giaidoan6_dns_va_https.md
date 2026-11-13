@@ -880,6 +880,555 @@ Trong Git Bash trên laptop, chỉ định executable Windows curl bằng đư�
 
 Hai lệnh đã được chạy kiểm chứng ngay trong Git Bash và đều trả HTTP 200. version hiển thị environment aws, region ap-southeast-1, commit c56fd3f. Writer health hiển thị connected true, role primary và writable true. Kết quả này hoàn tất checkpoint HTTPS AWS và xác nhận TLS Secret đang phục vụ qua Ingress đã cấu hình.
 
+### 4.21. Chuẩn bị kết nối SSH vào Azure
+
+Bắt đầu phần certificate và HTTPS của Azure sau checkpoint HTTPS AWS. Certificate Azure sẽ bao gồm azure.mcf.todicode.tech và app.mcf.todicode.tech. VM mcf-azure-standby đã được xác nhận running và public IP là 4.145.30.250.
+
+Lần kiểm tra ngày 2026-11-14 cho thấy rule ssh-from-operator của NSG Azure cho phép 171.251.233.105/32, còn IP public hiện tại của laptop là 171.251.235.11. Cần cập nhật input admin_cidr của root module Azure để kết nối SSH từ địa chỉ hiện tại.
+
+Mở deploy/terraform/azure/terraform.tfvars trên laptop và sửa dòng admin_cidr.
+
+```hcl
+admin_cidr = "171.251.235.11/32"
+```
+
+Trong Git Bash tại thư mục gốc repository, đặt subscription của project và kiểm tra plan.
+
+```bash
+export ARM_SUBSCRIPTION_ID="52341a4a-a86f-4780-82dc-879b500022d8"
+terraform -chdir=deploy/terraform/azure plan
+```
+
+Plan đã được xem trước với input IP này. Kết quả mong đợi là azurerm_network_security_rule.ssh được updated in-place, với source_address_prefix đổi sang 171.251.235.11/32.
+
+```text
+Plan: 0 to add, 1 to change, 0 to destroy.
+```
+
+Sau khi đối chiếu plan, apply và nhập yes.
+
+```bash
+terraform -chdir=deploy/terraform/azure apply
+```
+
+Sau khi apply hoàn tất, SSH vào Azure từ Git Bash trên laptop.
+
+```bash
+ssh -o ConnectTimeout=10 -i ~/.ssh/mcf-lab azureuser@4.145.30.250
+```
+
+Checkpoint này hoàn tất khi đăng nhập được vào terminal Ubuntu của VM mcf-azure-standby. Bước tiếp theo cài Certbot và plugin Route 53 trên VM Azure.
+
+### 4.22. Cài Certbot và plugin Route 53 trên Azure
+
+Trong terminal SSH Ubuntu của Azure, với prompt azureuser@mcf-azure-standby, cài Certbot và plugin từ Ubuntu package repository.
+
+```bash
+sudo apt-get update
+sudo apt-get install -y certbot python3-certbot-dns-route53
+```
+
+Certbot trên VM Azure sẽ xin certificate riêng mang tên quản lý mcf-azure, bao gồm azure.mcf.todicode.tech và app.mcf.todicode.tech. Plugin dns-route53 cập nhật TXT challenge trong hosted zone Route 53 mcf.todicode.tech thông qua AWS API. VM Azure sử dụng plugin này vì DNS của nhánh project đang được quản lý tại Route 53.
+
+Kiểm tra sau khi cài.
+
+```bash
+certbot --version
+sudo certbot plugins
+```
+
+Mong đợi có thông tin phiên bản Certbot và plugin dns-route53 trong danh sách với chức năng Authenticator. Checkpoint này hoàn tất khi công cụ và plugin đã sẵn sàng trên Azure. Bước tiếp theo cấu hình quyền truy cập Route 53 cho Certbot chạy trên VM Azure, sau đó kiểm tra DNS challenge bằng staging.
+
+### 4.23. Khai báo IAM user dành cho Certbot trên Azure
+
+Certbot trên VM Azure cần danh tính AWS để gọi Route 53 API. Project sử dụng IAM user mcf-azure-certbot dành cho công việc này. Các bước tiếp theo sẽ cấp policy giới hạn DNS challenge và cấu hình credential trên VM Azure.
+
+IAM user này được quản lý trong root module deploy/terraform/dns để đi cùng vòng đời hosted zone và quyền DNS. Provider AWS của root module dùng profile default thuộc tài khoản AWS của người thực hành.
+
+Trên laptop, tạo file deploy/terraform/dns/certbot-azure.tf với nội dung sau.
+
+```hcl
+resource "aws_iam_user" "certbot_azure" {
+  name = "mcf-azure-certbot"
+
+  tags = {
+    Name    = "mcf-azure-certbot"
+    Project = "multi-cloud-failover"
+  }
+}
+```
+
+aws_iam_user khai báo IAM user trong AWS. certbot_azure là tên resource trong Terraform, tạo địa chỉ aws_iam_user.certbot_azure. name là tên user trong IAM. Tên mcf-azure-certbot thể hiện mục đích sử dụng cho Certbot chạy trên Azure.
+
+Trong Git Bash trên laptop tại thư mục gốc repository, chạy các lệnh kiểm tra root module DNS.
+
+```bash
+terraform -chdir=deploy/terraform/dns fmt
+terraform -chdir=deploy/terraform/dns validate
+terraform -chdir=deploy/terraform/dns plan
+```
+
+Plan mong đợi tại checkpoint này.
+
+```text
+# aws_iam_user.certbot_azure will be created
+Plan: 1 to add, 0 to change, 0 to destroy.
+```
+
+Đối chiếu tên user mcf-azure-certbot. Bước tiếp theo thêm policy Route 53 cho user trước khi apply phần danh tính dùng trên Azure.
+
+### 4.24. Khai báo policy Route 53 cho Certbot trên Azure
+
+IAM user certbot_azure đã được khai báo và đối chiếu plan tạo một user. Thêm resource sau vào cuối deploy/terraform/dns/certbot-azure.tf.
+
+```hcl
+resource "aws_iam_user_policy" "certbot_azure_route53" {
+  name = "mcf-certbot-route53"
+  user = aws_iam_user.certbot_azure.name
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect   = "Allow"
+        Action   = "route53:ListHostedZones"
+        Resource = "*"
+      },
+      {
+        Effect   = "Allow"
+        Action   = "route53:GetChange"
+        Resource = "arn:aws:route53:::change/*"
+      },
+      {
+        Effect   = "Allow"
+        Action   = "route53:ChangeResourceRecordSets"
+        Resource = aws_route53_zone.project.arn
+        Condition = {
+          "ForAllValues:StringEquals" = {
+            "route53:ChangeResourceRecordSetsRecordTypes" = ["TXT"]
+          }
+          Null = {
+            "route53:ChangeResourceRecordSetsRecordTypes" = "false"
+          }
+        }
+      }
+    ]
+  })
+}
+```
+
+aws_iam_user_policy quản lý inline policy gắn vào IAM user được chọn qua thuộc tính user. ListHostedZones cho phép tìm zone quản lý hostname. GetChange cho phép kiểm tra trạng thái đồng bộ các thay đổi DNS. ChangeResourceRecordSets cho phép cập nhật record trong zone project, với điều kiện toàn bộ record trong request có type TXT và context key loại record tồn tại.
+
+Resource dùng aws_route53_zone.project.arn để tham chiếu hosted zone trong cùng root module DNS. Policy giới hạn quyền ghi vào các TXT record trong zone mcf.todicode.tech. Certbot trên Azure sẽ sử dụng các quyền này để tạo và dọn TXT challenge khi xin hoặc gia hạn certificate.
+
+Trong Git Bash trên laptop tại thư mục gốc repository, chạy các lệnh kiểm tra.
+
+```bash
+terraform -chdir=deploy/terraform/dns fmt
+terraform -chdir=deploy/terraform/dns validate
+terraform -chdir=deploy/terraform/dns plan
+```
+
+Plan mong đợi.
+
+```text
+# aws_iam_user.certbot_azure will be created
+# aws_iam_user_policy.certbot_azure_route53 will be created
+Plan: 2 to add, 0 to change, 0 to destroy.
+```
+
+Đối chiếu tên user mcf-azure-certbot và ARN hosted zone kết thúc bằng Z043946815CRXHICLXRTS. Bước tiếp theo apply user cùng policy, sau đó cấu hình credential dành cho Certbot trên VM Azure.
+
+#### 4.24.1. Vai trò của IAM khi xin certificate trên Azure
+
+Certificate được xin cho các hostname azure.mcf.todicode.tech và app.mcf.todicode.tech, sau đó triển khai vào TLS Secret trong cluster Azure. Các thành phần tham gia có trách nhiệm sau.
+
+| Thành phần | Nơi chạy hoặc dịch vụ | Trách nhiệm |
+|---|---|---|
+| Certbot | VM Azure | Gửi yêu cầu certificate, thực hiện DNS challenge và lưu certificate |
+| Let's Encrypt | Certificate authority | Xác minh quyền quản lý hostname và cấp certificate |
+| Route 53 | AWS | Lưu TXT challenge trong hosted zone mcf.todicode.tech |
+| IAM user mcf-azure-certbot | AWS | Cung cấp danh tính và quyền gọi Route 53 API cho Certbot trên Azure |
+| Traefik | K3s Azure | Sử dụng certificate trong TLS Secret để phục vụ HTTPS |
+
+DNS của nhánh mcf.todicode.tech đã được delegate tới Route 53. Vì vậy, Certbot trên Azure gọi Route 53 API bằng credential của IAM user để đặt TXT record _acme-challenge.azure.mcf.todicode.tech và _acme-challenge.app.mcf.todicode.tech. Let's Encrypt truy vấn DNS, kiểm tra giá trị challenge và cấp certificate khi xác minh thành công. Sau đó plugin dọn TXT challenge.
+
+Phía AWS EC2 dùng IAM role mcf-aws-certbot qua instance profile và temporary credentials. Phía Azure đang khai báo IAM user mcf-azure-certbot với policy cho phép cập nhật TXT trong zone project. IAM cung cấp quyền cho thao tác DNS trong quá trình xin và gia hạn certificate.
+
+Sau khi cấu hình HTTPS, luồng phục vụ ứng dụng Azure là Browser → HTTPS → Traefik Azure → Service issues-app → App Pod. Certificate và private key được lưu trong TLS Secret của cluster Azure để Traefik sử dụng cho TLS handshake.
+
+### 4.25. Apply IAM user và policy dành cho Certbot Azure
+
+Root module DNS đã validate thành công. Plan đã được đối chiếu với hai resource sẽ tạo là aws_iam_user.certbot_azure và aws_iam_user_policy.certbot_azure_route53.
+
+Trong Git Bash trên laptop tại thư mục gốc repository, chạy lệnh sau.
+
+```bash
+terraform -chdir=deploy/terraform/dns apply
+```
+
+Đối chiếu tên user mcf-azure-certbot, policy mcf-certbot-route53 và plan 2 to add, 0 to change, 0 to destroy. Nhập yes để tạo user cùng policy trong tài khoản AWS của provider default.
+
+Kết quả mong đợi.
+
+```text
+Apply complete! Resources: 2 added, 0 changed, 0 destroyed.
+```
+
+Trong Git Bash trên laptop, kiểm tra danh tính user đã tạo.
+
+```bash
+aws iam get-user \
+  --profile default \
+  --user-name mcf-azure-certbot \
+  --query 'User.{Name:UserName,Arn:Arn}' \
+  --output table \
+  --no-cli-pager
+```
+
+Mong đợi Name là mcf-azure-certbot, ARN là arn:aws:iam::925271162060:user/mcf-azure-certbot. Checkpoint này hoàn tất khi apply thành công và danh tính user được đối chiếu. Bước tiếp theo tạo access key cho user chuyên dụng rồi cấu hình credential để Certbot trên Azure gọi Route 53.
+
+### 4.26. Tạo access key cho IAM user Certbot Azure
+
+AWS API đã xác nhận user mcf-azure-certbot cùng inline policy mcf-certbot-route53 tồn tại. Tại checkpoint trước khi tạo key, danh sách access key của user là rỗng.
+
+Tạo key bằng AWS Management Console trong tài khoản 925271162060.
+
+1. Mở IAM và chọn Users.
+2. Chọn user mcf-azure-certbot.
+3. Mở tab Security credentials.
+4. Trong phần Access keys, chọn Create access key.
+5. Ở trang chọn use case, chọn Other rồi Next.
+6. Chọn Create access key ở bước tiếp theo.
+7. Lưu Access key ID và Secret access key vào nơi lưu trữ riêng tư, chẳng hạn trình quản lý mật khẩu.
+
+Access key ID và Secret access key là cặp credential dùng để xác thực các request AWS API. Quyền thực thi request được quyết định bởi policy gắn với IAM user. Secret access key được hiển thị khi tạo key, nên cần lưu lại ở thời điểm này.
+
+Checkpoint này hoàn tất khi người vận hành đã tạo và lưu cặp key cho đúng user mcf-azure-certbot. Bước tiếp theo cấu hình credential trên VM Azure để Certbot sử dụng khi cập nhật TXT challenge.
+
+### 4.27. Lưu credential cho Certbot trên VM Azure
+
+Người vận hành đã xác nhận tạo access key cho user mcf-azure-certbot. Certbot sẽ chạy bằng sudo trên VM Azure và đọc shared credentials file của root tại /root/.aws/credentials.
+
+Trong terminal SSH Ubuntu của VM Azure, chuẩn bị thư mục và file với quyền truy cập cho root.
+
+```bash
+sudo install -d -m 700 -o root -g root /root/.aws
+sudo touch /root/.aws/credentials
+sudo chown root:root /root/.aws/credentials
+sudo chmod 600 /root/.aws/credentials
+```
+
+Mở file bằng trình soạn thảo trên VM.
+
+```bash
+sudo nano /root/.aws/credentials
+```
+
+Thêm cấu hình INI sau, thay hai giá trị mẫu sau dấu bằng bằng access key ID và secret access key đã lưu.
+
+```ini
+[default]
+aws_access_key_id = DIEN_ACCESS_KEY_ID_VAO_DAY
+aws_secret_access_key = DIEN_SECRET_ACCESS_KEY_VAO_DAY
+```
+
+Profile default trong file này thuộc môi trường root của VM Azure. Certbot cùng plugin dns-route53 sẽ đọc profile này khi chạy bằng sudo. Nhập credential trực tiếp trong trình soạn thảo. Lưu bằng Ctrl+O, Enter rồi thoát bằng Ctrl+X.
+
+Kiểm tra quyền và chủ sở hữu bằng lệnh sau.
+
+```bash
+sudo stat -c '%a %U:%G %n' /root/.aws /root/.aws/credentials
+```
+
+Kết quả mong đợi.
+
+```text
+700 root:root /root/.aws
+600 root:root /root/.aws/credentials
+```
+
+Checkpoint này hoàn tất khi credential được lưu vào đúng file và quyền truy cập được đối chiếu. Bước tiếp theo chạy Certbot dry-run cho azure.mcf.todicode.tech và app.mcf.todicode.tech để kiểm tra xác thực AWS cùng DNS challenge.
+
+### 4.28. Chạy thử Certbot DNS-01 trên Azure
+
+Kết quả thực hành đã xác nhận /root/.aws có mode 700, /root/.aws/credentials có mode 600 và cả hai thuộc root:root. Tiếp theo kiểm tra credential cùng quyền Route 53 bằng quá trình xin certificate trong môi trường staging.
+
+Trong terminal SSH Ubuntu của VM Azure, chạy lệnh sau.
+
+```bash
+sudo certbot certonly \
+  --dns-route53 \
+  --dry-run \
+  --cert-name mcf-azure \
+  -d azure.mcf.todicode.tech \
+  -d app.mcf.todicode.tech
+```
+
+cert-name chọn tên quản lý certificate mcf-azure. Hai tham số -d khai báo origin hostname Azure và hostname ứng dụng chung. dry-run sử dụng Let's Encrypt staging để kiểm tra luồng xác minh. Plugin đọc credential của root và gọi Route 53 API để tạo, cập nhật và dọn TXT challenge theo policy của IAM user mcf-azure-certbot.
+
+Ở lần chạy đầu, Certbot có thể hỏi email và điều khoản đăng ký. Nhập email của người vận hành, đọc điều khoản và lựa chọn trong terminal. Thông báo mong đợi khi quá trình hoàn tất.
+
+```text
+The dry run was successful.
+```
+
+Checkpoint này hoàn tất khi dry-run thành công cho cả azure.mcf.todicode.tech và app.mcf.todicode.tech. Kết quả đó xác nhận credential được plugin sử dụng thành công, quyền DNS đáp ứng yêu cầu và cả hai hostname được xác minh. Bước tiếp theo xin certificate production trên VM Azure.
+
+Kết quả thực hành trên VM Azure đã trả Account registered và The dry run was successful cho cả azure.mcf.todicode.tech và app.mcf.todicode.tech. Certbot cùng plugin Route 53 đã sử dụng credential và quyền DNS thành công.
+
+### 4.29. Xin certificate production trên Azure
+
+Trong terminal SSH Ubuntu của VM Azure, chạy yêu cầu certificate production.
+
+```bash
+sudo certbot certonly \
+  --dns-route53 \
+  --cert-name mcf-azure \
+  -d azure.mcf.todicode.tech \
+  -d app.mcf.todicode.tech
+```
+
+Certbot làm việc với Let's Encrypt production và có thể hỏi email cùng điều khoản đăng ký account production ở lần chạy đầu. Sau khi xác minh DNS thành công, kết quả mong đợi có thông báo Successfully received certificate.
+
+Kiểm tra certificate trên VM Azure.
+
+```bash
+sudo certbot certificates
+```
+
+Đối chiếu Certificate Name mcf-azure, Domains gồm azure.mcf.todicode.tech và app.mcf.todicode.tech, Expiry Date còn hiệu lực và các đường dẫn sau.
+
+```text
+Certificate Path: /etc/letsencrypt/live/mcf-azure/fullchain.pem
+Private Key Path: /etc/letsencrypt/live/mcf-azure/privkey.pem
+```
+
+Checkpoint này hoàn tất khi certificate production được cấp và các thông tin được đối chiếu. Bước tiếp theo tạo TLS Secret issues-app-tls trong namespace issues của cluster Azure rồi cấu hình Ingress HTTPS Azure.
+
+Kết quả thực hành đã xác nhận certificate ECDSA cho azure.mcf.todicode.tech và app.mcf.todicode.tech, còn hiệu lực tới 2027-02-11 18:22:33 UTC. Các đường dẫn certificate và private key thuộc /etc/letsencrypt/live/mcf-azure/.
+
+### 4.30. Tạo Kubernetes TLS Secret trên Azure
+
+Trong terminal SSH Ubuntu của VM Azure, tạo hoặc cập nhật Secret issues-app-tls trong namespace issues bằng certificate production mcf-azure.
+
+```bash
+sudo k3s kubectl -n issues create secret tls issues-app-tls \
+  --cert=/etc/letsencrypt/live/mcf-azure/fullchain.pem \
+  --key=/etc/letsencrypt/live/mcf-azure/privkey.pem \
+  --dry-run=client -o yaml | sudo k3s kubectl apply -f -
+```
+
+Lệnh create secret tls đọc certificate cùng private key và tạo cấu trúc Secret với hai trường tls.crt, tls.key. dry-run=client cùng -o yaml xuất cấu trúc resource để pipe sang kubectl apply -f -, tạo hoặc cập nhật Secret trong cluster Azure.
+
+Secret dùng tên issues-app-tls và namespace issues, tương ứng với Ingress ứng dụng sẽ cấu hình trên cluster Azure. Nội dung certificate của Secret bao gồm các hostname azure.mcf.todicode.tech và app.mcf.todicode.tech.
+
+Kiểm tra loại Secret và kích thước dữ liệu.
+
+```bash
+sudo k3s kubectl -n issues describe secret issues-app-tls
+```
+
+Kết quả mong đợi có Name issues-app-tls, Namespace issues, Type kubernetes.io/tls và hai trường tls.crt, tls.key có kích thước lớn hơn 0 byte. Checkpoint này hoàn tất khi Secret được tạo và thông tin được đối chiếu. Bước tiếp theo tạo manifest Ingress HTTPS Azure tham chiếu Secret này.
+
+### 4.31. Chuẩn bị manifest Ingress HTTPS Azure
+
+Trong Git Bash trên laptop tại thư mục gốc repository, tạo bản manifest cho Azure từ cấu hình HTTPS AWS đã triển khai.
+
+```bash
+cp deploy/kubernetes/app/app-ingress-https-aws.yaml \
+  deploy/kubernetes/app/app-ingress-https-azure.yaml
+```
+
+Mở file deploy/kubernetes/app/app-ingress-https-azure.yaml và thay cả hai lần xuất hiện của aws.mcf.todicode.tech bằng azure.mcf.todicode.tech. Hai vị trí tương ứng là hostname origin trong spec.tls và hostname của rule đầu tiên trong spec.rules.
+
+Phần TLS sau khi sửa cần có nội dung sau.
+
+```yaml
+  tls:
+    - hosts:
+        - azure.mcf.todicode.tech
+        - app.mcf.todicode.tech
+      secretName: issues-app-tls
+```
+
+Host của rule đầu tiên cần có giá trị sau.
+
+```yaml
+    - host: azure.mcf.todicode.tech
+```
+
+Rule cho app.mcf.todicode.tech định tuyến hostname chung tới Service issues-app của cluster Azure. Cấu hình sử dụng entrypoint websecure, TLS Secret issues-app-tls và backend issues-app:80. Khi apply trên VM Azure, resource issues-app-https thuộc namespace issues trong cluster Azure và sử dụng certificate mcf-azure được nạp vào Secret ở mục 4.30.
+
+Xem lại nội dung file trên laptop.
+
+```bash
+cat deploy/kubernetes/app/app-ingress-https-azure.yaml
+```
+
+Đối chiếu tls.hosts và hai rule host đều là azure.mcf.todicode.tech, app.mcf.todicode.tech. Checkpoint này chuẩn bị manifest trong repository. Bước tiếp theo chuyển file lên VM Azure, apply và kiểm tra HTTPS qua hostname Azure.
+
+### 4.32. Apply Ingress HTTPS Azure và kiểm tra từ laptop
+
+Manifest app-ingress-https-azure.yaml đã được kiểm tra cú pháp YAML và đối chiếu với bản AWS, với hai hostname của Azure và ứng dụng chung. Trước bước apply, kiểm tra HTTPS Azure gặp lỗi certificate chain chưa được tin cậy. Bước này cấu hình Ingress để sử dụng certificate production mcf-azure qua TLS Secret.
+
+Trong Git Bash trên laptop tại thư mục gốc repository, chuyển manifest lên VM Azure.
+
+```bash
+scp -i ~/.ssh/mcf-lab \
+  deploy/kubernetes/app/app-ingress-https-azure.yaml \
+  azureuser@4.145.30.250:/home/azureuser/app-ingress-https-azure.yaml
+```
+
+Trong terminal SSH Ubuntu của Azure, kiểm tra Secret đã tạo ở mục 4.30. Đối chiếu type kubernetes.io/tls và hai trường tls.crt, tls.key có dữ liệu.
+
+```bash
+sudo k3s kubectl -n issues describe secret issues-app-tls
+```
+
+Áp dụng manifest và kiểm tra Ingress trên cluster Azure.
+
+```bash
+sudo k3s kubectl apply -f /home/azureuser/app-ingress-https-azure.yaml
+sudo k3s kubectl -n issues describe ingress issues-app-https
+```
+
+Mong đợi Ingress được tạo với class traefik, TLS Secret issues-app-tls và các rule host azure.mcf.todicode.tech, app.mcf.todicode.tech dẫn tới backend issues-app:80.
+
+Trong Git Bash trên laptop, dùng Windows curl đã kiểm tra hoạt động để xác minh HTTPS Azure.
+
+```bash
+/c/Windows/System32/curl.exe -fsS --max-time 10 -w '\nHTTP %{http_code}\n' \
+  https://azure.mcf.todicode.tech/version
+
+/c/Windows/System32/curl.exe -sS --max-time 10 -w '\nHTTP %{http_code}\n' \
+  https://azure.mcf.todicode.tech/health/database
+```
+
+Endpoint version cần trả HTTP 200 với environment azure, region southeastasia và commit_sha c56fd3f30baee50fa779607dc0fb1a2133b53a9d. Writer health ở Azure cần trả HTTP 503 với role standby, writable false và replication_connected true. Lệnh writer health dùng -sS để hiển thị response body của HTTP 503. Cả hai lệnh sử dụng xác minh TLS mặc định của client.
+
+Checkpoint hoàn tất khi certificate cùng hostname được client xác minh, version khớp môi trường Azure và database giữ đúng vai trò standby. Bước tiếp theo hoàn thiện hostname chung cùng cơ chế gia hạn certificate và đồng bộ TLS Secret.
+
+Kết quả thực hành đã xác nhận HTTPS Azure với version trả HTTP 200, environment azure, region southeastasia và commit c56fd3f. Writer health trả HTTP 503, role standby, writable false, replication_connected true. receive_lsn và replay_lsn đều là 0/3006A68 tại thời điểm kiểm tra.
+
+### 4.33. Khai báo Route 53 writer health check cho AWS
+
+Chuẩn bị DNS failover cho hostname chung app.mcf.todicode.tech bằng health check theo endpoint /health/database của mỗi origin. Endpoint phản ánh vai trò database và khả năng ghi. AWS hiện là primary và trả HTTP 200, Azure hiện là standby và trả HTTP 503.
+
+Trên laptop, tạo file deploy/terraform/dns/health-check.tf và thêm resource cho AWS.
+
+```hcl
+resource "aws_route53_health_check" "aws_writer" {
+  ip_address        = var.aws_public_ip
+  fqdn              = aws_route53_record.aws_origin.fqdn
+  type              = "HTTPS"
+  port              = 443
+  resource_path     = "/health/database"
+  request_interval  = 30
+  failure_threshold = 3
+  enable_sni        = true
+
+  tags = {
+    Name    = "mcf-aws-writer-health"
+    Project = "multi-cloud-failover"
+  }
+}
+```
+
+ip_address chọn địa chỉ IPv4 origin để health checker kết nối. fqdn cung cấp hostname aws.mcf.todicode.tech cho Host header và TLS SNI. type HTTPS, port 443 và resource_path chỉ định endpoint kiểm tra. enable_sni true gửi hostname khi thực hiện TLS handshake, tương ứng với hostname được cấu hình tại Traefik.
+
+request_interval 30 là khoảng thời gian kiểm tra của từng health checker. failure_threshold 3 yêu cầu ba kết quả liên tiếp để từng checker đổi trạng thái đánh giá endpoint. Route 53 tổng hợp kết quả của các health checker để xác định trạng thái chung của health check.
+
+Trong Git Bash trên laptop tại thư mục gốc repository, chạy các lệnh sau.
+
+```bash
+terraform -chdir=deploy/terraform/dns fmt
+terraform -chdir=deploy/terraform/dns validate
+terraform -chdir=deploy/terraform/dns plan
+```
+
+Plan mong đợi.
+
+```text
+# aws_route53_health_check.aws_writer will be created
+Plan: 1 to add, 0 to change, 0 to destroy.
+```
+
+Đối chiếu IP 175.41.152.242, hostname aws.mcf.todicode.tech và resource_path /health/database. Bước tiếp theo khai báo health check cho Azure rồi apply và đối chiếu trạng thái hai origin.
+
+### 4.34. Khai báo Route 53 writer health check cho Azure
+
+Health check AWS đã validate thành công và plan hiển thị một resource sẽ được tạo. File thực hành hiện tại là deploy/terraform/dns/health-check.tf. Thêm resource sau vào cuối file này.
+
+```hcl
+resource "aws_route53_health_check" "azure_writer" {
+  ip_address        = var.azure_public_ip
+  fqdn              = aws_route53_record.azure_origin.fqdn
+  type              = "HTTPS"
+  port              = 443
+  resource_path     = "/health/database"
+  request_interval  = 30
+  failure_threshold = 3
+  enable_sni        = true
+
+  tags = {
+    Name    = "mcf-azure-writer-health"
+    Project = "multi-cloud-failover"
+  }
+}
+```
+
+Resource chọn IP public của VM Azure, hostname azure.mcf.todicode.tech và endpoint /health/database. Health checker kết nối HTTPS cổng 443, gửi hostname qua Host header và SNI để Traefik định tuyến request.
+
+Azure hiện trả HTTP 503 cho writer health vì database đang là standby. Sau khi apply và các health checker đánh giá endpoint, trạng thái mong đợi của health check AWS là Healthy, của Azure là Unhealthy. Khi Azure được promote và ứng dụng cho phép ghi, endpoint writer health trả HTTP 200 để health check có thể chuyển sang Healthy.
+
+Trong Git Bash trên laptop tại thư mục gốc repository, kiểm tra cấu hình.
+
+```bash
+terraform -chdir=deploy/terraform/dns fmt
+terraform -chdir=deploy/terraform/dns validate
+terraform -chdir=deploy/terraform/dns plan
+```
+
+Plan mong đợi.
+
+```text
+# aws_route53_health_check.aws_writer will be created
+# aws_route53_health_check.azure_writer will be created
+Plan: 2 to add, 0 to change, 0 to destroy.
+```
+
+Đối chiếu health check AWS dùng IP 175.41.152.242, Azure dùng IP 4.145.30.250 và cả hai có resource_path /health/database. Bước tiếp theo apply hai health check và kiểm tra trạng thái trên Route 53.
+
+### 4.35. Apply hai health check và đối chiếu trạng thái Route 53
+
+Đã đối chiếu plan tạo hai health check aws_writer và azure_writer với đúng IP, hostname, HTTPS 443, đường dẫn /health/database, interval 30 và threshold 3.
+
+Trong Git Bash trên laptop tại thư mục gốc repository, chạy lệnh sau.
+
+```bash
+terraform -chdir=deploy/terraform/dns apply
+```
+
+Đối chiếu plan 2 to add, 0 to change, 0 to destroy rồi nhập yes. Kết quả mong đợi.
+
+```text
+Apply complete! Resources: 2 added, 0 changed, 0 destroyed.
+```
+
+Mở AWS Console trong tài khoản 925271162060, vào Route 53 và chọn Health checks. Tìm hai health check theo Name tag mcf-aws-writer-health và mcf-azure-writer-health. Đợi các health checker đánh giá endpoint rồi refresh để đối chiếu trạng thái.
+
+| Health check | Endpoint | Trạng thái mong đợi |
+|---|---|---|
+| mcf-aws-writer-health | aws.mcf.todicode.tech/health/database | Healthy |
+| mcf-azure-writer-health | azure.mcf.todicode.tech/health/database | Unhealthy |
+
+AWS hiện là writable primary và trả HTTP 200. Azure hiện là read-only standby và trả HTTP 503. Health check theo endpoint này phản ánh trạng thái writer của mỗi origin. Route 53 tổng hợp đánh giá từ các health checker tại nhiều vị trí.
+
+Health check HTTPS cho endpoint Azure được tính theo nhóm Non-AWS Endpoints. Giá hiện tại gồm basic health check 0,75 USD/tháng và tính năng HTTPS 2,00 USD/tháng, tổng 2,75 USD/tháng trước thuế và credit, được tính tỷ lệ theo thời gian sử dụng. [Bảng giá Route 53](https://aws.amazon.com/route53/pricing/).
+
+Checkpoint này hoàn tất khi apply thành công và trạng thái AWS Healthy, Azure Unhealthy được đối chiếu. Bước tiếp theo cấu hình DNS failover cho hostname chung app.mcf.todicode.tech.
+
 ## 5. Theo dõi tiến độ
 
 - [x] Nghiệm thu đầu ra giai đoạn 5 và bắt đầu hướng dẫn DNS/HTTPS.
@@ -907,6 +1456,21 @@ Hai lệnh đã được chạy kiểm chứng ngay trong Git Bash và đều tr
 - [x] Tạo TLS Secret issues-app-tls trong namespace issues trên AWS.
 - [x] Khai báo manifest Ingress HTTPS cho hostname aws và app trên AWS.
 - [x] Apply Ingress HTTPS AWS và kiểm tra certificate, version, writer health qua HTTPS.
+- [x] Cập nhật admin_cidr Azure theo IP hiện tại và đăng nhập SSH vào VM.
+- [x] Cài Certbot và kiểm tra plugin dns-route53 trên Azure.
+- [x] Khai báo IAM user mcf-azure-certbot trong root module DNS và đối chiếu plan.
+- [x] Khai báo policy Route 53 giới hạn TXT record cho IAM user Certbot Azure.
+- [x] Apply IAM user cùng policy cho Certbot Azure và đối chiếu danh tính user.
+- [x] Tạo và lưu access key của IAM user mcf-azure-certbot.
+- [x] Lưu credential tại /root/.aws/credentials trên Azure với owner root và mode 600.
+- [x] Chạy thử Certbot DNS-01 thành công cho azure và app hostname trên VM Azure.
+- [x] Xin certificate production mcf-azure và đối chiếu hostname, thời hạn, đường dẫn.
+- [x] Tạo TLS Secret issues-app-tls trong namespace issues trên Azure.
+- [x] Chuẩn bị manifest Ingress HTTPS Azure với hostname azure và app.
+- [x] Apply Ingress HTTPS Azure và kiểm tra certificate, version, writer health qua HTTPS.
+- [x] Khai báo Route 53 writer health check cho AWS và đối chiếu plan.
+- [x] Khai báo Route 53 writer health check cho Azure và đối chiếu plan hai resource.
+- [x] Apply hai writer health check và đối chiếu trạng thái trên Route 53.
 - [ ] Tạo record cho hai origin và đường truy cập ứng dụng chung.
 - [ ] Cấu hình certificate, Ingress HTTPS và kiểm tra hai origin.
 - [ ] Nghiệm thu hostname chung, writer health và cơ chế gia hạn certificate.
@@ -944,3 +1508,9 @@ Hai lệnh đã được chạy kiểm chứng ngay trong Git Bash và đều tr
 - [Kubernetes TLS Secrets](https://kubernetes.io/docs/concepts/configuration/secret/#tls-secrets).
 - [Traefik Kubernetes Ingress annotations](https://doc.traefik.io/traefik/reference/routing-configuration/kubernetes/ingress/).
 - [K3s Traefik networking](https://docs.k3s.io/networking/networking-services#traefik-ingress-controller).
+- [Terraform aws_iam_user](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/iam_user).
+- [Terraform aws_iam_user_policy](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/iam_user_policy).
+- [Manage IAM user access keys](https://docs.aws.amazon.com/IAM/latest/UserGuide/access-keys-admin-managed.html).
+- [Terraform aws_route53_health_check](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/route53_health_check).
+- [Route 53 health check types](https://docs.aws.amazon.com/Route53/latest/DeveloperGuide/health-checks-types.html).
+- [Route 53 health check evaluation](https://docs.aws.amazon.com/Route53/latest/DeveloperGuide/dns-failover-determining-health-of-endpoints.html).
