@@ -324,6 +324,504 @@ Nameserver trong hai lệnh trên thuộc hosted zone hiện tại. Khi tạo l�
 
 Kết quả thực hành ngày 2026-11-14 đã xác nhận public resolver 1.1.1.1 trả aws.mcf.todicode.tech về 175.41.152.242 và azure.mcf.todicode.tech về 4.145.30.250.
 
+### 4.9. Kiểm tra HTTP qua hostname của hai origin
+
+Trong Git Bash trên laptop, kiểm tra ứng dụng của từng cloud thông qua hostname.
+
+```bash
+curl -fsS --max-time 10 -w '\nHTTP %{http_code}\n' \
+  http://aws.mcf.todicode.tech/version
+
+curl -fsS --max-time 10 -w '\nHTTP %{http_code}\n' \
+  http://azure.mcf.todicode.tech/version
+```
+
+Cả hai request cần trả HTTP 200, version v0.1.0 và commit_sha c56fd3f30baee50fa779607dc0fb1a2133b53a9d. environment lần lượt là aws và azure, region lần lượt là ap-southeast-1 và southeastasia.
+
+Tiếp theo kiểm tra writer health của database phía sau từng ứng dụng.
+
+```bash
+curl -sS --max-time 10 -w '\nHTTP %{http_code}\n' \
+  http://aws.mcf.todicode.tech/health/database
+
+curl -sS --max-time 10 -w '\nHTTP %{http_code}\n' \
+  http://azure.mcf.todicode.tech/health/database
+```
+
+Lệnh writer health dùng -sS để in được response body cùng mã HTTP 503 của standby. Đầu ra mong đợi tại checkpoint này.
+
+| Origin | /version | /health/database | Vai trò database |
+|---|---|---|---|
+| AWS | 200 | 200 | primary, writable true |
+| Azure | 200 | 503 | standby, writable false, replication_connected true |
+
+Ingress issues-app hiện dùng ingressClassName traefik và rule đường dẫn / cho mọi hostname. Request HTTP qua hai hostname mới đã được kiểm tra thành công ngày 2026-11-14, với đúng environment, image commit và vai trò database trong bảng trên.
+
+Checkpoint này xác nhận kết nối từ laptop qua hostname, Traefik, Service ứng dụng và database của từng cloud. Bước tiếp theo cấu hình certificate và Ingress HTTPS cho các hostname.
+
+### 4.10. Cài Certbot và plugin Route 53 trên AWS
+
+HTTPS sử dụng certificate do Let's Encrypt cấp. Certbot chạy trên host để xin và gia hạn certificate, với plugin dns-route53 thực hiện xác minh DNS-01. Khi xin certificate cho một hostname, plugin tạo TXT record dưới _acme-challenge của hostname đó, chờ xác minh từ Let's Encrypt rồi dọn record challenge.
+
+Certificate và private key được đưa vào Kubernetes TLS Secret ở bước cấu hình Ingress. Traefik sử dụng Secret này để phục vụ HTTPS cho các hostname được khai báo. Quyền gọi Route 53 API và cấu hình tự động gia hạn sẽ được bổ sung theo từng checkpoint tiếp theo.
+
+Trong Git Bash trên laptop, SSH vào máy AWS.
+
+```bash
+ssh -i ~/.ssh/mcf-lab ubuntu@175.41.152.242
+```
+
+Tại terminal Ubuntu trên EC2, cài Certbot và plugin từ Ubuntu package repository.
+
+```bash
+sudo apt-get update
+sudo apt-get install -y certbot python3-certbot-dns-route53
+```
+
+certbot cung cấp ACME client để làm việc với Let's Encrypt. python3-certbot-dns-route53 bổ sung authenticator cập nhật record DNS qua Route 53 API. Hai package có sẵn cho Ubuntu 24.04 đang dùng trên EC2.
+
+Kiểm tra công cụ sau khi cài.
+
+```bash
+certbot --version
+sudo certbot plugins
+```
+
+Kết quả mong đợi là thông tin phiên bản Certbot và plugin dns-route53 trong danh sách, với chức năng Authenticator. Checkpoint này hoàn tất khi plugin được nhận diện. Bước tiếp theo cấu hình quyền Route 53 cho Certbot trên AWS.
+
+#### 4.10.1. Xử lý SSH timeout khi IP của người vận hành thay đổi
+
+Rule SSH trên AWS dùng var.admin_cidr để cho phép địa chỉ IPv4 public của người vận hành truy cập TCP 22. Khi mạng đang dùng được cấp IP public mới, cần cập nhật giá trị này trong deploy/terraform/aws/terraform.tfvars.
+
+Nếu SSH đang chờ kết nối, nhấn Ctrl+C. Trong Git Bash trên laptop, xem IP public hiện tại.
+
+```bash
+curl -fsS https://checkip.amazonaws.com
+```
+
+Mở deploy/terraform/aws/terraform.tfvars và cập nhật dòng admin_cidr thành IP vừa lấy kèm /32. Ví dụ tại lần chẩn đoán ngày 2026-11-14, IP hiện tại là 171.251.235.11 trong khi rule SSH đang cho phép 171.251.233.105/32.
+
+```hcl
+admin_cidr = "171.251.235.11/32"
+```
+
+Chạy plan trong root module AWS để xem thay đổi.
+
+```bash
+terraform -chdir=deploy/terraform/aws plan
+```
+
+Plan đã đối chiếu tại lần chẩn đoán này là update in-place của aws_vpc_security_group_ingress_rule.ssh, chỉ thay cidr_ipv4, với 0 to add, 1 to change, 0 to destroy. Sau khi đối chiếu plan, apply và nhập yes để cập nhật rule.
+
+```bash
+terraform -chdir=deploy/terraform/aws apply
+```
+
+Kết nối lại EC2.
+
+```bash
+ssh -o ConnectTimeout=10 -i ~/.ssh/mcf-lab ubuntu@175.41.152.242
+```
+
+Tại lần chẩn đoán này, EC2 vẫn running, cả hai status check ok và HTTP /health/live trả 200. Checkpoint khôi phục SSH hoàn tất khi người vận hành đăng nhập được vào Ubuntu và tiếp tục bước cài Certbot.
+
+Đã cập nhật admin_cidr trong terraform.tfvars và apply thành công ngày 2026-11-14, với 0 added, 1 changed, 0 destroyed. AWS API xác nhận rule TCP 22 cho phép 171.251.235.11/32. Kiểm tra kết nối từ laptop đã nhận banner OpenSSH của Ubuntu trên cổng 22. Người vận hành tiếp tục đăng nhập bằng key mcf-lab để thực hiện bước cài Certbot.
+
+### 4.11. Khai báo IAM role cho Certbot trên EC2
+
+Certbot trên AWS sẽ sử dụng temporary credentials của IAM role gắn với EC2. Triển khai theo thứ tự role và trust policy, permissions policy cho DNS challenge, instance profile rồi gắn profile với EC2.
+
+Trong checkpoint này, tạo file deploy/terraform/aws/iam.tf trên laptop và thêm resource sau.
+
+```hcl
+resource "aws_iam_role" "certbot" {
+  name = "mcf-aws-certbot"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Action = "sts:AssumeRole"
+        Principal = {
+          Service = "ec2.amazonaws.com"
+        }
+      }
+    ]
+  })
+
+  tags = {
+    Name    = "mcf-aws-certbot"
+    Project = "multi-cloud-failover"
+  }
+}
+```
+
+assume_role_policy là trust policy của role. Principal Service ec2.amazonaws.com chỉ định EC2 là service được tin cậy để assume role. sts:AssumeRole là hành động được cho phép trong trust policy. jsonencode chuyển cấu trúc HCL thành chuỗi JSON mà IAM API sử dụng. Version 2012-10-17 là phiên bản ngôn ngữ policy của IAM.
+
+Role sẽ nhận permissions policy cho Route 53 ở checkpoint tiếp theo, sau đó được đặt trong instance profile gắn với EC2. Khi hoàn thiện chuỗi cấu hình, Certbot chạy trên host sẽ dùng temporary credentials do EC2 cung cấp để thực hiện DNS challenge.
+
+Chạy trong Git Bash trên laptop tại thư mục gốc repository.
+
+```bash
+terraform -chdir=deploy/terraform/aws fmt
+terraform -chdir=deploy/terraform/aws validate
+terraform -chdir=deploy/terraform/aws plan
+```
+
+Plan mong đợi tại checkpoint này.
+
+```text
+# aws_iam_role.certbot will be created
+Plan: 1 to add, 0 to change, 0 to destroy.
+```
+
+Đối chiếu tên role mcf-aws-certbot và Principal Service ec2.amazonaws.com. Checkpoint này dừng ở việc xem plan của role. Permissions policy và instance profile sẽ được bổ sung theo các bước thực hành tiếp theo.
+
+### 4.12. Truyền hosted zone ID vào root module AWS
+
+Policy cho Certbot cần ARN của hosted zone mcf.todicode.tech để giới hạn phạm vi cập nhật DNS. Root module DNS quản lý zone, còn root module AWS quản lý IAM role và EC2. Truyền ID của zone vào root module AWS qua input variable.
+
+Thêm block sau vào cuối file deploy/terraform/aws/variables.tf.
+
+```hcl
+variable "dns_zone_id" {
+  description = "Route 53 hosted zone ID used for certificate DNS validation"
+  type        = string
+}
+```
+
+Lệnh Terraform với -chdir=deploy/terraform/aws đọc khai báo trong root module AWS. Nếu gặp cảnh báo Value for undeclared variable cho dns_zone_id, kiểm tra đường dẫn file vừa sửa. Trường hợp block dns_zone_id được thêm vào deploy/terraform/dns/variables.tf, chuyển toàn bộ block đó sang deploy/terraform/aws/variables.tf. Hai biến aws_public_ip và azure_public_ip tiếp tục phục vụ các record ở root module DNS.
+
+Xem ID hiện tại bằng lệnh sau trong Git Bash trên laptop.
+
+```bash
+terraform -chdir=deploy/terraform/dns output -raw dns_zone_id
+```
+
+Giá trị đã đối chiếu tại checkpoint này là Z043946815CRXHICLXRTS. Thêm dòng sau vào deploy/terraform/aws/terraform.tfvars.
+
+```hcl
+dns_zone_id = "Z043946815CRXHICLXRTS"
+```
+
+Biến này dùng trong policy dưới dạng var.dns_zone_id. ARN của hosted zone sẽ có dạng arn:aws:route53:::hostedzone/${var.dns_zone_id}. Khi zone được tạo lại, cập nhật input từ output mới của root module DNS.
+
+Kiểm tra cấu hình root module AWS.
+
+```bash
+terraform -chdir=deploy/terraform/aws fmt
+terraform -chdir=deploy/terraform/aws validate
+terraform -chdir=deploy/terraform/aws plan
+```
+
+Tại checkpoint này, plan tiếp tục hiển thị 1 to add, 0 to change, 0 to destroy cho IAM role đã khai báo ở mục 4.11. Input variable chuẩn bị phạm vi hosted zone cho policy ở bước thực hành kế tiếp.
+
+### 4.13. Khai báo policy Route 53 cho role Certbot
+
+Biến dns_zone_id đã được chuyển đúng sang root module AWS và validate thành công. Thêm resource sau vào cuối deploy/terraform/aws/iam.tf, sau block aws_iam_role.certbot.
+
+```hcl
+resource "aws_iam_role_policy" "certbot_route53" {
+  name = "mcf-certbot-route53"
+  role = aws_iam_role.certbot.name
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect   = "Allow"
+        Action   = "route53:ListHostedZones"
+        Resource = "*"
+      },
+      {
+        Effect   = "Allow"
+        Action   = "route53:GetChange"
+        Resource = "arn:aws:route53:::change/*"
+      },
+      {
+        Effect   = "Allow"
+        Action   = "route53:ChangeResourceRecordSets"
+        Resource = "arn:aws:route53:::hostedzone/${var.dns_zone_id}"
+        Condition = {
+          "ForAllValues:StringEquals" = {
+            "route53:ChangeResourceRecordSetsRecordTypes" = ["TXT"]
+          }
+          Null = {
+            "route53:ChangeResourceRecordSetsRecordTypes" = "false"
+          }
+        }
+      }
+    ]
+  })
+}
+```
+
+aws_iam_role_policy quản lý inline policy gắn trực tiếp vào role được chọn qua thuộc tính role. Policy này có ba statement theo các API mà Certbot Route 53 plugin sử dụng.
+
+- ListHostedZones cho phép plugin tìm hosted zone phụ trách hostname. API này dùng Resource * vì thao tác liệt kê thực hiện ở cấp tài khoản.
+- GetChange cho phép đọc trạng thái thay đổi DNS để đợi đồng bộ. ARN change/* bao phủ các change ID được Route 53 sinh trong quá trình chạy.
+- ChangeResourceRecordSets cho phép cập nhật record trong hosted zone được chỉ định bởi var.dns_zone_id. Điều kiện ForAllValues:StringEquals yêu cầu tất cả record trong request có type TXT. Null false yêu cầu context key loại record phải tồn tại.
+
+Phạm vi ghi của policy là các record TXT trong hosted zone của project. Plugin dùng quyền này để đặt và dọn TXT challenge khi xin hoặc gia hạn certificate. Quyền của policy sẽ có hiệu lực cho ứng dụng trên EC2 sau bước gắn instance profile.
+
+Trong Git Bash trên laptop tại thư mục gốc repository, chạy các lệnh sau.
+
+```bash
+terraform -chdir=deploy/terraform/aws fmt
+terraform -chdir=deploy/terraform/aws validate
+terraform -chdir=deploy/terraform/aws plan
+```
+
+Plan mong đợi tại checkpoint này.
+
+```text
+# aws_iam_role.certbot will be created
+# aws_iam_role_policy.certbot_route53 will be created
+Plan: 2 to add, 0 to change, 0 to destroy.
+```
+
+Đối chiếu ARN hosted zone kết thúc bằng Z043946815CRXHICLXRTS và điều kiện record type TXT trong policy. Bước tiếp theo tạo instance profile và gắn role vào EC2 trước khi apply toàn bộ phần quyền Certbot.
+
+### 4.14. Khai báo instance profile và gắn vào EC2
+
+Instance profile chứa IAM role để EC2 cung cấp temporary credentials cho ứng dụng chạy trên host. Role Certbot được đặt vào profile này, sau đó aws_instance.primary tham chiếu tới profile qua iam_instance_profile.
+
+Thêm resource sau vào cuối deploy/terraform/aws/iam.tf.
+
+```hcl
+resource "aws_iam_instance_profile" "certbot" {
+  name = "mcf-aws-certbot"
+  role = aws_iam_role.certbot.name
+
+  tags = {
+    Name    = "mcf-aws-certbot"
+    Project = "multi-cloud-failover"
+  }
+}
+```
+
+Trong deploy/terraform/aws/compute.tf, tìm block resource aws_instance primary. Thêm thuộc tính sau vào trong block này, cùng cấp với ami, instance_type và key_name.
+
+```hcl
+iam_instance_profile = aws_iam_instance_profile.certbot.name
+```
+
+role trong instance profile chọn role mcf-aws-certbot. iam_instance_profile trong EC2 chọn tên profile vừa khai báo. Các tham chiếu này thiết lập quan hệ phụ thuộc để Terraform tạo role, tạo profile rồi gắn profile vào EC2.
+
+Luồng cấp quyền khi cấu hình được áp dụng.
+
+```text
+EC2 → instance profile → IAM role → policy Route 53
+Certbot trên host → temporary credentials của role → Route 53 API
+```
+
+Trong Git Bash trên laptop tại thư mục gốc repository, chạy các lệnh kiểm tra.
+
+```bash
+terraform -chdir=deploy/terraform/aws fmt
+terraform -chdir=deploy/terraform/aws validate
+terraform -chdir=deploy/terraform/aws plan
+```
+
+Plan mong đợi tại checkpoint này.
+
+```text
+# aws_iam_role.certbot will be created
+# aws_iam_role_policy.certbot_route53 will be created
+# aws_iam_instance_profile.certbot will be created
+# aws_instance.primary will be updated in-place
+Plan: 3 to add, 1 to change, 0 to destroy.
+```
+
+Đối chiếu thay đổi trên EC2 là thuộc tính iam_instance_profile và hành động update in-place. Checkpoint này hoàn tất khi đối chiếu được plan. Bước tiếp theo apply phần quyền và kiểm tra role từ EC2.
+
+### 4.15. Apply phần quyền và xác nhận role từ EC2
+
+Plan đã được đối chiếu ở checkpoint 4.14, với ba resource IAM sẽ được tạo và EC2 được update in-place để gắn profile. Trong Git Bash trên laptop tại thư mục gốc repository, chạy lệnh sau.
+
+```bash
+terraform -chdir=deploy/terraform/aws apply
+```
+
+Đối chiếu plan 3 to add, 1 to change, 0 to destroy, sau đó nhập yes. Kết quả mong đợi.
+
+```text
+Apply complete! Resources: 3 added, 1 changed, 0 destroyed.
+```
+
+Sau khi apply hoàn tất, SSH vào EC2 từ Git Bash trên laptop.
+
+```bash
+ssh -o ConnectTimeout=10 -i ~/.ssh/mcf-lab ubuntu@175.41.152.242
+```
+
+Trong terminal Ubuntu trên EC2, lấy token IMDSv2 rồi truy vấn tên role được cung cấp qua instance metadata.
+
+```bash
+MCF_IMDS_TOKEN=$(curl -fsS --max-time 5 -X PUT \
+  -H 'X-aws-ec2-metadata-token-ttl-seconds: 300' \
+  http://169.254.169.254/latest/api/token)
+
+curl -fsS --max-time 5 -w '\n' \
+  -H "X-aws-ec2-metadata-token: $MCF_IMDS_TOKEN" \
+  http://169.254.169.254/latest/meta-data/iam/security-credentials/
+```
+
+169.254.169.254 là endpoint instance metadata mà EC2 cung cấp bên trong máy. Request PUT tạo session token có hiệu lực 300 giây. Request GET sử dụng token để đọc tên IAM role. EC2 hiện yêu cầu IMDSv2 qua cấu hình http_tokens required trong Terraform.
+
+Kết quả mong đợi.
+
+```text
+mcf-aws-certbot
+```
+
+Nếu metadata chưa hiển thị role ngay sau khi attach, đợi đồng bộ IAM rồi chạy lại hai lệnh. Checkpoint này hoàn tất khi apply thành công và metadata trả đúng tên role. Bước tiếp theo kiểm tra Certbot cùng quyền DNS challenge trước khi xin certificate.
+
+### 4.16. Chạy thử DNS challenge trên AWS bằng Certbot
+
+EC2 đã trả tên role mcf-aws-certbot qua IMDSv2. AWS API cũng xác nhận instance profile ở trạng thái associated và policy đã giới hạn quyền ghi vào TXT record trong hosted zone của project.
+
+Certificate trên AWS dự kiến bao gồm hai hostname aws.mcf.todicode.tech và app.mcf.todicode.tech. Origin hostname phục vụ kiểm tra trực tiếp AWS, còn app hostname phục vụ địa chỉ chung sau khi cấu hình DNS failover. DNS-01 xác minh quyền quản lý hostname qua TXT record, nên có thể xác minh app hostname trong bước chuẩn bị certificate này.
+
+Trong terminal Ubuntu trên EC2, kiểm tra Certbot và plugin.
+
+```bash
+certbot --version
+sudo certbot plugins
+```
+
+Khi plugin dns-route53 đã được nhận diện với chức năng Authenticator, chạy thử quá trình xin certificate với Let's Encrypt staging.
+
+```bash
+sudo certbot certonly \
+  --dns-route53 \
+  --dry-run \
+  --cert-name mcf-aws \
+  -d aws.mcf.todicode.tech \
+  -d app.mcf.todicode.tech
+```
+
+certonly thực hiện xin certificate. dns-route53 chọn plugin DNS-01 cập nhật Route 53. dry-run kiểm tra luồng xác minh với môi trường staging của Let's Encrypt. cert-name đặt tên quản lý certificate là mcf-aws. Mỗi tham số -d thêm một hostname vào yêu cầu certificate.
+
+Certbot có thể hỏi email và điều khoản đăng ký ở lần chạy đầu. Người vận hành nhập email của mình và thực hiện các lựa chọn trong terminal. Plugin sử dụng temporary credentials của IAM role trên EC2 để tạo TXT challenge, đợi Route 53 đồng bộ, thực hiện xác minh và dọn TXT challenge.
+
+Thông báo mong đợi khi hoàn tất.
+
+```text
+The dry run was successful.
+```
+
+Checkpoint này xác nhận Certbot cùng plugin hoạt động, quyền Route 53 đáp ứng DNS challenge và cả hai hostname được xác minh thành công trong staging. Bước tiếp theo xin certificate production rồi đưa certificate vào Kubernetes TLS Secret.
+
+Kết quả thực hành đã trả Account registered và The dry run was successful cho cả aws.mcf.todicode.tech và app.mcf.todicode.tech. Checkpoint kiểm tra Certbot và DNS challenge đã hoàn tất.
+
+### 4.17. Xin certificate production trên AWS
+
+Trong terminal Ubuntu trên EC2, chạy yêu cầu certificate production với tên mcf-aws và hai hostname đã kiểm tra.
+
+```bash
+sudo certbot certonly \
+  --dns-route53 \
+  --cert-name mcf-aws \
+  -d aws.mcf.todicode.tech \
+  -d app.mcf.todicode.tech
+```
+
+Lệnh này sử dụng Let's Encrypt production. Certbot có thể yêu cầu đăng ký account production, email và xác nhận điều khoản trong terminal. Sau khi xác minh DNS thành công, kết quả mong đợi có thông báo Successfully received certificate.
+
+Certbot lưu certificate cùng certificate chain tại /etc/letsencrypt/live/mcf-aws/fullchain.pem và private key tại /etc/letsencrypt/live/mcf-aws/privkey.pem. Hai file sẽ được dùng ở bước tạo Kubernetes TLS Secret.
+
+Kiểm tra certificate đã cấp bằng lệnh sau trên EC2.
+
+```bash
+sudo certbot certificates
+```
+
+Đối chiếu Certificate Name là mcf-aws, Domains bao gồm aws.mcf.todicode.tech và app.mcf.todicode.tech, Expiry Date còn hiệu lực và các đường dẫn Certificate Path, Private Key Path thuộc /etc/letsencrypt/live/mcf-aws/. Checkpoint này hoàn tất khi certificate production được cấp và các thông tin được đối chiếu. Bước tiếp theo tạo TLS Secret trong namespace issues rồi cấu hình Ingress HTTPS.
+
+Kết quả thực hành đã xác nhận certificate ECDSA cho hai hostname, còn hiệu lực tới 2027-02-11 17:22:35 UTC. Certificate Path và Private Key Path khớp các đường dẫn mcf-aws ở trên.
+
+### 4.18. Tạo Kubernetes TLS Secret trên AWS
+
+Trong terminal Ubuntu trên EC2, tạo hoặc cập nhật Secret issues-app-tls trong namespace issues từ certificate production vừa cấp.
+
+```bash
+sudo k3s kubectl -n issues create secret tls issues-app-tls \
+  --cert=/etc/letsencrypt/live/mcf-aws/fullchain.pem \
+  --key=/etc/letsencrypt/live/mcf-aws/privkey.pem \
+  --dry-run=client -o yaml | sudo k3s kubectl apply -f -
+```
+
+create secret tls đọc certificate và private key để tạo cấu trúc Secret type kubernetes.io/tls. Tham số dry-run=client yêu cầu tạo cấu trúc resource ở phía client, còn -o yaml chuyển cấu trúc đó thành YAML. Dấu pipe truyền YAML sang kubectl apply -f - để áp dụng vào cluster. Có thể chạy lại cùng lệnh để cập nhật Secret từ certificate hiện tại.
+
+Secret chứa hai trường tls.crt và tls.key, tương ứng với fullchain.pem và privkey.pem. Namespace issues khớp namespace của Ingress ứng dụng. Bước cấu hình HTTPS sẽ tham chiếu Secret bằng tên issues-app-tls.
+
+Kiểm tra loại Secret và kích thước dữ liệu bằng lệnh sau.
+
+```bash
+sudo k3s kubectl -n issues describe secret issues-app-tls
+```
+
+Kết quả mong đợi có Name issues-app-tls, Namespace issues, Type kubernetes.io/tls và hai trường dữ liệu tls.crt, tls.key có kích thước lớn hơn 0 byte. Checkpoint này hoàn tất khi Secret được tạo và các thông tin trên được đối chiếu. Bước tiếp theo khai báo Ingress HTTPS cho AWS.
+
+### 4.19. Khai báo Ingress HTTPS cho AWS
+
+Tạo file deploy/kubernetes/app/app-ingress-https-aws.yaml trên laptop. Ingress HTTPS dùng entrypoint websecure của Traefik và TLS Secret issues-app-tls trong namespace issues.
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: issues-app-https
+  namespace: issues
+  annotations:
+    traefik.ingress.kubernetes.io/router.entrypoints: websecure
+    traefik.ingress.kubernetes.io/router.tls: "true"
+spec:
+  ingressClassName: traefik
+  tls:
+    - hosts:
+        - aws.mcf.todicode.tech
+        - app.mcf.todicode.tech
+      secretName: issues-app-tls
+  rules:
+    - host: aws.mcf.todicode.tech
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: issues-app
+                port:
+                  number: 80
+    - host: app.mcf.todicode.tech
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: issues-app
+                port:
+                  number: 80
+```
+
+metadata.name đặt tên resource issues-app-https. ingressClassName chọn Traefik xử lý Ingress. Annotation router.entrypoints chọn listener websecure, sử dụng cổng HTTPS 443 trong cấu hình K3s mặc định. router.tls true bật TLS cho router của Ingress.
+
+tls.hosts khai báo hai hostname khớp certificate mcf-aws. secretName chọn Secret issues-app-tls đã được hướng dẫn tạo ở mục 4.18. Các rule host định tuyến request theo hostname, đường dẫn / kiểu Prefix chuyển các đường dẫn ứng dụng tới Service issues-app cổng 80. Traefik thực hiện TLS termination và gửi HTTP tới backend Service.
+
+Luồng truy cập khi manifest được áp dụng.
+
+```text
+Browser → HTTPS 443 → Traefik → HTTP Service issues-app:80 → App Pod:8080
+                         ↑
+                TLS Secret issues-app-tls
+```
+
+Checkpoint này chuẩn bị manifest trong repository. Bước tiếp theo chuyển file lên EC2, apply và kiểm tra HTTPS bằng hostname AWS cùng certificate đã cấp.
+
 ## 5. Theo dõi tiến độ
 
 - [x] Nghiệm thu đầu ra giai đoạn 5 và bắt đầu hướng dẫn DNS/HTTPS.
@@ -339,6 +837,17 @@ Kết quả thực hành ngày 2026-11-14 đã xác nhận public resolver 1.1.1
 - [x] Chuẩn bị biến và terraform.tfvars chứa IP của hai origin.
 - [x] Khai báo hai record A cho origin và đối chiếu plan tạo hai resource.
 - [x] Apply hai record A origin và kiểm tra phân giải về đúng IP.
+- [x] Kiểm tra HTTP qua hostname origin, đúng environment và writer health của mỗi cloud.
+- [x] Cài Certbot và kiểm tra plugin dns-route53 trên AWS.
+- [x] Khai báo IAM role Certbot với EC2 trust policy và đối chiếu plan.
+- [x] Truyền dns_zone_id từ root module DNS vào root module AWS.
+- [x] Khai báo policy Certbot giới hạn cập nhật TXT trong hosted zone của project.
+- [x] Khai báo instance profile và đối chiếu plan gắn profile vào EC2.
+- [x] Cấp quyền DNS challenge, gắn instance profile và kiểm tra role trên EC2.
+- [x] Chạy thử Certbot DNS-01 thành công cho aws và app hostname trên AWS.
+- [x] Xin certificate production mcf-aws và đối chiếu hostname, thời hạn, đường dẫn.
+- [ ] Tạo TLS Secret issues-app-tls trong namespace issues trên AWS.
+- [ ] Khai báo manifest Ingress HTTPS cho hostname aws và app trên AWS.
 - [ ] Tạo record cho hai origin và đường truy cập ứng dụng chung.
 - [ ] Cấu hình certificate, Ingress HTTPS và kiểm tra hai origin.
 - [ ] Nghiệm thu hostname chung, writer health và cơ chế gia hạn certificate.
@@ -358,3 +867,21 @@ Kết quả thực hành ngày 2026-11-14 đã xác nhận public resolver 1.1.1
 - [Route 53 pricing](https://aws.amazon.com/route53/pricing/).
 - [Terraform input variables](https://developer.hashicorp.com/terraform/language/values/variables).
 - [Terraform aws_route53_record](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/route53_record).
+- [Certbot DNS Route 53 plugin](https://certbot-dns-route53.readthedocs.io/en/stable/).
+- [Let's Encrypt DNS-01](https://letsencrypt.org/docs/challenge-types/#dns-01-challenge).
+- [Ubuntu 24.04 Route 53 plugin package](https://packages.ubuntu.com/noble/python3-certbot-dns-route53).
+- [Kubernetes Ingress TLS](https://kubernetes.io/docs/concepts/services-networking/ingress/#tls).
+- [EC2 SSH connection troubleshooting](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/TroubleshootingInstancesConnecting.html).
+- [IAM roles for applications on EC2](https://docs.aws.amazon.com/IAM/latest/UserGuide/id_roles_use_switch-role-ec2.html).
+- [Terraform aws_iam_role](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/iam_role).
+- [Terraform aws_iam_role_policy](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/iam_role_policy).
+- [Route 53 policy conditions](https://docs.aws.amazon.com/Route53/latest/DeveloperGuide/specifying-conditions-route53.html).
+- [Terraform aws_iam_instance_profile](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/iam_instance_profile).
+- [Attach an IAM role to EC2](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/attach-iam-role.html).
+- [EC2 IMDSv2](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/configuring-instance-metadata-service.html).
+- [Certbot user guide](https://eff-certbot.readthedocs.io/en/stable/using.html).
+- [Let's Encrypt staging](https://letsencrypt.org/docs/staging-environment/).
+- [kubectl create secret tls](https://kubernetes.io/docs/reference/kubectl/generated/kubectl_create/kubectl_create_secret_tls/).
+- [Kubernetes TLS Secrets](https://kubernetes.io/docs/concepts/configuration/secret/#tls-secrets).
+- [Traefik Kubernetes Ingress annotations](https://doc.traefik.io/traefik/reference/routing-configuration/kubernetes/ingress/).
+- [K3s Traefik networking](https://docs.k3s.io/networking/networking-services#traefik-ingress-controller).
