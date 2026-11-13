@@ -1,0 +1,36 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: issues-app-https
+  namespace: issues
+  annotations:
+    traefik.ingress.kubernetes.io/router.entrypoints: websecure
+    traefik.ingress.kubernetes.io/router.tls: "true"
+spec:
+  ingressClassName: traefik
+  tls:
+    - hosts:
+        - aws.mcf.todicode.tech
+        - app.mcf.todicode.tech
+      secretName: issues-app-tls
+  rules:
+    - host: aws.mcf.todicode.tech
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: issues-app
+                port:
+                  number: 80
+    - host: app.mcf.todicode.tech
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: issues-app
+                port:
+                  number: 80

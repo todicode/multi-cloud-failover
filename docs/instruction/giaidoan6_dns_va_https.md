@@ -822,6 +822,64 @@ Browser → HTTPS 443 → Traefik → HTTP Service issues-app:80 → App Pod:808
 
 Checkpoint này chuẩn bị manifest trong repository. Bước tiếp theo chuyển file lên EC2, apply và kiểm tra HTTPS bằng hostname AWS cùng certificate đã cấp.
 
+### 4.20. Apply Ingress HTTPS AWS và kiểm tra từ laptop
+
+Manifest app-ingress-https-aws.yaml đã được kiểm tra cú pháp YAML, tên resource, namespace, TLS Secret và hai hostname. Trước bước apply, endpoint HTTPS AWS đang trả certificate mặc định có subject và issuer CN=TRAEFIK DEFAULT CERT. Bước này cấu hình Traefik sử dụng certificate mcf-aws thông qua TLS Secret.
+
+Trong Git Bash trên laptop, chuyển manifest lên EC2.
+
+```bash
+cd /d/multi-cloud-failover
+scp -i ~/.ssh/mcf-lab \
+  deploy/kubernetes/app/app-ingress-https-aws.yaml \
+  ubuntu@175.41.152.242:/home/ubuntu/app-ingress-https-aws.yaml
+```
+
+Trong terminal Ubuntu trên EC2, kiểm tra TLS Secret đã tạo ở mục 4.18. Đối chiếu Type kubernetes.io/tls và hai trường tls.crt, tls.key có dữ liệu.
+
+```bash
+sudo k3s kubectl -n issues describe secret issues-app-tls
+```
+
+Áp dụng manifest và kiểm tra Ingress.
+
+```bash
+sudo k3s kubectl apply -f /home/ubuntu/app-ingress-https-aws.yaml
+sudo k3s kubectl -n issues describe ingress issues-app-https
+```
+
+Kết quả apply mong đợi là ingress.networking.k8s.io/issues-app-https created. Kết quả describe cần có Ingress Class traefik, TLS Secret issues-app-tls, hai rule host aws.mcf.todicode.tech và app.mcf.todicode.tech với backend issues-app:80.
+
+Trong Git Bash trên laptop, kiểm tra HTTPS theo hostname AWS.
+
+```bash
+curl -fsS --max-time 10 -w '\nHTTP %{http_code}\n' \
+  https://aws.mcf.todicode.tech/version
+
+curl -fsS --max-time 10 -w '\nHTTP %{http_code}\n' \
+  https://aws.mcf.todicode.tech/health/database
+```
+
+Cả hai endpoint cần trả HTTP 200. version cần có environment aws, region ap-southeast-1 và commit_sha c56fd3f30baee50fa779607dc0fb1a2133b53a9d. Writer health cần trả role primary và writable true. curl kiểm tra certificate chain và hostname theo cơ chế xác minh TLS mặc định của client.
+
+Checkpoint này hoàn tất khi HTTPS qua hostname AWS được xác minh và ứng dụng trả đúng các thông tin trên. Bước tiếp theo triển khai certificate và HTTPS cho Azure, rồi hoàn thiện hostname chung cùng cơ chế gia hạn.
+
+#### 4.20.1. Xử lý curl lỗi 43 trong Git Bash trên Windows
+
+Ở lần kiểm tra ngày 2026-11-14, Git Bash chọn /mingw64/bin/curl, phiên bản 8.8.0. Đã tái hiện lỗi curl (43) A libcurl function was given a bad argument với endpoint HTTPS AWS trên executable này. Windows curl tại C:/Windows/System32/curl.exe, phiên bản 8.22.0, đã kiểm tra thành công cùng endpoint với xác minh TLS mặc định.
+
+Trong Git Bash trên laptop, chỉ định executable Windows curl bằng đường dẫn đầy đủ.
+
+```bash
+/c/Windows/System32/curl.exe -fsS --max-time 10 -w '\nHTTP %{http_code}\n' \
+  https://aws.mcf.todicode.tech/version
+
+/c/Windows/System32/curl.exe -fsS --max-time 10 -w '\nHTTP %{http_code}\n' \
+  https://aws.mcf.todicode.tech/health/database
+```
+
+Hai lệnh đã được chạy kiểm chứng ngay trong Git Bash và đều trả HTTP 200. version hiển thị environment aws, region ap-southeast-1, commit c56fd3f. Writer health hiển thị connected true, role primary và writable true. Kết quả này hoàn tất checkpoint HTTPS AWS và xác nhận TLS Secret đang phục vụ qua Ingress đã cấu hình.
+
 ## 5. Theo dõi tiến độ
 
 - [x] Nghiệm thu đầu ra giai đoạn 5 và bắt đầu hướng dẫn DNS/HTTPS.
@@ -846,8 +904,9 @@ Checkpoint này chuẩn bị manifest trong repository. Bước tiếp theo chuy
 - [x] Cấp quyền DNS challenge, gắn instance profile và kiểm tra role trên EC2.
 - [x] Chạy thử Certbot DNS-01 thành công cho aws và app hostname trên AWS.
 - [x] Xin certificate production mcf-aws và đối chiếu hostname, thời hạn, đường dẫn.
-- [ ] Tạo TLS Secret issues-app-tls trong namespace issues trên AWS.
-- [ ] Khai báo manifest Ingress HTTPS cho hostname aws và app trên AWS.
+- [x] Tạo TLS Secret issues-app-tls trong namespace issues trên AWS.
+- [x] Khai báo manifest Ingress HTTPS cho hostname aws và app trên AWS.
+- [x] Apply Ingress HTTPS AWS và kiểm tra certificate, version, writer health qua HTTPS.
 - [ ] Tạo record cho hai origin và đường truy cập ứng dụng chung.
 - [ ] Cấu hình certificate, Ingress HTTPS và kiểm tra hai origin.
 - [ ] Nghiệm thu hostname chung, writer health và cơ chế gia hạn certificate.
