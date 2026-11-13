@@ -1429,6 +1429,140 @@ Health check HTTPS cho endpoint Azure được tính theo nhóm Non-AWS Endpoint
 
 Checkpoint này hoàn tất khi apply thành công và trạng thái AWS Healthy, Azure Unhealthy được đối chiếu. Bước tiếp theo cấu hình DNS failover cho hostname chung app.mcf.todicode.tech.
 
+### 4.36. Khai báo DNS failover PRIMARY cho hostname chung
+
+Hai health check đã được tạo. Đối chiếu qua API Route 53 cho thấy các health checker của AWS nhận HTTP 200, các health checker của Azure nhận HTTP 503. Kết quả phù hợp với AWS writable primary và Azure read-only standby.
+
+Hostname chung của ứng dụng là app.mcf.todicode.tech. Cặp record failover sẽ dùng AWS làm PRIMARY và Azure làm SECONDARY. Bắt đầu bằng record PRIMARY.
+
+Tạo file deploy/terraform/dns/failover.tf và nhập đoạn sau.
+
+```hcl
+resource "aws_route53_record" "app_primary" {
+  zone_id = aws_route53_zone.project.zone_id
+  name    = "app.${aws_route53_zone.project.name}"
+  type    = "CNAME"
+  ttl     = 30
+  records = [aws_route53_record.aws_origin.fqdn]
+
+  set_identifier  = "aws-primary"
+  health_check_id = aws_route53_health_check.aws_writer.id
+
+  failover_routing_policy {
+    type = "PRIMARY"
+  }
+}
+```
+
+- name tạo hostname app.mcf.todicode.tech trong hosted zone của project.
+- CNAME trỏ hostname chung tới aws.mcf.todicode.tech. Record A của origin cung cấp IP EC2.
+- ttl đặt thời gian cache của câu trả lời CNAME là 30 giây. Resolver có thể đang giữ cache từ lần truy vấn trước. Record A của origin có TTL riêng là 60 giây.
+- set_identifier phân biệt từng record trong nhóm cùng tên và cùng loại.
+- health_check_id gắn record với writer health check AWS đã tạo.
+- PRIMARY đặt ưu tiên trả lời DNS khi health check AWS healthy.
+
+Trong Git Bash trên laptop tại thư mục gốc repository, kiểm tra cấu hình.
+
+```bash
+terraform -chdir=deploy/terraform/dns fmt
+terraform -chdir=deploy/terraform/dns validate
+terraform -chdir=deploy/terraform/dns plan
+```
+
+Plan mong đợi tại bước này.
+
+```text
+# aws_route53_record.app_primary will be created
+Plan: 1 to add, 0 to change, 0 to destroy.
+```
+
+Checkpoint hiện tại là validate thành công và plan tạo một record PRIMARY. Bước tiếp theo thêm record SECONDARY, sau đó apply cả cặp record.
+
+Với cặp failover có health check ở cả hai record, Route 53 trả PRIMARY khi PRIMARY healthy. Khi PRIMARY unhealthy và SECONDARY healthy, Route 53 trả SECONDARY. Khi cả hai unhealthy, Route 53 trả PRIMARY. Fencing và promote database được thực hiện trong luồng failover ở giai đoạn 7. [Cách Route 53 chọn record](https://docs.aws.amazon.com/Route53/latest/DeveloperGuide/health-checks-how-route-53-chooses-records.html).
+
+### 4.37. Khai báo DNS failover SECONDARY cho Azure
+
+File deploy/terraform/dns/failover.tf đã có resource app_primary cho AWS. Thêm resource sau vào cuối file để hoàn thành cặp record cho hostname chung.
+
+```hcl
+resource "aws_route53_record" "app_secondary" {
+  zone_id = aws_route53_zone.project.zone_id
+  name    = "app.${aws_route53_zone.project.name}"
+  type    = "CNAME"
+  ttl     = 30
+  records = [aws_route53_record.azure_origin.fqdn]
+
+  set_identifier  = "azure-secondary"
+  health_check_id = aws_route53_health_check.azure_writer.id
+
+  failover_routing_policy {
+    type = "SECONDARY"
+  }
+}
+```
+
+Hai resource có cùng name app.mcf.todicode.tech và cùng type CNAME. set_identifier phân biệt aws-primary với azure-secondary. records của SECONDARY trỏ tới azure.mcf.todicode.tech, còn health_check_id liên kết với writer health check Azure.
+
+Khi AWS healthy, Route 53 trả CNAME trỏ AWS. Khi AWS unhealthy và Azure healthy, Route 53 trả CNAME trỏ Azure. Khi cả hai unhealthy, Route 53 trả record PRIMARY theo cơ chế failover. Azure hiện đang là standby và writer health trả HTTP 503. Giai đoạn 7 sẽ thực hành fencing AWS, promote Azure và xác minh writer trước khi nghiệm thu chuyển hướng DNS. [Cách Route 53 chọn record](https://docs.aws.amazon.com/Route53/latest/DeveloperGuide/health-checks-how-route-53-chooses-records.html).
+
+Trong Git Bash trên laptop tại thư mục gốc repository, kiểm tra cấu hình.
+
+```bash
+terraform -chdir=deploy/terraform/dns fmt
+terraform -chdir=deploy/terraform/dns validate
+terraform -chdir=deploy/terraform/dns plan
+```
+
+Plan mong đợi khi cả hai record đang chờ tạo.
+
+```text
+# aws_route53_record.app_primary will be created
+# aws_route53_record.app_secondary will be created
+Plan: 2 to add, 0 to change, 0 to destroy.
+```
+
+Đối chiếu cả hai record dùng cùng hostname app.mcf.todicode.tech, TTL 30 và mỗi record gắn đúng origin cùng health check của cloud tương ứng. Checkpoint hiện tại là validate thành công và đối chiếu plan. Bước tiếp theo apply cả cặp record rồi kiểm tra phân giải DNS và HTTPS qua hostname chung.
+
+### 4.38. Apply cặp DNS failover và kiểm tra hostname chung
+
+Đã kiểm tra file failover.tf có đủ app_primary và app_secondary. Terraform validate thành công và plan hiển thị đúng hai record CNAME app.mcf.todicode.tech sẽ được tạo, với TTL 30, origin và health check tương ứng cho từng cloud.
+
+Trong Git Bash trên laptop tại thư mục gốc repository, chạy lệnh sau.
+
+```bash
+terraform -chdir=deploy/terraform/dns apply
+```
+
+Đối chiếu plan 2 to add, 0 to change, 0 to destroy, record PRIMARY trỏ aws.mcf.todicode.tech và SECONDARY trỏ azure.mcf.todicode.tech. Nhập yes để tạo cặp record. Kết quả mong đợi.
+
+```text
+Apply complete! Resources: 2 added, 0 changed, 0 destroyed.
+```
+
+Kiểm tra DNS qua resolver công cộng.
+
+```bash
+nslookup -type=CNAME app.mcf.todicode.tech 1.1.1.1
+```
+
+Trong trạng thái hiện tại AWS writer healthy và Azure standby unhealthy, câu trả lời mong đợi chứa canonical name aws.mcf.todicode.tech. Nếu resolver còn lưu cache câu trả lời âm từ trước khi tạo record, cần chờ cache hết hạn rồi kiểm tra lại.
+
+Kiểm tra HTTPS qua hostname chung bằng Windows curl trong Git Bash.
+
+```bash
+/c/Windows/System32/curl.exe -fsS --max-time 10 -w '\nHTTP %{http_code}\n' \
+  https://app.mcf.todicode.tech/version
+
+/c/Windows/System32/curl.exe -fsS --max-time 10 -w '\nHTTP %{http_code}\n' \
+  https://app.mcf.todicode.tech/health/database
+```
+
+version cần trả HTTP 200 với environment aws, region ap-southeast-1 và commit_sha c56fd3f30baee50fa779607dc0fb1a2133b53a9d. Writer health cần trả HTTP 200 với connected true, role primary và writable true. Luồng request là laptop phân giải app hostname thành AWS origin, sau đó kết nối HTTPS tới EC2, qua Traefik và Service issues-app tới ứng dụng.
+
+Checkpoint này hoàn tất khi apply thành công, DNS chọn AWS origin và hai request HTTPS qua hostname chung đạt kết quả mong đợi. Phần tiếp theo hoàn thiện cơ chế gia hạn certificate và đồng bộ TLS Secret trên hai cluster.
+
+Kết quả thực hành đã xác nhận resolver 1.1.1.1 trả CNAME app.mcf.todicode.tech tới aws.mcf.todicode.tech. HTTPS qua hostname chung trả HTTP 200 ở cả /version và /health/database. Ứng dụng phục vụ từ AWS, region ap-southeast-1, commit c56fd3f. Database báo connected true, role primary, writable true và writes_paused false.
+
 ## 5. Theo dõi tiến độ
 
 - [x] Nghiệm thu đầu ra giai đoạn 5 và bắt đầu hướng dẫn DNS/HTTPS.
@@ -1471,8 +1605,11 @@ Checkpoint này hoàn tất khi apply thành công và trạng thái AWS Healthy
 - [x] Khai báo Route 53 writer health check cho AWS và đối chiếu plan.
 - [x] Khai báo Route 53 writer health check cho Azure và đối chiếu plan hai resource.
 - [x] Apply hai writer health check và đối chiếu trạng thái trên Route 53.
-- [ ] Tạo record cho hai origin và đường truy cập ứng dụng chung.
-- [ ] Cấu hình certificate, Ingress HTTPS và kiểm tra hai origin.
+- [x] Khai báo record failover PRIMARY và đối chiếu plan.
+- [x] Khai báo record failover SECONDARY và đối chiếu plan cả cặp record.
+- [x] Apply cặp record failover và kiểm tra DNS, HTTPS qua hostname chung.
+- [x] Tạo record cho hai origin và đường truy cập ứng dụng chung.
+- [x] Cấu hình certificate, Ingress HTTPS và kiểm tra hai origin.
 - [ ] Nghiệm thu hostname chung, writer health và cơ chế gia hạn certificate.
 
 ## 6. Tài liệu kỹ thuật
@@ -1514,3 +1651,4 @@ Checkpoint này hoàn tất khi apply thành công và trạng thái AWS Healthy
 - [Terraform aws_route53_health_check](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/route53_health_check).
 - [Route 53 health check types](https://docs.aws.amazon.com/Route53/latest/DeveloperGuide/health-checks-types.html).
 - [Route 53 health check evaluation](https://docs.aws.amazon.com/Route53/latest/DeveloperGuide/dns-failover-determining-health-of-endpoints.html).
+- [Route 53 failover record selection](https://docs.aws.amazon.com/Route53/latest/DeveloperGuide/health-checks-how-route-53-chooses-records.html).
