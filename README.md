@@ -27,9 +27,11 @@ The current implementation runs a complete local environment: two FastAPI instan
 | Azure single-node K3s cluster | Node Ready, system Pods and StorageClass verified |
 | WireGuard tunnel between AWS and Azure | Peer handshakes, tunnel routes, and bidirectional ping verified |
 | Cloud application deployment | Same image digest on both K3s clusters; HTTP, database roles, issue/comment/history replication, and standby write rejection verified |
+| Cloud DNS and HTTPS | Route 53 delegation, origin/shared hostname TLS, writer health checks, and failover records validated |
+| Certificate renewal integration | Certbot timers and renewal dry-runs with Kubernetes TLS Secret deploy hooks validated on both clouds |
 | Cloud traffic failover and recovery | Planned |
 
-The AWS Terraform root module provisions networking, host access rules, EC2, SSH Key Pair, and Elastic IP in Singapore. The subnet AZ and Ubuntu AMI are pinned. Deployment, post-apply consistency checks, and SSH access were validated. A separate Azure root module provisions the Resource Group, VNet, subnet, NSG and access rules, Static Public IP, NIC, and Ubuntu VM. Its image version and VM zone are pinned, and deployment and SSH access were validated. Both environments were recreated for Stage 5. Each cloud runs an independent single-node K3s v1.35.1+k3s1 cluster. PostgreSQL 17 uses retained local storage and asynchronous WAL streaming over a peer-restricted WireGuard tunnel. A new probe record written on AWS was read on Azure. Both clusters run the same application image digest. HTTP checks confirmed version, environment, database roles, and writer health. Issue details, comments, and create/close/reopen history matched between AWS and Azure, and the operator confirmed standby write rejection. Stage 5 acceptance is complete. DNS/HTTPS preparation is in progress. Cloud traffic failover and recovery remain planned. The [roadmap](docs/ROADMAP.md) tracks progress.
+The AWS Terraform root module provisions networking, host access rules, EC2, SSH Key Pair, and Elastic IP in Singapore. The subnet AZ and Ubuntu AMI are pinned. Deployment, post-apply consistency checks, and SSH access were validated. A separate Azure root module provisions the Resource Group, VNet, subnet, NSG and access rules, Static Public IP, NIC, and Ubuntu VM. Its image version and VM zone are pinned, and deployment and SSH access were validated. Both environments were recreated for Stage 5. Each cloud runs an independent single-node K3s v1.35.1+k3s1 cluster. PostgreSQL 17 uses retained local storage and asynchronous WAL streaming over a peer-restricted WireGuard tunnel. A new probe record written on AWS was read on Azure. Both clusters run the same application image digest. HTTP checks confirmed version, environment, database roles, and writer health. Issue details, comments, and create/close/reopen history matched between AWS and Azure, and the operator confirmed standby write rejection. Stages 5 and 6 acceptance is complete. Route 53 serves origin records and the shared application hostname with writer-aware failover records. HTTPS and the shared-hostname certificate were verified on both clouds. Certbot renewal dry-runs with deploy hooks passed on both VMs. Cloud writer transitions and recovery exercises are the next milestone. The [roadmap](docs/ROADMAP.md) tracks progress.
 
 ## Features
 
@@ -110,7 +112,7 @@ The [accepted CI run](https://github.com/todicode/multi-cloud-failover/actions/r
 - [Stage 3: CI and container registry instructions](docs/instruction/giaidoan3_ci_va_container_registry.md)
 - [Stage 4: AWS/Azure infrastructure with Terraform](docs/instruction/giaidoan4_ha_tang_aws_azure_terraform.md)
 - [Stage 5: K3s and cloud workloads](docs/instruction/giaidoan5_k3s_va_trien_khai_workload.md)
-- [Stage 6: DNS and HTTPS (in progress)](docs/instruction/giaidoan6_dns_va_https.md)
+- [Stage 6: DNS and HTTPS](docs/instruction/giaidoan6_dns_va_https.md)
 - [Kubernetes manifests grouped by component](deploy/kubernetes/)
 - [Architecture and consistency model](docs/ARCHITECTURE.md)
 - [Local setup and operations](docs/LOCAL_DEVELOPMENT.md)

@@ -1563,6 +1563,211 @@ Checkpoint này hoàn tất khi apply thành công, DNS chọn AWS origin và ha
 
 Kết quả thực hành đã xác nhận resolver 1.1.1.1 trả CNAME app.mcf.todicode.tech tới aws.mcf.todicode.tech. HTTPS qua hostname chung trả HTTP 200 ở cả /version và /health/database. Ứng dụng phục vụ từ AWS, region ap-southeast-1, commit c56fd3f. Database báo connected true, role primary, writable true và writes_paused false.
 
+### 4.39. Kiểm tra lịch gia hạn certificate trên hai VM
+
+Certbot lưu certificate đã cấp trong /etc/letsencrypt/live/. TLS Secret issues-app-tls chứa bản certificate và private key đã nạp vào Kubernetes. Luồng gia hạn cần hai phần là Certbot gia hạn file trên VM và deploy hook cập nhật TLS Secret để Traefik sử dụng certificate mới.
+
+Bắt đầu kiểm tra systemd timer của gói Certbot đã cài bằng apt. Chạy các lệnh sau trong terminal SSH Ubuntu trên AWS, sau đó chạy lại trong terminal SSH Ubuntu trên Azure.
+
+```bash
+sudo systemctl is-enabled certbot.timer
+sudo systemctl is-active certbot.timer
+sudo systemctl list-timers --all certbot.timer --no-pager
+```
+
+Mong đợi hai dòng đầu là enabled và active. Bảng list-timers cần có certbot.timer, cột NEXT cho biết lần kích hoạt dự kiến và cột ACTIVATES là certbot.service. Certbot kiểm tra certificate theo lịch, rồi thực hiện gia hạn khi đủ điều kiện. [Hướng dẫn gia hạn Certbot](https://eff-certbot.readthedocs.io/en/stable/using.html#automated-renewals).
+
+Checkpoint này là đối chiếu timer trên cả hai VM. Bước tiếp theo cấu hình deploy hook để đồng bộ certificate đã gia hạn vào TLS Secret của cluster tương ứng.
+
+### 4.40. Viết deploy hook đồng bộ certificate vào Kubernetes
+
+Đã xác nhận certbot.timer hoạt động trên cả hai VM. Chuẩn bị một script dùng trên mỗi VM để Certbot cập nhật TLS Secret issues-app-tls sau khi gia hạn certificate thành công.
+
+Trong Git Bash trên laptop tại thư mục gốc repository, tạo thư mục và file script.
+
+```bash
+mkdir -p deploy/certbot
+touch deploy/certbot/deploy-tls.sh
+```
+
+Mở deploy/certbot/deploy-tls.sh trong trình soạn thảo, chọn line ending LF và nhập nội dung sau.
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+case "${RENEWED_LINEAGE:-}" in
+  /etc/letsencrypt/live/mcf-aws|/etc/letsencrypt/live/mcf-azure) ;;
+  *) exit 0 ;;
+esac
+
+/usr/local/bin/k3s kubectl -n issues create secret tls issues-app-tls \
+  --cert="${RENEWED_LINEAGE}/fullchain.pem" \
+  --key="${RENEWED_LINEAGE}/privkey.pem" \
+  --dry-run=client -o yaml \
+  | /usr/local/bin/k3s kubectl -n issues apply -f -
+```
+
+Certbot truyền biến RENEWED_LINEAGE chứa thư mục certificate vừa gia hạn vào deploy hook. Script nhận hai đường dẫn certificate của project, cho phép dùng cùng nội dung trên cả AWS và Azure. Mỗi lần chạy sử dụng certificate ở VM hiện tại và cập nhật Secret trong cluster K3s của VM đó.
+
+set -euo pipefail làm script báo lỗi khi dùng biến chưa khai báo hoặc một lệnh trong pipeline thất bại. case chọn certificate của project để đồng bộ. create secret tls cùng dry-run=client tạo manifest từ certificate và private key, rồi pipe trực tiếp vào kubectl apply để cập nhật Secret. Tham số -n issues chọn namespace của ứng dụng. Đường dẫn k3s tuyệt đối giúp hook tìm đúng executable trong môi trường chạy theo lịch.
+
+Script được thiết kế chạy bằng root qua Certbot trên VM. Certificate và private key được đọc từ thư mục Certbot để cập nhật Kubernetes API. File script trong repository chứa các lệnh và đường dẫn cấu hình.
+
+Trong Git Bash trên laptop, kiểm tra cú pháp.
+
+```bash
+bash -n deploy/certbot/deploy-tls.sh
+```
+
+Lệnh kiểm tra trả exit code 0 khi cú pháp hợp lệ. Checkpoint hiện tại là viết và kiểm tra cú pháp script. Bước tiếp theo chuyển script lên AWS, cài vào /etc/letsencrypt/renewal-hooks/deploy/ với quyền thực thi, rồi kiểm tra cập nhật Secret bằng certificate hiện tại. [Certbot deploy hooks](https://eff-certbot.readthedocs.io/en/stable/using.html#renewing-certificates).
+
+### 4.41. Cài deploy hook và chạy thử trên AWS
+
+Đã kiểm tra deploy/certbot/deploy-tls.sh dùng line ending LF và vượt qua kiểm tra cú pháp Bash. Chuyển script lên EC2 từ Git Bash trên laptop tại thư mục gốc repository.
+
+```bash
+scp -i ~/.ssh/mcf-lab \
+  deploy/certbot/deploy-tls.sh \
+  ubuntu@175.41.152.242:/home/ubuntu/deploy-tls.sh
+```
+
+Trong terminal SSH Ubuntu của AWS, cài script vào thư mục deploy hook của Certbot.
+
+```bash
+sudo install -d -m 755 -o root -g root /etc/letsencrypt/renewal-hooks/deploy
+sudo install -m 750 -o root -g root \
+  /home/ubuntu/deploy-tls.sh \
+  /etc/letsencrypt/renewal-hooks/deploy/deploy-tls.sh
+```
+
+install sao chép script và đặt owner root cùng mode 750. Root có quyền đọc, ghi, thực thi. Group root có quyền đọc và thực thi. Certbot tự chạy các executable trong thư mục renewal-hooks/deploy sau khi gia hạn thành công. [Certbot deploy hooks](https://eff-certbot.readthedocs.io/en/stable/using.html#renewing-certificates).
+
+Chạy thử hook với certificate production hiện tại của AWS, vẫn trong terminal SSH Ubuntu của AWS.
+
+```bash
+sudo env RENEWED_LINEAGE=/etc/letsencrypt/live/mcf-aws \
+  /etc/letsencrypt/renewal-hooks/deploy/deploy-tls.sh
+```
+
+sudo env truyền RENEWED_LINEAGE vào process hook chạy bằng root. Certbot sẽ cung cấp biến này trong lần chạy theo lịch. Lệnh thử cập nhật TLS Secret từ certificate đang có trên EC2. Output mong đợi là secret/issues-app-tls configured hoặc secret/issues-app-tls unchanged, tùy dữ liệu và metadata hiện tại của Secret.
+
+Kiểm tra metadata và kích thước dữ liệu của Secret.
+
+```bash
+sudo k3s kubectl -n issues describe secret issues-app-tls
+```
+
+Đối chiếu Type kubernetes.io/tls, cùng hai trường tls.crt và tls.key có dữ liệu. Checkpoint này xác nhận hook đã được cài trên AWS và chạy thử thành công với certificate hiện tại. Bước tiếp theo kiểm tra luồng Certbot renewal dry-run kèm deploy hook.
+
+Kết quả thực hành trên AWS đã trả secret/issues-app-tls unchanged khi chạy hook với RENEWED_LINEAGE=/etc/letsencrypt/live/mcf-aws. Secret có type kubernetes.io/tls, tls.crt 4861 bytes và tls.key 241 bytes. Dữ liệu Secret đã khớp certificate hiện tại tại thời điểm chạy thử.
+
+### 4.42. Kiểm tra Certbot renewal kèm deploy hook trên AWS
+
+Trong terminal SSH Ubuntu của AWS, chạy mô phỏng gia hạn cho certificate mcf-aws và yêu cầu thực thi deploy hook sau khi mô phỏng thành công.
+
+```bash
+sudo certbot renew \
+  --cert-name mcf-aws \
+  --dry-run \
+  --run-deploy-hooks \
+  --verbose
+```
+
+renew sử dụng cấu hình certificate đã lưu, bao gồm plugin dns-route53. dry-run thực hiện xác minh và cấp thử qua Let's Encrypt staging. run-deploy-hooks bật việc chạy deploy hook sau khi mô phỏng thành công. Trong phép thử này, hook nhận đường dẫn certificate production đang hoạt động để đồng bộ TLS Secret. verbose hiển thị chi tiết quá trình kiểm tra và hook. [Certbot renewal và deploy hooks](https://eff-certbot.readthedocs.io/en/stable/using.html#renewing-certificates).
+
+Đối chiếu output có mô phỏng gia hạn mcf-aws thành công, hook /etc/letsencrypt/renewal-hooks/deploy/deploy-tls.sh được gọi và kết quả cập nhật secret/issues-app-tls. Thông báo tổng kết thường có nội dung sau.
+
+```text
+Congratulations, all simulated renewals succeeded:
+```
+
+Đối chiếu cả phần output của hook để xác nhận cập nhật Secret thành công. Checkpoint này hoàn tất khi mô phỏng renewal và hook đều đạt. Bước tiếp theo cài và kiểm tra cùng hook trên Azure.
+
+Đã xác nhận mô phỏng gia hạn certificate mcf-aws thành công và deploy hook cập nhật TLS Secret thành công trên AWS.
+
+### 4.43. Cài và kiểm tra deploy hook trên Azure
+
+Sử dụng script deploy/certbot/deploy-tls.sh đã kiểm tra trên AWS. Trong Git Bash trên laptop tại thư mục gốc repository, chuyển file lên VM Azure.
+
+```bash
+scp -i ~/.ssh/mcf-lab \
+  deploy/certbot/deploy-tls.sh \
+  azureuser@4.145.30.250:/home/azureuser/deploy-tls.sh
+```
+
+Trong terminal SSH Ubuntu của Azure, cài script vào thư mục deploy hook của Certbot và chạy thử bằng certificate Azure hiện tại.
+
+```bash
+sudo install -d -m 755 -o root -g root /etc/letsencrypt/renewal-hooks/deploy
+
+sudo install -m 750 -o root -g root \
+  /home/azureuser/deploy-tls.sh \
+  /etc/letsencrypt/renewal-hooks/deploy/deploy-tls.sh
+
+sudo env RENEWED_LINEAGE=/etc/letsencrypt/live/mcf-azure \
+  /etc/letsencrypt/renewal-hooks/deploy/deploy-tls.sh
+```
+
+Output mong đợi là secret/issues-app-tls configured hoặc secret/issues-app-tls unchanged. RENEWED_LINEAGE chọn certificate mcf-azure trên VM Azure. Script gọi Kubernetes API của cluster Azure để đồng bộ Secret issues-app-tls trong namespace issues.
+
+Vẫn trong terminal SSH Ubuntu của Azure, kiểm tra mô phỏng gia hạn cùng deploy hook.
+
+```bash
+sudo certbot renew \
+  --cert-name mcf-azure \
+  --dry-run \
+  --run-deploy-hooks \
+  --verbose
+```
+
+Certbot sử dụng cấu hình dns-route53 và AWS credential đã lưu cho root trên VM Azure để thực hiện DNS challenge. Sau khi mô phỏng thành công, hook dùng certificate production hiện tại của Azure để cập nhật Secret. Đối chiếu output của hook cùng thông báo Congratulations, all simulated renewals succeeded. Checkpoint này hoàn tất khi hook chạy thủ công và luồng renewal dry-run kèm hook đều thành công trên Azure.
+
+Đã xác nhận hook và mô phỏng gia hạn certificate mcf-azure thành công trên Azure.
+
+### 4.44. Nghiệm thu HTTPS của hostname chung trên cả hai cloud
+
+DNS công cộng của app.mcf.todicode.tech hiện chọn AWS theo failover policy. Dùng curl --resolve để kiểm tra cùng hostname ứng dụng qua từng IP origin. Tham số này chọn IP kết nối cho request, đồng thời curl sử dụng hostname trong URL để gửi SNI, Host header và xác minh certificate. [curl resolve](https://curl.se/docs/manpage.html#--resolve).
+
+Trong Git Bash trên laptop, kiểm tra hostname app qua AWS.
+
+```bash
+/c/Windows/System32/curl.exe -fsS --max-time 10 \
+  --resolve app.mcf.todicode.tech:443:175.41.152.242 \
+  -w '\nHTTP %{http_code}\n' \
+  https://app.mcf.todicode.tech/version
+```
+
+Mong đợi HTTP 200, environment aws và commit_sha c56fd3f30baee50fa779607dc0fb1a2133b53a9d.
+
+Kiểm tra cùng hostname qua Azure.
+
+```bash
+/c/Windows/System32/curl.exe -fsS --max-time 10 \
+  --resolve app.mcf.todicode.tech:443:4.145.30.250 \
+  -w '\nHTTP %{http_code}\n' \
+  https://app.mcf.todicode.tech/version
+```
+
+Mong đợi HTTP 200, environment azure và cùng commit_sha. Kết quả xác nhận certificate và Ingress trên cả hai cluster phục vụ được hostname chung.
+
+Đối chiếu writer health Azure qua hostname chung.
+
+```bash
+/c/Windows/System32/curl.exe -sS --max-time 10 \
+  --resolve app.mcf.todicode.tech:443:4.145.30.250 \
+  -w '\nHTTP %{http_code}\n' \
+  https://app.mcf.todicode.tech/health/database
+```
+
+Mong đợi HTTP 503 với connected true, role standby, writable false và replication_connected true. Writer health này phản ánh vai trò standby đang hoạt động. Cấu hình DNS failover, endpoint origin, certificate của hostname chung và mô phỏng gia hạn kèm hook trên cả hai cloud tạo thành đầu ra giai đoạn 6. Phép thử chuyển writer, fencing, failover và failback thuộc giai đoạn 7.
+
+Checkpoint nghiệm thu giai đoạn 6 hoàn tất sau khi đối chiếu ba kết quả trên với các checkpoint DNS và renewal đã đạt.
+
+Kết quả nghiệm thu ngày 2026-11-13 UTC đã xác nhận hostname app.mcf.todicode.tech qua IP AWS trả HTTP 200 với environment aws, qua IP Azure trả HTTP 200 với environment azure. Cả hai trả commit_sha c56fd3f30baee50fa779607dc0fb1a2133b53a9d. Writer health qua IP Azure trả HTTP 503, connected true, role standby, writable false, replication_connected true và receive_lsn bằng replay_lsn tại 0/3006A68. Các phép thử dùng xác minh TLS mặc định của client.
+
+Giai đoạn 6 đã hoàn tất. DNS delegation, origin records, cặp record failover, HTTPS của hai origin và hostname chung, writer health checks, timer Certbot và renewal dry-run kèm deploy hook trên cả hai VM đã được nghiệm thu. Bước tiếp theo là giai đoạn 7 với luồng fencing, promote, kiểm tra writer, failover và phục hồi có kiểm soát.
+
 ## 5. Theo dõi tiến độ
 
 - [x] Nghiệm thu đầu ra giai đoạn 5 và bắt đầu hướng dẫn DNS/HTTPS.
@@ -1610,7 +1815,13 @@ Kết quả thực hành đã xác nhận resolver 1.1.1.1 trả CNAME app.mcf.t
 - [x] Apply cặp record failover và kiểm tra DNS, HTTPS qua hostname chung.
 - [x] Tạo record cho hai origin và đường truy cập ứng dụng chung.
 - [x] Cấu hình certificate, Ingress HTTPS và kiểm tra hai origin.
-- [ ] Nghiệm thu hostname chung, writer health và cơ chế gia hạn certificate.
+- [x] Kiểm tra certbot.timer trên cả hai VM.
+- [x] Viết deploy hook cập nhật TLS Secret và kiểm tra cú pháp.
+- [x] Cài deploy hook và chạy thử cập nhật TLS Secret trên AWS.
+- [x] Kiểm tra Certbot renewal dry-run kèm deploy hook trên AWS.
+- [x] Cài và kiểm tra deploy hook cùng renewal dry-run trên Azure.
+- [x] Kiểm tra certificate và Ingress của hostname chung qua cả hai IP origin.
+- [x] Nghiệm thu hostname chung, writer health và cơ chế gia hạn certificate.
 
 ## 6. Tài liệu kỹ thuật
 

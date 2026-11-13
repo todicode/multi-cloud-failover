@@ -48,9 +48,9 @@ The [Stage 5 guide](instruction/giaidoan5_k3s_va_trien_khai_workload.md) records
 
 Public HTTP GET checks through Traefik passed for the UI, version, and database status on both clouds. API comparisons confirmed matching issue details, comments, and create/close/reopen history between AWS and Azure. The operator confirmed HTTP 409 for a write probe against the Azure standby. Browser form checks use SSH forwarding to loopback origins to satisfy the current UI's crypto.randomUUID secure-context requirement. Stage 5 acceptance is complete.
 
-## In progress: DNS and HTTPS
+## Completed: DNS and HTTPS
 
-The [Stage 6 guide](instruction/giaidoan6_dns_va_https.md) prepares a dedicated mcf.todicode.tech DNS branch for this project, with app, aws, and azure hostnames. The parent domain currently uses Orderbox nameservers. The plan delegates the project branch to a Route 53 public hosted zone, then configures origin records, the shared hostname, certificates, and HTTPS Ingress. The DNS Terraform root module is introduced incrementally alongside the existing AWS and Azure modules. Commands and acceptance evidence are added as each step begins.
+The [Stage 6 guide](instruction/giaidoan6_dns_va_https.md) records delegation of mcf.todicode.tech to a Route 53 public hosted zone, origin A records, HTTPS writer health checks, and PRIMARY/SECONDARY CNAME records for app.mcf.todicode.tech. Public DNS selected AWS during acceptance. Both origins served HTTPS successfully, and requests for the shared hostname directed to each origin IP verified its certificate, Ingress routing, environment, and matching application commit. AWS writer health returned HTTP 200 and Azure standby writer health returned HTTP 503. Certbot timers were active on both VMs, and renewal dry-runs with deploy hooks successfully synchronized the Kubernetes TLS Secrets. Cloud writer transitions and recovery exercises are the next milestone.
 
 ## Milestones
 
