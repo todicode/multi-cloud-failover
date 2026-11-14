@@ -1048,6 +1048,828 @@ sudo k3s kubectl -n issues get configmap postgres-clone-script
 
 Mong đợi ConfigMap postgres-clone-script tồn tại với DATA 1, tương ứng key clone.sh. Job clone sẽ mount key này làm file /bootstrap/clone.sh để thực thi. Checkpoint này là script có thể chọn tên kết nối theo cloud và ConfigMap sẵn sàng trên AWS. Bước tiếp theo viết manifest Job clone dùng Azure source, PVC mới và PGAPPNAME của AWS standby.
 
+Kết quả AWS đã xác nhận ConfigMap postgres-clone-script được tạo và có DATA 1, tương ứng key clone.sh.
+
+### 4.31. Chuẩn bị Job clone AWS rejoin từ Azure
+
+Job là workload chạy tác vụ clone tới khi hoàn tất. Sau khi Job thành công, StatefulSet PostgreSQL sẽ sử dụng dữ liệu trên PVC mới để chạy standby. Tái sử dụng manifest Job clone đã thực hành trên Azure, rồi chọn source, storage và định danh phù hợp cho AWS rejoin.
+
+Trong Git Bash trên laptop tại thư mục gốc repository, tạo file Job mới.
+
+```bash
+cp deploy/kubernetes/database/postgres-clone-azure.yaml \
+  deploy/kubernetes/database/postgres-clone-rejoin-aws.yaml
+```
+
+Mở deploy/kubernetes/database/postgres-clone-rejoin-aws.yaml và sửa bốn giá trị của lượt rejoin.
+
+| Trường | Giá trị AWS rejoin |
+|---|---|
+| metadata.name | postgres-clone-rejoin-aws-01 |
+| SOURCE_DB_HOST trong env | 10.200.29.2 |
+| PGAPPNAME thêm trong env | mcf-aws-standby |
+| claimName của volume data | postgres-data-rejoin-aws-01 |
+
+Nội dung đầy đủ sau khi chỉnh sửa.
+
+```yaml
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: postgres-clone-rejoin-aws-01
+  namespace: issues
+spec:
+  backoffLimit: 0
+  activeDeadlineSeconds: 600
+  template:
+    spec:
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      restartPolicy: Never
+      containers:
+        - name: basebackup
+          image: postgres:17-bookworm@sha256:665dc7b37ac52a17e298511414c21d23ffa4e6a6ef6225b3e5d59c7afb35e994
+          command: ["bash", "/bootstrap/clone.sh"]
+          envFrom:
+            - secretRef:
+                name: postgres-replication
+          env:
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+            - name: SOURCE_DB_HOST
+              value: "10.200.29.2"
+            - name: PGAPPNAME
+              value: "mcf-aws-standby"
+          resources:
+            requests:
+              cpu: 200m
+              memory: 256Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+            - name: script
+              mountPath: /bootstrap
+              readOnly: true
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: postgres-data-rejoin-aws-01
+        - name: script
+          configMap:
+            name: postgres-clone-script
+```
+
+metadata.name nhận diện Job của lượt AWS rejoin đầu tiên. SOURCE_DB_HOST chọn IP WireGuard của Azure primary. PGAPPNAME gán tên kết nối cho AWS standby thông qua script đã chuẩn bị. claimName chọn PVC mới đã tạo, là nơi Job ghi dữ liệu clone. Secret postgres-replication cung cấp user và password, ConfigMap postgres-clone-script cung cấp script.
+
+hostNetwork true cho container dùng mạng host AWS để kết nối tới 10.200.29.2 qua WireGuard. volumeMounts đặt dữ liệu ở /var/lib/postgresql/data và script ở /bootstrap. command chạy Bash để thực thi script clone. Resource requests và limits dùng mức đã thực hành cho tác vụ base backup.
+
+backoffLimit 0 ghi nhận thất bại khi Job gặp lỗi để người vận hành xem log và kiểm tra vùng đích trước lần thực hiện tiếp theo. activeDeadlineSeconds 600 giới hạn thời gian hoạt động của Job. Job sẽ được apply khi agent AWS hoạt động trở lại và workload cũ đã được chuẩn bị đúng trạng thái để Pod clone có thể chạy trong thời hạn này. [Kubernetes Jobs](https://kubernetes.io/docs/concepts/workloads/controllers/job/).
+
+Checkpoint hiện tại là chuẩn bị manifest trong repository. Bước tiếp theo sửa StatefulSet AWS để trỏ PVC mới với replicas 0 và điều kiện dữ liệu clone hoàn tất, rồi hoàn thiện các điều kiện trước khi bật lại agent và chạy Job.
+
+Manifest postgres-clone-rejoin-aws.yaml đã được kiểm tra YAML và các tham chiếu. Job chọn source 10.200.29.2, PGAPPNAME mcf-aws-standby, Secret postgres-replication, ConfigMap postgres-clone-script và PVC postgres-data-rejoin-aws-01.
+
+### 4.32. Chuẩn bị StatefulSet AWS dùng dữ liệu clone mới
+
+Job chuẩn bị dữ liệu, còn StatefulSet vận hành PostgreSQL sau khi clone hoàn tất. Cập nhật manifest AWS để khai báo PVC rejoin, số replica 0 trong giai đoạn chuẩn bị và điều kiện kiểm tra bản clone trước khi gọi entrypoint PostgreSQL.
+
+Trên laptop, mở deploy/kubernetes/database/postgres-aws.yaml và thực hiện ba thay đổi sau.
+
+Đặt spec.replicas thành 0.
+
+```yaml
+spec:
+  serviceName: postgres-headless
+  replicas: 0
+```
+
+Giá trị 0 đưa trạng thái chuẩn bị vào manifest để lượt apply tiếp theo ghi đúng desired state trong lúc rejoin. Sau khi Job clone được nghiệm thu, số replica sẽ được đặt về 1 để chạy database.
+
+Trong containers của PostgreSQL, thêm command giữa image và args theo mẫu đã thực hành ở manifest Azure.
+
+```yaml
+          command:
+            - bash
+            - -ec
+            - |
+              test -f /var/lib/postgresql/data/.clone-complete
+              test "$(cat "$PGDATA/PG_VERSION")" = 17
+              exec docker-entrypoint.sh "$@"
+            - --
+          args: ["postgres", "-c", "config_file=/etc/postgresql/postgresql.conf"]
+```
+
+bash -ec thực thi đoạn script với chế độ dừng khi một lệnh thất bại. Phép kiểm tra đầu yêu cầu marker .clone-complete, được Job tạo sau khi base backup và các kiểm tra hoàn tất. Phép kiểm tra thứ hai đọc major version trong PG_VERSION và yêu cầu giá trị 17, tương ứng image PostgreSQL đang dùng. Hai điều kiện cho phép workload sử dụng bản clone đã hoàn tất để khởi động.
+
+exec docker-entrypoint.sh "$@" chuyển quyền điều khiển process sang entrypoint của image PostgreSQL với danh sách args. Dấu -- đứng sau nội dung script là giá trị $0 của Bash khi dùng -c, còn các phần tử trong args trở thành tham số $1, $2 và tiếp theo. "$@" giữ từng tham số là một đối số riêng, nên entrypoint nhận postgres -c config_file=/etc/postgresql/postgresql.conf.
+
+Điều kiện bản clone cần thiết vì entrypoint của image PostgreSQL có khả năng khởi tạo database khi gặp data directory mới. Trong lượt rejoin, database cần khởi động từ dữ liệu đã clone và cấu hình recovery do pg_basebackup -R tạo. [PostgreSQL image entrypoint](https://github.com/docker-library/postgres/blob/master/docker-entrypoint.sh).
+
+Trong volume data, đặt claimName thành PVC mới của lượt rejoin.
+
+```yaml
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: postgres-data-rejoin-aws-01
+        - name: config
+          configMap:
+            name: postgres-config
+```
+
+Volume data liên kết cùng PVC mà Job ghi base backup. Volume config cung cấp cấu hình PostgreSQL dành cho địa chỉ WireGuard của host AWS. Cấu hình primary_conninfo cùng standby.signal nằm trong PGDATA của bản clone sẽ giúp PostgreSQL kết nối tới writer Azure khi khởi động.
+
+Checkpoint hiện tại là chuẩn bị StatefulSet trên laptop với replicas 0, entrypoint kiểm tra clone và PVC mới. Bước tiếp theo chuyển manifest lên AWS, apply trong chế độ agentless và xử lý các Pod object cũ trước khi bật lại agent.
+
+### 4.33. Apply StatefulSet AWS trong chế độ agentless
+
+Control plane AWS đang chạy với disable-agent: true. API server tiếp nhận manifest, còn việc chạy Pod sẽ được khôi phục sau khi hoàn tất chuẩn bị rejoin. Apply StatefulSet ở thời điểm này để lưu desired replicas 0 và liên kết tới PVC mới trước khi bật lại agent.
+
+Trên Git Bash của laptop, chuyển manifest lên EC2.
+
+```bash
+scp -i ~/.ssh/mcf-lab \
+  deploy/kubernetes/database/postgres-aws.yaml \
+  ubuntu@175.41.152.242:/home/ubuntu/postgres-aws.yaml
+```
+
+Trong phiên SSH AWS, apply rồi kiểm tra số replica mong muốn của cả database và ứng dụng.
+
+```bash
+sudo k3s kubectl apply -f /home/ubuntu/postgres-aws.yaml
+
+sudo k3s kubectl -n issues get statefulset/postgres deployment/issues-app \
+  -o 'custom-columns=KIND:.kind,NAME:.metadata.name,DESIRED:.spec.replicas'
+```
+
+Kết quả cần có DESIRED bằng 0 cho cả postgres và issues-app. StatefulSet lấy giá trị này từ manifest vừa apply. Deployment ứng dụng lấy giá trị đã scale ở bước 4.26.
+
+Kiểm tra PVC mà StatefulSet sẽ sử dụng và các Pod object còn lưu trong API.
+
+```bash
+sudo k3s kubectl -n issues get statefulset postgres \
+  -o jsonpath='{.spec.template.spec.volumes[?(@.name=="data")].persistentVolumeClaim.claimName}{"\n"}'
+
+sudo k3s kubectl -n issues get pods -o wide
+```
+
+Tên PVC cần là postgres-data-rejoin-aws-01. Pod object cũ có thể còn xuất hiện hoặc ở trạng thái Terminating khi kubelet đang tắt. Danh sách này giúp xác định các object cần xử lý trước lúc bật lại agent. Đối chiếu với phép kiểm tra socket PostgreSQL đã dừng ở bước 4.25 để phân biệt trạng thái lưu trong API với process trên host.
+
+Checkpoint của bước này gồm desired replicas của hai workload bằng 0, StatefulSet tham chiếu PVC mới và danh sách Pod object hiện tại để chuẩn bị bước tiếp theo.
+
+### 4.34. Xử lý Pod object cũ khi agent AWS đang tắt
+
+Trong lượt thực hành, postgres-0 và issues-app-f8fb495f5-thvkw đang Terminating. Kubelet đang tắt trong chế độ agentless nên chưa thể hoàn tất quy trình xóa Pod thông thường. Cột READY có thể vẫn chứa trạng thái được báo trước đó.
+
+Trên SSH AWS, kiểm tra desired replicas và process PostgreSQL trước khi xóa object.
+
+```bash
+sudo k3s kubectl -n issues get statefulset/postgres deployment/issues-app \
+  -o 'custom-columns=KIND:.kind,NAME:.metadata.name,DESIRED:.spec.replicas'
+
+sudo pgrep -a -x postgres
+sudo ss -ltnp 'sport = :5432'
+```
+
+Điều kiện tiếp tục là hai workload đều DESIRED 0, pgrep không tìm thấy process postgres và ss chỉ hiện tiêu đề bảng. Control plane AWS vẫn chạy agentless theo bước 4.25. Nếu kết quả khác các điều kiện này, cần xác định nguyên nhân trước khi thực hiện lệnh xóa.
+
+Với các điều kiện trên đã đạt, xóa đích danh hai Pod object cũ của lượt thực hành.
+
+```bash
+sudo k3s kubectl -n issues delete pod \
+  postgres-0 issues-app-f8fb495f5-thvkw \
+  --force --grace-period=0 --ignore-not-found
+```
+
+--force --grace-period=0 yêu cầu API xóa object ngay. --ignore-not-found cho phép chạy lại nếu một object đã được xóa. Cơ chế force delete có thể hoàn tất trước khi process trên node kết thúc, nên việc xác nhận process đã dừng và agent đang tắt là điều kiện cần cho thao tác ở bước này. [Kubernetes force delete StatefulSet Pods](https://kubernetes.io/docs/tasks/run-application/force-delete-stateful-set-pod/).
+
+Kiểm tra kết quả và tình trạng PVC.
+
+```bash
+sudo k3s kubectl -n issues get pods -o wide
+sudo k3s kubectl -n issues get pvc postgres-data postgres-data-rejoin-aws-01
+```
+
+Hai Pod object vừa xóa cần biến mất. PVC postgres-data vẫn Bound và PVC postgres-data-rejoin-aws-01 dự kiến Pending cho tới khi Job clone được lên lịch. Bước tiếp theo khôi phục agent để có thể chạy Job clone dữ liệu từ Azure.
+
+### 4.35. Khôi phục agent AWS sau khi chuẩn bị workload
+
+Agent cung cấp kubelet và container runtime để node chạy Pod. Sau khi desired replicas của hai workload bằng 0, StatefulSet trỏ PVC mới và các Pod object cũ đã được xóa, khôi phục agent để có thể chạy Job clone. Azure tiếp tục giữ vai trò writer trong bước này.
+
+Trên SSH AWS, đối chiếu trạng thái trước khi khởi động lại K3s.
+
+```bash
+sudo k3s kubectl -n issues get statefulset/postgres deployment/issues-app \
+  -o 'custom-columns=KIND:.kind,NAME:.metadata.name,DESIRED:.spec.replicas'
+sudo k3s kubectl -n issues get pods -o wide
+sudo test -f /run/issues-k3s-start-approved && echo 'Boot approval present'
+```
+
+Hai workload cần DESIRED 0, hai Pod cũ đã biến mất và marker phê duyệt boot hiện tại còn tồn tại. Nếu một điều kiện chưa đạt, hoàn tất bước chuẩn bị tương ứng trước khi khởi động lại dịch vụ.
+
+Khi các điều kiện đã đạt, chạy chuỗi lệnh sau.
+
+```bash
+sudo systemctl stop k3s &&
+sudo rm -- /etc/rancher/k3s/config.yaml.d/99-rejoin.yaml &&
+sudo systemctl start k3s
+```
+
+File 99-rejoin.yaml được tạo riêng ở bước 4.25 với disable-agent: true. Xóa file cấu hình tạm này rồi khởi động K3s sẽ khôi phục agent theo cấu hình thông thường của server. K3s đọc các file config.yaml.d/*.yaml khi khởi động. Dấu && khiến lệnh tiếp theo chỉ chạy khi lệnh trước thành công. Marker trong /run đã được phê duyệt cho boot hiện tại và được ExecStartPre kiểm tra khi start dịch vụ. [K3s configuration file](https://docs.k3s.io/installation/configuration#configuration-file).
+
+Chờ node sẵn sàng rồi kiểm tra workload cùng cổng PostgreSQL.
+
+```bash
+sudo k3s kubectl wait --for=condition=Ready \
+  node/mcf-aws-primary --timeout=180s
+
+sudo k3s kubectl get nodes -o wide
+sudo k3s kubectl -n issues get pods -o wide
+sudo ss -ltnp 'sport = :5432'
+```
+
+Node cần Ready, hai workload ứng dụng và database vẫn có desired replicas 0, cổng 5432 chưa có listener. Các Pod hệ thống có thể được khôi phục trong quá trình node trở lại. Bước kế tiếp mới apply Job clone để thời hạn chạy của Job bắt đầu khi node đã có khả năng thực thi Pod.
+
+### 4.36. Chạy Job clone Azure sang PVC rejoin trên AWS
+
+Sau khi AWS node Ready, namespace issues đã hết Pod và cổng 5432 chưa có listener, chuyển manifest Job đã chuẩn bị lên EC2. Thực hiện trên Git Bash của laptop.
+
+```bash
+scp -i ~/.ssh/mcf-lab \
+  deploy/kubernetes/database/postgres-clone-rejoin-aws.yaml \
+  ubuntu@175.41.152.242:/home/ubuntu/postgres-clone-rejoin-aws.yaml
+```
+
+Trong SSH AWS, kiểm tra peer WireGuard và writer Azure.
+
+```bash
+ping -c 2 -W 2 10.200.29.2
+curl -fsS --max-time 10 -w '\n' \
+  https://azure.mcf.todicode.tech/health/database
+```
+
+Ping cần nhận được phản hồi từ peer. Writer health cần trả role primary và writable true. Khi cả hai đạt, apply Job.
+
+```bash
+sudo k3s kubectl apply -f /home/ubuntu/postgres-clone-rejoin-aws.yaml
+
+sudo k3s kubectl -n issues wait --for=condition=complete \
+  job/postgres-clone-rejoin-aws-01 --timeout=600s
+```
+
+Job tạo Pod sử dụng network của host AWS để kết nối 10.200.29.2:5432 qua WireGuard. Script lấy credential từ Secret postgres-replication và chạy pg_basebackup vào PVC postgres-data-rejoin-aws-01. local-path provisioner cấp volume khi Pod được lên lịch, phù hợp WaitForFirstConsumer.
+
+pg_basebackup sao chép dữ liệu của PostgreSQL cluster Azure. Tham số -X stream đưa WAL cần cho bản backup vào dữ liệu được nhận, còn -R tạo standby.signal và lưu thông tin kết nối phục vụ replication. Sau các kiểm tra cuối, script tạo marker .clone-complete. [PostgreSQL pg_basebackup](https://www.postgresql.org/docs/17/app-pgbasebackup.html).
+
+Lệnh wait theo dõi condition Complete của Job. Job đã có activeDeadlineSeconds 600 và backoffLimit 0. Khi wait báo lỗi, cần đọc trạng thái và log để xác định nguyên nhân trước khi xử lý dữ liệu clone.
+
+```bash
+sudo k3s kubectl -n issues logs job/postgres-clone-rejoin-aws-01
+sudo k3s kubectl -n issues get job postgres-clone-rejoin-aws-01
+sudo k3s kubectl -n issues get pvc postgres-data-rejoin-aws-01
+```
+
+Kết quả nghiệm thu cần có log Base backup completed, Job Complete với COMPLETIONS 1/1 và PVC Bound. PostgreSQL StatefulSet AWS vẫn replicas 0 trong bước này. Sau khi bản clone được nghiệm thu, bước tiếp theo khởi động PostgreSQL AWS từ PVC mới và kiểm chứng vai trò standby.
+
+### 4.37. Khởi động PostgreSQL AWS từ bản clone mới
+
+Sau khi Job clone Complete 1/1, log có Base backup completed và PVC rejoin Bound, tăng số replica PostgreSQL AWS để khởi động database từ dữ liệu vừa nhận. Trong lượt thực hành, PVC mới được gắn với PV pvc-8f0f13b6-05b8-43d8-8887-fb30a9525613.
+
+Trên laptop, mở deploy/kubernetes/database/postgres-aws.yaml và đổi spec.replicas từ 0 thành 1.
+
+```yaml
+spec:
+  serviceName: postgres-headless
+  replicas: 1
+```
+
+Thao tác này cập nhật desired state trong file quản lý StatefulSet. Volume data của manifest cần tiếp tục tham chiếu postgres-data-rejoin-aws-01 và command kiểm tra .clone-complete cùng PG_VERSION đã được chuẩn bị ở bước 4.32.
+
+Trên Git Bash laptop, chuyển manifest đã chỉnh lên EC2.
+
+```bash
+scp -i ~/.ssh/mcf-lab \
+  deploy/kubernetes/database/postgres-aws.yaml \
+  ubuntu@175.41.152.242:/home/ubuntu/postgres-aws.yaml
+```
+
+Trong SSH AWS, apply và chờ StatefulSet sẵn sàng.
+
+```bash
+sudo k3s kubectl apply -f /home/ubuntu/postgres-aws.yaml
+
+sudo k3s kubectl -n issues rollout status statefulset/postgres --timeout=180s
+
+sudo k3s kubectl -n issues get pod postgres-0 -o wide
+```
+
+StatefulSet tạo Pod postgres-0 và mount PVC rejoin. Command kiểm tra bản clone trước khi gọi entrypoint. PostgreSQL đọc standby.signal cùng cấu hình kết nối do pg_basebackup -R tạo để khởi động recovery và nhận WAL từ Azure. [PostgreSQL pg_basebackup](https://www.postgresql.org/docs/17/app-pgbasebackup.html).
+
+Khi Pod đạt 1/1 Running, kiểm tra vai trò và WAL receiver bằng kết nối SQL trên AWS.
+
+```bash
+sudo k3s kubectl -n issues exec postgres-0 -- \
+  psql -X -U taskflow -d taskflow -P pager=off -c \
+  "SELECT pg_is_in_recovery() AS in_recovery,
+          current_setting('transaction_read_only') AS read_only;
+   SELECT status, sender_host, sender_port,
+          pg_last_wal_receive_lsn() AS receive_lsn,
+          pg_last_wal_replay_lsn() AS replay_lsn
+   FROM pg_stat_wal_receiver;"
+```
+
+Kết quả cần có in_recovery t, read_only on và một dòng receiver status streaming, sender_host 10.200.29.2, sender_port 5432. in_recovery xác nhận vai trò standby, transaction_read_only xác nhận chế độ chỉ đọc của kết nối và receiver cho biết nguồn WAL Azure. LSN cho biết tiến độ nhận và replay tại thời điểm truy vấn. Sau bước này cần đối chiếu sender trên Azure và dữ liệu đã ghi sau failover trước khi nghiệm thu rejoin.
+
+### 4.38. Đối chiếu WAL sender Azure và dữ liệu sau failover trên AWS
+
+Kết quả kiểm tra AWS sau khi khởi động từ PVC rejoin đã có in_recovery t, read_only on và receiver streaming từ 10.200.29.2:5432. receive_lsn cùng replay_lsn đạt 0/5000060 tại thời điểm truy vấn. Tiếp tục kiểm tra kết nối từ phía Azure và đọc lại dữ liệu đã tạo sau failover.
+
+Trên SSH Azure, xem WAL sender.
+
+```bash
+sudo k3s kubectl -n issues exec postgres-0 -- \
+  psql -X -U taskflow -d taskflow -P pager=off -c \
+  "SELECT application_name, client_addr, state, sync_state,
+          sent_lsn, write_lsn, flush_lsn, replay_lsn
+   FROM pg_stat_replication;"
+```
+
+Kết nối AWS cần có application_name mcf-aws-standby, client_addr 10.200.29.1, state streaming và sync_state async. application_name đến từ cấu hình kết nối mà Job clone lưu qua pg_basebackup -R. client_addr đối chiếu địa chỉ WireGuard của bên nhận. View pg_stat_replication cung cấp trạng thái sender và tiến độ WAL được standby báo về. [PostgreSQL statistics views](https://www.postgresql.org/docs/17/monitoring-stats.html#MONITORING-PG-STAT-REPLICATION-VIEW).
+
+Trên SSH AWS, đọc bản ghi đã tạo qua API Azure sau failover ở bước 4.21.
+
+```bash
+sudo k3s kubectl -n issues exec postgres-0 -- \
+  psql -X -U taskflow -d taskflow -P pager=off -c \
+  "SELECT run_id, seq, environment, created_at
+   FROM probe_pings
+   WHERE run_id = 'stage7-failover-20261114T121609Z'
+     AND seq = 1;"
+```
+
+Kết quả cần có một dòng với seq 1 và environment azure. Bản ghi này được tạo khi Azure đã là primary, sau khi AWS cũ bị dừng. Đọc được nó trên AWS xác nhận dữ liệu sau failover hiện có trong database AWS đã rejoin. Cột environment lưu nơi bản ghi được tạo, còn vai trò database hiện tại được kiểm chứng bằng pg_is_in_recovery ở bước 4.37.
+
+Phép đọc này kiểm chứng dữ liệu từ bản clone và quá trình cập nhật đến thời điểm đọc. Bước tiếp theo dùng một transaction mới trên Azure sau rejoin để kiểm tra replication tiếp tục chuyển dữ liệu sang AWS.
+
+### 4.39. Tạo transaction mới trên Azure sau khi AWS rejoin
+
+AWS đã đọc được bản ghi stage7-failover-20261114T121609Z, seq 1, environment azure, created_at 2026-11-14 12:16:13.966852+00. Tiếp tục tạo dữ liệu mới sau thời điểm AWS đã trở lại standby để kiểm chứng replication đang hoạt động với transaction mới.
+
+Trên SSH Azure, chạy lệnh sau.
+
+```bash
+sudo k3s kubectl -n issues exec postgres-0 -- \
+  psql -X -U taskflow -d taskflow -P pager=off -c \
+  "INSERT INTO probe_pings (run_id, seq, environment)
+   VALUES ('stage7-after-rejoin-' || gen_random_uuid()::text, 1, 'azure')
+   RETURNING run_id, seq, environment, created_at;"
+```
+
+Tiền tố stage7-after-rejoin- nhận diện phép thử. gen_random_uuid() tạo định danh mới cho mỗi lần chạy, phép || nối tiền tố với UUID và ::text chuyển UUID sang kiểu chuỗi. environment azure được ghi tường minh bởi câu SQL này. RETURNING hiển thị bản ghi vừa thêm để lấy chính xác run_id cho phép đọc trên AWS ở bước tiếp theo. Với phiên psql đang dùng, transaction được commit khi câu lệnh thành công.
+
+Giữ lại run_id cùng seq 1. Kết quả cần có một dòng RETURNING và thông báo INSERT 0 1. Để hoàn tất đối chiếu từ phía sender, cần lưu cả kết quả pg_stat_replication trên Azure theo bước 4.38.
+
+### 4.40. Đọc transaction mới trên AWS sau rejoin
+
+Lệnh ghi ở bước 4.39 đã tạo run_id stage7-after-rejoin-b7b94038-bdcc-4640-8d7d-7eba71d7336c, seq 1, environment azure, created_at 2026-11-14 15:14:23.426045+00 và trả INSERT 0 1.
+
+Trên SSH AWS, đọc đúng bản ghi vừa tạo trên Azure.
+
+```bash
+sudo k3s kubectl -n issues exec postgres-0 -- \
+  psql -X -U taskflow -d taskflow -P pager=off -c \
+  "SELECT run_id, seq, environment, created_at
+   FROM probe_pings
+   WHERE run_id = 'stage7-after-rejoin-b7b94038-bdcc-4640-8d7d-7eba71d7336c'
+     AND seq = 1;"
+```
+
+Kết quả cần có một dòng khớp cả run_id, seq, environment và created_at của lệnh ghi trên Azure. Bản ghi được tạo sau khi clone hoàn tất và AWS đã khởi động thành standby. Đọc được bản ghi này trên AWS kiểm chứng transaction mới đã được chuyển qua replication và replay thành dữ liệu có thể truy vấn.
+
+Nếu lần đọc đầu trả 0 rows, chạy lại câu SELECT để đối chiếu do replication đang dùng chế độ bất đồng bộ. Nếu vẫn thiếu bản ghi, kiểm tra lại WAL receiver và WAL sender theo các bước 4.37 và 4.38.
+
+Các run_id trong phần kết quả ghi nhận lượt thực hành hiện tại. Khi thực hiện lại project, dùng run_id do câu INSERT của lượt mới trả về để đối chiếu.
+
+### 4.41. Khôi phục ứng dụng AWS kết nối tới database standby
+
+AWS đã đọc được transaction mới stage7-after-rejoin-b7b94038-bdcc-4640-8d7d-7eba71d7336c với seq 1, environment azure và created_at 2026-11-14 15:14:23.426045+00. Dữ liệu khớp lệnh ghi trên Azure sau khi AWS rejoin, kiểm chứng luồng replication đang chuyển transaction mới sang AWS.
+
+Khôi phục Deployment ứng dụng AWS đã scale về 0 ở bước 4.26. Manifest deploy/kubernetes/app/app-deployment.yaml đang khai báo replicas 1 và image digest đã được kiểm chứng ở giai đoạn 5. Trên Git Bash laptop, chuyển manifest lên EC2.
+
+```bash
+scp -i ~/.ssh/mcf-lab \
+  deploy/kubernetes/app/app-deployment.yaml \
+  ubuntu@175.41.152.242:/home/ubuntu/app-deployment.yaml
+```
+
+Trong SSH AWS, apply và chờ Deployment sẵn sàng.
+
+```bash
+sudo k3s kubectl apply -f /home/ubuntu/app-deployment.yaml
+sudo k3s kubectl -n issues rollout status deployment/issues-app --timeout=180s
+sudo k3s kubectl -n issues get pods -l app=issues-app -o wide
+```
+
+Deployment cần có Pod ứng dụng 1/1 Running. Ứng dụng lấy môi trường aws từ ConfigMap issues-app-config và kết nối Service postgres của cluster AWS. Service database ánh xạ tới PostgreSQL ở WireGuard 10.200.29.1. readinessProbe gọi /api/database/status, hỗ trợ database standby khi kết nối thành công.
+
+Kiểm tra HTTPS origin AWS ngay trong SSH AWS.
+
+```bash
+curl -fsS --max-time 10 -w '\nHTTP %{http_code}\n' \
+  https://aws.mcf.todicode.tech/api/database/status
+
+curl -sS --max-time 10 -w '\nHTTP %{http_code}\n' \
+  https://aws.mcf.todicode.tech/health/database
+```
+
+Endpoint /api/database/status cần HTTP 200, connected true, role standby, writable false và replication_connected true. Endpoint /health/database cần HTTP 503 vì nó biểu diễn điều kiện writable primary mà Route 53 sử dụng. -f ở câu curl đầu làm lệnh thất bại khi gặp HTTP lỗi. Câu curl thứ hai dùng -sS để hiển thị cả body và HTTP 503 phục vụ đối chiếu vai trò standby.
+
+Checkpoint này nghiệm thu ứng dụng AWS phục vụ được HTTP và truy vấn database standby sau rejoin. Cần lưu kết quả endpoint trước khi chuyển sang chuẩn bị failback có kiểm soát.
+
+### 4.42. Đối chiếu primary Azure và kết nối AWS trước failback
+
+Ứng dụng AWS sau rejoin đã trả /api/database/status HTTP 200 và /health/database HTTP 503, với connected true, role standby, writable false, replication_connected true. receive_lsn và replay_lsn cùng đạt 0/50006C8 tại thời điểm kiểm tra. Database cùng ứng dụng AWS đã hoạt động ở vai trò standby.
+
+Failback đưa vai trò writer về AWS rồi xây dựng lại Azure thành standby. Trình tự dự kiến gồm tạm dừng ghi ứng dụng trên Azure, đợi AWS replay tới mốc WAL được ghi nhận sau khi dừng ghi, fence Azure, promote AWS và mở lại ghi trên AWS. Cờ writes_enabled được lưu trong dữ liệu PostgreSQL và được replicate, nên việc mở lại ghi trên writer mới cần thực hiện tường minh. Quá trình chuyển vai trò có khoảng gián đoạn ghi cần ghi nhận trong lượt thực hành.
+
+Trước khi bắt đầu dừng ghi, đối chiếu topology từ phía Azure. Trên SSH Azure, chạy lệnh sau.
+
+```bash
+sudo k3s kubectl -n issues exec postgres-0 -- \
+  psql -X -U taskflow -d taskflow -P pager=off -c \
+  "SELECT pg_is_in_recovery() AS in_recovery,
+          current_setting('transaction_read_only') AS read_only,
+          writes_enabled
+   FROM app_control
+   WHERE singleton = TRUE;
+   SELECT application_name, client_addr, state, sync_state,
+          sent_lsn, write_lsn, flush_lsn, replay_lsn
+   FROM pg_stat_replication;"
+```
+
+Kết quả vai trò Azure cần in_recovery f, read_only off và writes_enabled t. Kết nối AWS cần application_name mcf-aws-standby, client_addr 10.200.29.1, state streaming và sync_state async. Các vị trí WAL giúp quan sát tiến độ từ phía sender tại thời điểm truy vấn.
+
+Checkpoint này xác nhận primary hiện tại và đúng bên nhận replication trước khi thay đổi cờ ghi. Lệnh SQL của bước này chỉ đọc trạng thái. Sau khi kết quả được đối chiếu, hướng dẫn tiếp theo thực hiện write barrier bằng advisory lock (2900, 1) tương ứng database/control.py.
+
+### 4.43. Tạm dừng ghi Azure và lấy mốc WAL cho failback
+
+Kết quả preflight đã xác nhận Azure in_recovery f, read_only off, writes_enabled t. WAL sender tới mcf-aws-standby ở 10.200.29.1 đang streaming async, với sent_lsn, write_lsn, flush_lsn và replay_lsn cùng đạt 0/50006C8 tại thời điểm kiểm tra. Lượt AWS rejoin đã được kiểm chứng từ database, dữ liệu mới, ứng dụng và kết nối hai phía.
+
+Bước này bắt đầu khoảng tạm dừng ghi ứng dụng để chuyển vai trò có kiểm soát. Trên SSH Azure, chạy toàn bộ lệnh sau trong cùng một phiên psql.
+
+```bash
+sudo k3s kubectl -n issues exec postgres-0 -- \
+  psql -X -v ON_ERROR_STOP=1 -U taskflow -d taskflow -P pager=off \
+  -c "SET lock_timeout = '15s'; SET synchronous_commit = on;" \
+  -c "SELECT pg_advisory_lock(2900, 1);" \
+  -c "UPDATE app_control SET writes_enabled = FALSE WHERE singleton = TRUE RETURNING writes_enabled;" \
+  -c "SELECT pg_current_wal_flush_lsn() AS target_lsn;" \
+  -c "SELECT pg_advisory_unlock(2900, 1) AS unlocked;"
+```
+
+Ứng dụng lấy shared transaction advisory lock (2900, 1) trong database/control.py trước khi kiểm tra cờ ghi. Exclusive session lock ở lệnh trên đợi các transaction đang giữ shared lock hoàn tất và chặn các writer ứng dụng mới trong lúc thay đổi cờ. lock_timeout giới hạn thời gian đợi lock ở 15 giây. ON_ERROR_STOP dừng các lệnh tiếp theo khi có lỗi SQL.
+
+Các tùy chọn -c chạy lần lượt trên cùng kết nối psql. UPDATE được commit trước câu SELECT lấy target_lsn, trong khi session advisory lock vẫn được giữ qua các transaction. synchronous_commit on yêu cầu WAL của commit được flush trước khi UPDATE trả thành công. target_lsn được lấy sau đó làm mốc WAL mà AWS cần replay tới. Khi unlock hoàn tất, các writer ứng dụng tiếp tục qua bước lấy shared lock rồi đọc writes_enabled false, nên trả lỗi tạm dừng ghi. Session lock cũng được giải phóng khi kết nối kết thúc. [PostgreSQL advisory locks](https://www.postgresql.org/docs/17/explicit-locking.html#ADVISORY-LOCKS).
+
+Giá trị (2900, 1) là định danh lock do project chọn và dùng thống nhất giữa ứng dụng với thao tác điều phối. Cờ này điều khiển các đường ghi ứng dụng có gọi guard_write. Trong khoảng chuyển vai trò, các thao tác SQL quản trị cần được phối hợp với mốc WAL đã lấy.
+
+Kết quả cần có writes_enabled f, UPDATE 1, một target_lsn và unlocked t. Giữ lại target_lsn để truy vấn trên AWS ở bước tiếp theo. Nếu có lỗi SQL, đối chiếu lỗi cùng trạng thái cờ ghi trước khi tiếp tục chuyển vai trò.
+
+Khi Azure writes_enabled false, endpoint writer health Azure trả 503. AWS standby cũng trả 503. Sau khi cả hai health check được đánh giá unhealthy, Route 53 trả record PRIMARY AWS theo failover policy. DNS có thể chọn AWS trong lúc AWS vẫn là standby. [Route 53 health-check routing](https://docs.aws.amazon.com/Route53/latest/DeveloperGuide/health-checks-how-route-53-chooses-records.html).
+
+Checkpoint là ghi ứng dụng Azure đã tạm dừng và mốc WAL sau commit đã được ghi nhận. Bước tiếp theo kiểm tra AWS vẫn standby, đã replay tới mốc này và đã nhận cờ writes_enabled false trước khi fence Azure.
+
+### 4.44. Kiểm tra AWS replay tới mốc dừng ghi Azure
+
+Write barrier trên Azure đã trả writes_enabled f, UPDATE 1, target_lsn 0/5000798 và unlocked t. Đối chiếu mốc này trên AWS trước khi fence Azure.
+
+Trên SSH AWS, chạy truy vấn sau.
+
+```bash
+sudo k3s kubectl -n issues exec postgres-0 -- \
+  psql -X -v ON_ERROR_STOP=1 -U taskflow -d taskflow -P pager=off -c \
+  "SELECT pg_is_in_recovery() AS in_recovery,
+          writes_enabled,
+          pg_last_wal_replay_lsn() AS replay_lsn,
+          pg_last_wal_replay_lsn() >= '0/5000798'::pg_lsn AS caught_up
+   FROM app_control
+   WHERE singleton = TRUE;"
+```
+
+Kết quả cần một dòng với in_recovery t, writes_enabled f và caught_up t. replay_lsn cần lớn hơn hoặc bằng 0/5000798. Kiểu pg_lsn cho phép so sánh vị trí WAL theo thứ tự PostgreSQL. Phép so sánh dùng >= vì standby có thể tiếp tục replay thêm WAL sau mốc đã ghi nhận.
+
+in_recovery xác nhận AWS vẫn là standby. writes_enabled f xác nhận thay đổi cờ điều khiển đã xuất hiện trong dữ liệu có thể truy vấn trên AWS. caught_up t xác nhận WAL đã được replay tới mốc lấy sau khi commit thao tác tạm dừng ghi trên Azure. Truy vấn kiểm tra cả dữ liệu và tiến độ replay trước khi thay đổi trạng thái nguồn.
+
+Nếu caught_up f, thực hiện lại truy vấn và kiểm tra replication khi cần. Điều kiện chuyển sang fence Azure là đủ cả ba giá trị in_recovery t, writes_enabled f, caught_up t. Khi thực hiện lại project, thay 0/5000798 bằng target_lsn của chính lượt dừng ghi mới.
+
+Checkpoint tiếp theo là xác nhận VM Azure đã được fence ở cấp cloud trước khi promote AWS. Cờ ghi ứng dụng tiếp tục false qua giai đoạn này.
+
+### 4.45. Fence VM Azure trước khi promote AWS
+
+AWS đã trả in_recovery t, writes_enabled f, replay_lsn 0/50008D8 và caught_up t so với target_lsn 0/5000798. Bên nhận đã replay tới mốc được lấy sau commit tạm dừng ghi trên Azure.
+
+Thực hiện fencing ở cấp cloud bằng cách deallocate VM Azure đang giữ vai trò primary. Trên Git Bash laptop, chạy lệnh sau.
+
+```bash
+az vm deallocate \
+  --subscription 52341a4a-a86f-4780-82dc-879b500022d8 \
+  --resource-group mcf-azure-rg \
+  --name mcf-azure-standby
+```
+
+subscription chỉ định tài khoản triển khai, resource-group xác định nhóm tài nguyên và name chọn đúng VM của project. Tên tài nguyên vẫn là mcf-azure-standby dù database bên trong hiện là primary. Deallocate dừng VM và giải phóng phần cấp phát compute. Trong lượt failback, VM được dừng giúp cô lập PostgreSQL writer cũ trước khi promote AWS. [Azure CLI deallocate](https://learn.microsoft.com/en-us/cli/azure/vm?view=azure-cli-latest#az-vm-deallocate).
+
+Sau khi lệnh hoàn tất, truy vấn power state từ Azure.
+
+```bash
+az vm get-instance-view \
+  --subscription 52341a4a-a86f-4780-82dc-879b500022d8 \
+  --resource-group mcf-azure-rg \
+  --name mcf-azure-standby \
+  --query "instanceView.statuses[?starts_with(code, 'PowerState/')].code | [0]" \
+  --output tsv
+```
+
+Kết quả cần là PowerState/deallocated. Query lọc phần trạng thái nguồn điện trong instanceView, lấy trường code và phần tử đầu tiên. --output tsv in giá trị thuận tiện đối chiếu. SSH Azure sẽ mất kết nối khi VM được dừng. Bằng chứng fencing ở bước này là power state do Azure báo về. [Azure VM states](https://learn.microsoft.com/en-us/azure/virtual-machines/states-billing).
+
+Chỉ sau khi xác nhận PowerState/deallocated mới chuyển sang promote AWS. Startup guard đã cài trên Azure sẽ yêu cầu phê duyệt boot khi VM được khởi động lại để rejoin.
+
+### 4.46. Promote PostgreSQL AWS sau khi fence Azure
+
+Azure đã báo PowerState/deallocated qua instance view. AWS đã replay vượt target_lsn 0/5000798 và nhận writes_enabled false ở bước 4.44. Với nguồn writer cũ đã được fence, promote PostgreSQL AWS.
+
+Trên SSH AWS, chạy lệnh sau.
+
+```bash
+sudo k3s kubectl -n issues exec postgres-0 -- \
+  psql -X -v ON_ERROR_STOP=1 -U taskflow -d taskflow -P pager=off -c \
+  "SELECT pg_promote(true, 60) AS promoted;"
+```
+
+pg_promote yêu cầu PostgreSQL kết thúc recovery và chuyển thành primary. Đối số true yêu cầu chờ hoàn tất, 60 là số giây chờ tối đa. Kết quả promoted t xác nhận promotion hoàn tất trong thời gian chờ. Nếu hàm trả f hoặc lệnh có lỗi, đối chiếu trạng thái recovery và log trước khi mở ghi. [PostgreSQL recovery control functions](https://www.postgresql.org/docs/17/functions-admin.html#FUNCTIONS-RECOVERY-CONTROL).
+
+Sau đó dùng kết nối psql mới để kiểm tra vai trò cùng cờ ứng dụng.
+
+```bash
+sudo k3s kubectl -n issues exec postgres-0 -- \
+  psql -X -v ON_ERROR_STOP=1 -U taskflow -d taskflow -P pager=off -c \
+  "SELECT pg_is_in_recovery() AS in_recovery,
+          current_setting('transaction_read_only') AS read_only,
+          writes_enabled
+   FROM app_control
+   WHERE singleton = TRUE;"
+```
+
+Kết quả cần in_recovery f, read_only off và writes_enabled f. Hai cột đầu xác nhận PostgreSQL AWS đã là primary và kết nối có thể thực hiện transaction ghi. writes_enabled f tiếp tục giữ ứng dụng ở trạng thái tạm dừng ghi theo cờ đã replicate từ Azure. Theo database/role.py, writer health ở thời điểm này vẫn trả HTTP 503 vì cờ ứng dụng còn false.
+
+Checkpoint là AWS được promote thành primary trong khi cờ ghi ứng dụng tiếp tục false. Bước kế tiếp mở ghi trên AWS sau khi đối chiếu kết quả promotion và vai trò.
+
+### 4.47. Mở ghi ứng dụng trên primary AWS và kiểm tra writer health
+
+Truy vấn trên AWS sau promotion đã xác nhận in_recovery f, read_only off và writes_enabled f. Azure đã được xác nhận PowerState/deallocated ở bước 4.45. Mở cờ ghi trên primary AWS bằng cùng cơ chế advisory lock mà ứng dụng sử dụng.
+
+Trên SSH AWS, chạy toàn bộ khối lệnh sau.
+
+```bash
+sudo k3s kubectl -n issues exec postgres-0 -- \
+  psql -X -v ON_ERROR_STOP=1 -U taskflow -d taskflow -P pager=off \
+  -c "SET lock_timeout = '15s'; SET synchronous_commit = on;" \
+  -c "SELECT pg_advisory_lock(2900, 1);" \
+  -c "UPDATE app_control SET writes_enabled = TRUE WHERE singleton = TRUE RETURNING writes_enabled;" \
+  -c "SELECT pg_advisory_unlock(2900, 1) AS unlocked;"
+```
+
+Exclusive session lock phối hợp thay đổi cờ với shared transaction lock của các đường ghi ứng dụng trong database/control.py. UPDATE được commit trước khi câu lệnh unlock chạy. Kết quả cần writes_enabled t, UPDATE 1 và unlocked t. Khi lock được nhả, request ứng dụng đọc được cờ true và có thể ghi vào primary AWS. lock_timeout giới hạn thời gian chờ lock, ON_ERROR_STOP dừng các lệnh tiếp theo khi có lỗi SQL và synchronous_commit on yêu cầu flush WAL của commit trước khi báo thành công.
+
+Trong SSH AWS, kiểm tra writer health qua HTTPS origin.
+
+```bash
+curl -fsS --max-time 10 -w '\nHTTP %{http_code}\n' \
+  https://aws.mcf.todicode.tech/health/database
+```
+
+Kết quả cần HTTP 200, connected true, role primary, writable true và writes_paused false. database/role.py tính writable từ vai trò PostgreSQL, transaction_read_only và cờ writes_enabled. Kết quả này kiểm chứng ứng dụng AWS đã nhận trạng thái primary được phép ghi. Bước tiếp theo đối chiếu DNS, môi trường phục vụ hostname chung và một request ghi đọc qua API sau failback.
+
+### 4.48. Kiểm tra DNS và HTTPS hostname chung sau khi mở ghi AWS
+
+AWS đã trả writes_enabled t, UPDATE 1 và unlocked t. HTTPS writer health của origin AWS đã trả HTTP 200 với connected true, role primary, writable true, writes_paused false và current_lsn 0/5000B40. Tiếp tục nghiệm thu đường truy cập hostname chung từ laptop.
+
+Trên Git Bash laptop, kiểm tra CNAME qua resolver công cộng.
+
+```bash
+nslookup -type=CNAME app.mcf.todicode.tech 1.1.1.1
+```
+
+CNAME cần trỏ aws.mcf.todicode.tech. Truy vấn này đối chiếu câu trả lời DNS của resolver 1.1.1.1. Cấu hình failover.tf chọn AWS là PRIMARY và Azure là SECONDARY, với TTL 30 giây cho record chung.
+
+Kiểm tra môi trường phục vụ và writer health bằng hostname chung.
+
+```bash
+/c/Windows/System32/curl.exe -fsS --max-time 10 -w '\nHTTP %{http_code}\n' \
+  https://app.mcf.todicode.tech/version
+
+/c/Windows/System32/curl.exe -fsS --max-time 10 -w '\nHTTP %{http_code}\n' \
+  https://app.mcf.todicode.tech/health/database
+```
+
+Endpoint /version cần HTTP 200 với environment aws, region ap-southeast-1 và commit_sha c56fd3f30baee50fa779607dc0fb1a2133b53a9d tương ứng image đang chạy. Endpoint /health/database cần HTTP 200 với role primary, writable true và writes_paused false. curl sử dụng cơ chế phân giải tên của máy laptop, nên kết quả HTTP kiểm chứng cả đường truy cập thực tế cùng TLS của hostname chung, bổ sung cho phép kiểm tra DNS qua resolver công cộng.
+
+Nếu DNS hoặc HTTP chưa chuyển về kết quả mong đợi, đối chiếu lại sau khi health check và cache DNS được cập nhật. Khi cả hai origin đều bị đánh giá unhealthy, Route 53 vẫn có thể trả record PRIMARY AWS theo cơ chế đã giải thích ở bước 4.43, nên CNAME cần được đối chiếu cùng kết quả writer health.
+
+Checkpoint là hostname chung phục vụ ứng dụng AWS với writer health 200. Bước tiếp theo kiểm tra ghi và đọc qua API hostname chung sau failback, rồi chuẩn bị rejoin Azure để khôi phục standby.
+
+### 4.49. Ghi và đọc qua API hostname chung sau failback về AWS
+
+HTTPS hostname chung đã trả /version HTTP 200 với environment aws, region ap-southeast-1 và commit_sha c56fd3f30baee50fa779607dc0fb1a2133b53a9d tại 2026-11-14T15:45:55.047567+00:00. Writer health cùng hostname đã trả HTTP 200, role primary, writable true và writes_paused false. Tiếp tục tạo dữ liệu qua API để kiểm chứng đường ghi sau chuyển vai trò.
+
+Trên Git Bash laptop, tạo mã lượt thử và gửi POST.
+
+```bash
+MCF_FAILBACK_RUN_ID="stage7-failback-$(date -u +%Y%m%dT%H%M%SZ)"
+
+printf '{"run_id":"%s","seq":1}\n' "$MCF_FAILBACK_RUN_ID" |
+  /c/Windows/System32/curl.exe -fsS --max-time 10 \
+    -H 'Content-Type: application/json' \
+    --data-binary @- \
+    -w '\nHTTP %{http_code}\n' \
+    https://app.mcf.todicode.tech/api/ping
+```
+
+MCF_FAILBACK_RUN_ID giữ mã lượt thử trong terminal hiện tại. date -u dùng thời gian UTC để tạo hậu tố nhận diện. printf tạo JSON chứa run_id cùng seq 1, pipe truyền JSON vào stdin của curl và --data-binary @- gửi nội dung đó làm POST body. Header Content-Type khai báo JSON. Kết quả cần HTTP 200, run_id khớp biến vừa tạo, seq 1 và environment aws.
+
+Trong cùng terminal Git Bash, đọc lại bằng API.
+
+```bash
+/c/Windows/System32/curl.exe -fsS --max-time 10 -w '\nHTTP %{http_code}\n' \
+  "https://app.mcf.todicode.tech/api/ping/$MCF_FAILBACK_RUN_ID"
+```
+
+GET cần HTTP 200 với run_id khớp, count 1 và pings chứa seq 1, environment aws. POST kiểm chứng ứng dụng cho phép ghi trên writer AWS, còn GET kiểm chứng bản ghi có thể đọc lại qua hostname chung sau commit. Giữ run_id để đối chiếu trên Azure sau khi rebuild standby.
+
+Checkpoint là đường ứng dụng qua hostname chung đã ghi và đọc được trên AWS sau failback. Việc khôi phục topology hai cloud còn cần rejoin Azure thành standby từ dữ liệu primary AWS.
+
+### 4.50. Bật Azure và kiểm tra startup guard trước rejoin
+
+Hostname chung đã ghi và đọc thành công trên AWS với run_id stage7-failback-20261114T154715Z, seq 1, environment aws. POST cùng GET đều trả HTTP 200, GET có count 1. Giữ mã này để kiểm tra dữ liệu trên Azure sau khi rebuild standby.
+
+AWS hiện là primary phục vụ ứng dụng. Azure cần được xây dựng lại thành standby từ dữ liệu primary AWS. Trước tiên bật VM Azure và kiểm tra guard của boot mới đang chặn PostgreSQL cũ.
+
+Trên Git Bash laptop, bật đúng VM trong subscription project.
+
+```bash
+az vm start \
+  --subscription 52341a4a-a86f-4780-82dc-879b500022d8 \
+  --resource-group mcf-azure-rg \
+  --name mcf-azure-standby
+
+az vm get-instance-view \
+  --subscription 52341a4a-a86f-4780-82dc-879b500022d8 \
+  --resource-group mcf-azure-rg \
+  --name mcf-azure-standby \
+  --query "instanceView.statuses[?starts_with(code, 'PowerState/')].code | [0]" \
+  --output tsv
+```
+
+Sau khi power state là PowerState/running, kết nối SSH từ laptop.
+
+```bash
+ssh -i ~/.ssh/mcf-lab azureuser@4.145.30.250
+```
+
+Trong SSH Azure, kiểm tra marker, dịch vụ và socket PostgreSQL.
+
+```bash
+sudo test -f /run/issues-k3s-start-approved
+echo $?
+
+sudo systemctl status k3s --no-pager --full
+sudo ss -ltnp 'sport = :5432'
+```
+
+Phép test cần trả exit code 1 vì marker của boot trước đã mất. Dịch vụ K3s có thể hiện activating (auto-restart) hoặc failed do ExecStartPre kiểm tra marker thất bại. ss cần chỉ hiện tiêu đề bảng, thể hiện cổng 5432 chưa có listener. Startup guard kiểm soát thời điểm cho phép K3s khởi động, giúp chuẩn bị lại workload và PVC trước khi chạy database Azure.
+
+Checkpoint của bước này là host Azure đã bật, marker phê duyệt boot còn thiếu và PostgreSQL cũ tiếp tục dừng. Bước kế tiếp cài cấu hình agentless tạm thời trên Azure trước khi tạo marker phê duyệt, tương tự quy trình AWS ở bước 4.24 và 4.25.
+
+### 4.51. Khởi động control plane Azure ở chế độ agentless
+
+Azure sau khi bật lại đã xác nhận marker phê duyệt boot còn thiếu, ExecStartPre kiểm tra marker thất bại và cổng 5432 chưa có listener. Chuẩn bị control plane agentless để cập nhật trạng thái workload trước khi khôi phục khả năng chạy Pod.
+
+Sử dụng lại file deploy/k3s/rejoin-control-plane.yaml đã chuẩn bị cho AWS ở bước 4.24, với nội dung disable-agent: true. Trên Git Bash laptop, chuyển file lên Azure.
+
+```bash
+scp -i ~/.ssh/mcf-lab \
+  deploy/k3s/rejoin-control-plane.yaml \
+  azureuser@4.145.30.250:/home/azureuser/rejoin-control-plane.yaml
+```
+
+Trong SSH Azure, dừng vòng khởi động lại K3s và cài cấu hình tạm.
+
+```bash
+sudo systemctl stop k3s &&
+sudo install -d -m 700 -o root -g root /etc/rancher/k3s/config.yaml.d &&
+sudo install -m 600 -o root -g root \
+  /home/azureuser/rejoin-control-plane.yaml \
+  /etc/rancher/k3s/config.yaml.d/99-rejoin.yaml
+
+sudo cat /etc/rancher/k3s/config.yaml.d/99-rejoin.yaml
+```
+
+Nội dung cần là disable-agent: true. install tạo thư mục và sao chép file với quyền sở hữu root cùng permission chỉ định. Dấu && yêu cầu thao tác trước thành công để thực hiện thao tác tiếp theo. K3s đọc drop-in này khi khởi động.
+
+Sau khi xác nhận nội dung cấu hình, tạo marker phê duyệt boot hiện tại và khởi động K3s.
+
+```bash
+sudo touch /run/issues-k3s-start-approved &&
+sudo systemctl reset-failed k3s &&
+sudo systemctl start k3s
+```
+
+Marker cho phép vượt qua kiểm tra ExecStartPre. disable-agent true khiến server chạy control plane với kubelet, containerd và CNI của agent được tắt. Chế độ agentless được K3s đánh dấu experimental và được dùng tạm trong quy trình rejoin này. [K3s agentless servers](https://docs.k3s.io/advanced#running-agentless-servers-experimental).
+
+Kiểm tra API server và socket PostgreSQL.
+
+```bash
+sudo k3s kubectl get --raw=/readyz
+sudo ss -ltnp 'sport = :5432'
+```
+
+API cần trả ok, socket 5432 tiếp tục chỉ có tiêu đề bảng. Nếu API đang khởi tạo, kiểm tra lại readyz sau khi chờ vài giây. Các Pod object từ boot trước có thể còn lưu trong API với trạng thái cũ. Bước tiếp theo đặt desired replicas của PostgreSQL và ứng dụng Azure về 0 để chuẩn bị PVC và clone mới.
+
+### 4.52. Đặt workload Azure về 0 trong chế độ agentless
+
+Thực hiện khi API Azure ở bước 4.51 đã trả readyz ok và cổng 5432 chưa có listener. Đặt desired replicas của StatefulSet PostgreSQL và Deployment ứng dụng về 0 để chuẩn bị thay đổi PVC trước khi khôi phục agent.
+
+Trong SSH Azure, chạy lần lượt hai lệnh scale.
+
+```bash
+sudo k3s kubectl -n issues scale statefulset/postgres --replicas=0
+sudo k3s kubectl -n issues scale deployment/issues-app --replicas=0
+```
+
+scale cập nhật spec.replicas của resource đang lưu trong API. StatefulSet quản lý database và Deployment quản lý ứng dụng web. Giá trị 0 yêu cầu controller duy trì số Pod của hai workload bằng 0. Các manifest trên laptop được cập nhật hoặc apply lại theo trạng thái phù hợp trong các bước tiếp theo.
+
+Kiểm tra desired state cùng các Pod object hiện tại.
+
+```bash
+sudo k3s kubectl -n issues get statefulset/postgres deployment/issues-app \
+  -o 'custom-columns=KIND:.kind,NAME:.metadata.name,DESIRED:.spec.replicas'
+
+sudo k3s kubectl -n issues get pods -o wide
+```
+
+Cả postgres và issues-app cần DESIRED 0. Pod object cũ có thể tiếp tục hiện Terminating vì kubelet đang tắt. Danh sách này được dùng để đối chiếu trước bước xử lý object cũ và bật lại agent.
+
+Checkpoint của bước này là desired replicas của hai workload Azure bằng 0 và đã ghi nhận danh sách Pod object còn lưu trong API. Bước tiếp theo chuẩn bị PVC mới dành cho bản clone từ AWS.
+
+### 4.53. Tạo PVC mới cho Azure rejoin
+
+Azure đã xác nhận StatefulSet postgres và Deployment issues-app đều DESIRED 0. Pod postgres-0 và issues-app-f8fb495f5-lf458 đang Terminating. Chuẩn bị PVC riêng cho dữ liệu clone từ primary AWS trước khi xử lý Pod object cũ và khôi phục agent.
+
+Trên laptop, tạo file deploy/kubernetes/database/postgres-pvc-rejoin-azure.yaml với nội dung sau.
+
+```yaml
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: postgres-data-rejoin-azure-01
+  namespace: issues
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: local-path-retain
+  resources:
+    requests:
+      storage: 5Gi
+```
+
+PVC này dành cho lượt rebuild Azure đầu tiên, với tên riêng để Job clone cùng StatefulSet tham chiếu ở các bước tiếp theo. ReadWriteOnce cho phép volume được mount đọc ghi trên một node. StorageClass local-path-retain đã được chuẩn bị với reclaimPolicy Retain và volumeBindingMode WaitForFirstConsumer. Request 5Gi khai báo nhu cầu lưu trữ, còn dung lượng thực tế của local-path vẫn phụ thuộc filesystem trên host.
+
+Trên Git Bash laptop, chuyển manifest lên Azure.
+
+```bash
+scp -i ~/.ssh/mcf-lab \
+  deploy/kubernetes/database/postgres-pvc-rejoin-azure.yaml \
+  azureuser@4.145.30.250:/home/azureuser/postgres-pvc-rejoin-azure.yaml
+```
+
+Trong SSH Azure, apply rồi kiểm tra PVC cùng dung lượng host.
+
+```bash
+sudo k3s kubectl apply -f /home/azureuser/postgres-pvc-rejoin-azure.yaml
+
+sudo k3s kubectl -n issues get pvc postgres-data postgres-data-rejoin-azure-01
+
+sudo df -h /var/lib/rancher/k3s/storage
+sudo du -sh /var/lib/rancher/k3s/storage
+```
+
+PVC cũ postgres-data cần tiếp tục Bound. PVC mới dự kiến Pending do WaitForFirstConsumer, chờ Pod clone được lên lịch sau khi agent khôi phục. df hiển thị dung lượng trống filesystem, du cho biết dữ liệu local-path hiện chiếm bao nhiêu trên host. Hai kết quả được dùng để đối chiếu khả năng giữ bản cũ cùng bản clone mới trên OS disk Azure.
+
+Checkpoint là PVC mới đã được tạo và đã đối chiếu dung lượng trống cho bản clone. Bước tiếp theo chuẩn bị Job clone AWS sang PVC Azure mới cùng cấu hình StatefulSet Azure dùng bản clone này.
+
 ## 5. Theo dõi tiến độ
 
 - [x] Nghiệm thu giai đoạn 6 và xác định phạm vi giai đoạn 7.
@@ -1087,8 +1909,36 @@ Mong đợi ConfigMap postgres-clone-script tồn tại với DATA 1, tương �
 - [x] Apply PVC mới trên AWS và đối chiếu PVC cũ cùng dung lượng filesystem.
 - [x] Đối chiếu dung lượng filesystem AWS cho lượt clone mới.
 - [x] Tạo Secret replication trên AWS từ credential hiện có và đối chiếu metadata.
-- [ ] Chuẩn bị script clone dùng chung với tên kết nối theo cloud và apply ConfigMap trên AWS.
-- [ ] Rejoin AWS thành standby.
+- [x] Chuẩn bị script clone dùng chung với tên kết nối theo cloud và apply ConfigMap trên AWS.
+- [x] Chuẩn bị manifest Job clone AWS rejoin từ Azure vào PVC mới.
+- [x] Chuẩn bị StatefulSet AWS replicas 0, PVC mới và kiểm tra clone hoàn tất.
+- [ ] Apply StatefulSet AWS và đối chiếu desired replicas, PVC cùng Pod object cũ.
+- [x] Đối chiếu StatefulSet tham chiếu PVC rejoin và hai Pod object cũ đang Terminating.
+- [ ] Xóa Pod object cũ sau khi xác nhận desired replicas 0 và PostgreSQL đã dừng.
+- [x] Đối chiếu hai Pod object cũ đã biến mất khỏi namespace issues.
+- [x] Khôi phục agent AWS, kiểm tra node Ready và PostgreSQL tiếp tục dừng trước clone.
+- [x] Chạy Job clone từ Azure sang PVC rejoin AWS và đối chiếu log, Job, PVC.
+- [x] Khởi động PostgreSQL AWS từ PVC rejoin và đối chiếu vai trò cùng WAL receiver.
+- [x] Đối chiếu sender Azure của kết nối AWS standby.
+- [x] Đọc bản ghi sau failover trên AWS đã rejoin.
+- [x] Tạo transaction mới trên Azure sau khi AWS rejoin.
+- [x] Tạo và đọc lại transaction mới từ Azure sang AWS sau rejoin.
+- [x] Khôi phục ứng dụng AWS và đối chiếu readiness cùng writer health của standby.
+- [x] Kiểm chứng database, dữ liệu mới và ứng dụng AWS hoạt động ở vai trò standby sau rejoin.
+- [x] Đối chiếu primary Azure và WAL sender tới AWS trước failback.
+- [x] Rejoin AWS thành standby.
+- [x] Tạm dừng ghi Azure bằng write barrier và lấy mốc WAL sau commit.
+- [x] Xác nhận AWS standby đã replay tới mốc dừng ghi và nhận writes_enabled false.
+- [x] Deallocate VM Azure và xác nhận power state để fence writer cũ trước failback.
+- [x] Đối chiếu AWS sau promotion là primary với cờ ghi ứng dụng còn false.
+- [x] Mở ghi ứng dụng AWS và xác nhận writer health HTTP 200.
+- [ ] Đối chiếu DNS và HTTPS hostname chung phục vụ primary AWS sau failback.
+- [x] Đối chiếu HTTPS hostname chung trả version AWS và writer health HTTP 200 sau failback.
+- [x] Ghi và đọc lại dữ liệu qua API hostname chung trên primary AWS sau failback.
+- [x] Bật Azure và kiểm chứng startup guard chặn database cũ trước rejoin.
+- [ ] Khởi động control plane Azure agentless và xác nhận PostgreSQL cũ tiếp tục dừng.
+- [x] Đặt desired replicas PostgreSQL và ứng dụng Azure về 0 trước rejoin.
+- [ ] Tạo PVC Azure rejoin và đối chiếu PVC cũ cùng dung lượng filesystem.
 - [ ] Failback và khôi phục topology AWS primary, Azure standby.
 
 ## 6. Tài liệu kỹ thuật

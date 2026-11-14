@@ -20,6 +20,14 @@ spec:
       containers:
         - name: postgres
           image: postgres:17-bookworm@sha256:665dc7b37ac52a17e298511414c21d23ffa4e6a6ef6225b3e5d59c7afb35e994
+          command:
+            - bash
+            - -ec
+            - |
+              test -f /var/lib/postgresql/data/.clone-complete
+              test "$(cat "$PGDATA/PG_VERSION")" = 17
+              exec docker-entrypoint.sh "$@"
+            - --
           args: ["postgres", "-c", "config_file=/etc/postgresql/postgresql.conf"]
           envFrom:
             - secretRef:
@@ -54,7 +62,7 @@ spec:
       volumes:
         - name: data
           persistentVolumeClaim:
-            claimName: postgres-data
+            claimName: postgres-data-rejoin-aws-01
         - name: config
           configMap:
             name: postgres-config
