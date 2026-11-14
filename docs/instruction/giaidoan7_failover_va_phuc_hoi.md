@@ -2991,7 +2991,7 @@ Trình duyệt hỏi DNS để tìm origin, sau đó kết nối HTTPS trực ti
 
 ### 7.2. Toàn bộ vòng chuyển đổi
 
-![Toàn bộ vòng chuyển đổi AWS và Azure](images/giaidoan7_toan_bo_vong_chuyen_doi.png)
+![Toàn bộ vòng chuyển đổi AWS và Azure](../../images/failover/giaidoan7_toan_bo_vong_chuyen_doi.png)
 
 | Thời điểm | AWS | Azure | Nơi nhận ghi ứng dụng |
 |---|---|---|---|
@@ -3018,7 +3018,7 @@ Lượt gây sự cố dùng thao tác dừng EC2 có kiểm soát. Các phép �
 
 ### 7.4. Vì sao rejoin có nhiều lệnh K3s và PVC
 
-![Quy trình rejoin một host cũ thành standby](images/giaidoan7_quy_trinh_rejoin.png)
+![Quy trình rejoin một host cũ thành standby](../../images/failover/giaidoan7_quy_trinh_rejoin.png)
 
 Sau khi Azure nhận ghi, dữ liệu authoritative của lượt vận hành nằm trên Azure. AWS cũ còn disk và dữ liệu từ lúc trước khi dừng. Quy trình đã chọn tạo bản clone vật lý mới từ Azure và khởi động AWS thành standby của Azure.
 
@@ -3055,7 +3055,7 @@ PVC mới trong StorageClass local-path-retain sử dụng thư mục trên OS d
 
 ### 7.5. Liên kết các lệnh failback Azure về AWS
 
-![Failback, write barrier và các trạng thái cờ ghi](images/giaidoan7_failback_va_co_ghi.png)
+![Failback, write barrier và các trạng thái cờ ghi](../../images/failover/giaidoan7_failback_va_co_ghi.png)
 
 Khi bắt đầu failback, Azure đang primary và AWS đã là standby streaming. Lượt chuyển có kế hoạch này dùng cờ ứng dụng và mốc WAL để chờ AWS nhận đủ các transaction ứng dụng đã được chấp nhận trước khi dừng ghi.
 
@@ -3108,4 +3108,4 @@ Trong lượt giai đoạn 7 đã thực hành, người vận hành gửi lện
 
 Cloud watcher dự kiến chạy trên host Azure để thực hiện các bước điều khiển failover khi phát hiện AWS lỗi. Luồng cần triển khai là phát hiện lỗi theo ngưỡng, kiểm tra standby, xác nhận fencing AWS, promote Azure và kiểm tra writer. Khi Azure sẵn sàng nhận ghi, writer health hỗ trợ Route 53 chọn Azure. Controller cloud tiếp tục được xây dựng theo từng phần sau khi người vận hành đã hiểu vòng thủ công.
 
-Ba hình là sơ đồ giải thích được tạo bằng ImageGen từ trạng thái và cấu hình của lượt thực hành. Hình tổng quan rút gọn lớp Ingress, Service và Pod để tập trung vào sự thay đổi vai trò giữa hai cloud. Bộ prompt tạo hình và chỉnh sửa được lưu cùng ảnh. [Image generation prompts](images/giaidoan7_image_prompts.txt).
+Ba hình là sơ đồ giải thích được tạo bằng ImageGen từ trạng thái và cấu hình của lượt thực hành. Hình tổng quan rút gọn lớp Ingress, Service và Pod để tập trung vào sự thay đổi vai trò giữa hai cloud.
