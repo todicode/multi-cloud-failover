@@ -2551,6 +2551,318 @@ Cú pháp heredoc truyền đoạn Python giữa hai dòng PY vào stdin của i
 
 Checkpoint là phân loại được writer, paused, standby, unavailable và unknown theo dữ liệu hiện có. Unavailable là quan sát đầu vào để tiếp tục xác minh. Quyết định chuyển vai trò cần được xây dựng với ngưỡng lỗi, nguồn quan sát Route 53 và điều kiện fencing.
 
+### 4.73. Tạo access key cho danh tính watcher
+
+User mcf-azure-watcher đã được đối chiếu trong account 925271162060. Terraform state đã có cả user và inline policy watcher_observe. Chuẩn bị credential để CLI và chương trình watcher có thể xác thực bằng danh tính này.
+
+Trên AWS Console, dùng tài khoản người vận hành của project và mở IAM. Chọn Users, chọn mcf-azure-watcher, rồi mở tab Security credentials. Trong Access keys, chọn Create access key. Xem thông tin use case, chọn Other và Next. Đặt description mcf-watcher-lab rồi chọn Create access key.
+
+Lưu Access key ID cùng Secret access key vào nơi lưu credential cá nhân ngoài repository. AWS hiển thị secret tại lượt tạo key, vì vậy cần lưu trước khi rời trang. Giữ kín hai giá trị, đặc biệt Secret access key. [Quản lý access key của IAM user](https://docs.aws.amazon.com/IAM/latest/UserGuide/access-keys-admin-managed.html).
+
+Access key ID xác định key được sử dụng. Secret access key được CLI hoặc SDK dùng để ký request. AWS xác thực request rồi đánh giá quyền của IAM user, trong đó có policy quan sát đã gắn. Vì vậy credential và policy cùng tham gia luồng truy cập API.
+
+Trong project, profile mcf-watcher sẽ là tên bộ cấu hình mà CLI hoặc SDK chọn để dùng credential này. Giá trị aws_profile trong config.json giúp chương trình chọn đúng profile khi bổ sung lời gọi AWS API. Watcher dự kiến chạy trên host Azure và gọi API AWS qua HTTPS.
+
+Checkpoint hiện tại là access key đã được tạo cho đúng user và credential được lưu riêng. Bước tiếp theo cấu hình profile mcf-watcher trên laptop rồi kiểm chứng danh tính và quyền quan sát.
+
+### 4.74. Cấu hình profile watcher trên laptop và xác nhận danh tính
+
+Người vận hành đã tạo access key cho mcf-azure-watcher. Trên Git Bash laptop, chạy lệnh cấu hình profile có tên trùng với aws_profile trong deploy/watcher/config.json.
+
+```bash
+aws configure --profile mcf-watcher
+```
+
+Nhập Access key ID và Secret access key vừa tạo khi CLI hỏi. Đặt Default region name thành ap-southeast-1 và Default output format thành json.
+
+--profile mcf-watcher chọn bộ cấu hình được ghi. Profile là tên cấu hình trên máy đang chạy CLI. IAM user là danh tính trên AWS mà credential thuộc về. AWS CLI mặc định lưu credential trong ~/.aws/credentials, còn region cùng output format trong ~/.aws/config. Trên Windows, các file này nằm trong thư mục .aws thuộc thư mục người dùng. Giữ credential ngoài repository. [AWS CLI configuration files and named profiles](https://docs.aws.amazon.com/cli/latest/userguide/cli-configure-files.html).
+
+Xác nhận danh tính bằng profile vừa cấu hình.
+
+```bash
+aws sts get-caller-identity \
+  --profile mcf-watcher \
+  --query '{Account:Account,Arn:Arn}' \
+  --output json \
+  --no-cli-pager
+```
+
+Kết quả mong đợi là
+
+```json
+{
+  "Account": "925271162060",
+  "Arn": "arn:aws:iam::925271162060:user/mcf-azure-watcher"
+}
+```
+
+sts get-caller-identity trả danh tính được dùng để gọi API. --query chọn hai trường để đối chiếu account và user. --output json định dạng kết quả, còn --no-cli-pager hiển thị trực tiếp tại terminal. Lệnh này xác nhận credential đang xác thực đúng danh tính. Quyền DescribeInstances và GetHealthCheckStatus được kiểm chứng bằng các lời gọi tương ứng ở bước tiếp theo. [AWS CLI get-caller-identity](https://docs.aws.amazon.com/cli/latest/reference/sts/get-caller-identity.html).
+
+Checkpoint là profile mcf-watcher trên laptop trả đúng account và ARN của watcher. Khi chuyển chương trình sang VM Azure, profile được cấu hình trong môi trường của tài khoản chạy dịch vụ tại đó.
+
+### 4.75. Kiểm chứng quyền quan sát EC2 và Route 53
+
+Sau khi profile mcf-watcher trả đúng account cùng ARN qua STS, dùng profile này để gọi hai API quan sát đã cấp trong policy.
+
+Trên Git Bash laptop, đọc trạng thái EC2 được cấu hình cho watcher.
+
+```bash
+aws ec2 describe-instances \
+  --profile mcf-watcher \
+  --region ap-southeast-1 \
+  --instance-ids i-014ee6f4d204aacb7 \
+  --query 'Reservations[].Instances[].{InstanceId:InstanceId,State:State.Name}' \
+  --output table \
+  --no-cli-pager
+```
+
+--profile chọn credential watcher, --region chọn region EC2 và --instance-ids xác định máy của project. --query đi qua cấu trúc Reservations và Instances để lấy ID cùng State.Name. Kết quả cần chứa đúng instance ID và trạng thái hiện tại. Trong phiên thực hành đang bật máy, trạng thái dự kiến là running. [AWS CLI describe-instances](https://docs.aws.amazon.com/cli/latest/reference/ec2/describe-instances.html).
+
+EC2 state cung cấp thông tin từ control plane AWS. Trong luồng fencing sẽ xây dựng, controller dùng API này để chờ trạng thái stopped sau khi yêu cầu dừng EC2. EC2 running phản ánh trạng thái máy theo AWS, còn writer health phản ánh khả năng phục vụ ghi của ứng dụng.
+
+Tiếp tục đọc quan sát của health check writer AWS.
+
+```bash
+aws route53 get-health-check-status \
+  --profile mcf-watcher \
+  --health-check-id 45a1d674-1355-5102-09ff-69e75ef12793 \
+  --query 'HealthCheckObservations[].{Region:Region,Status:StatusReport.Status}' \
+  --output table \
+  --no-cli-pager
+```
+
+--health-check-id chọn đúng health check được cấp quyền trong policy và được ghi trong deploy/watcher/config.json. Mỗi dòng kết quả là quan sát từ một health checker Route 53. Region là region của checker. Status là nội dung báo cáo của checker đó. Health check này kiểm tra origin AWS qua HTTPS tại /health/database. Khi origin phục vụ writer bình thường, báo cáo dự kiến có thông tin HTTP 200 thành công. [AWS CLI get-health-check-status](https://docs.aws.amazon.com/cli/latest/reference/route53/get-health-check-status.html).
+
+Hai lời gọi thành công với dữ liệu resource tương ứng xác nhận quyền quan sát bằng profile watcher. Nội dung trạng thái cho biết tình hình resource tại thời điểm quan sát. Nếu nhận AccessDenied hoặc UnauthorizedOperation, đối chiếu profile và policy đã apply trước khi tiếp tục.
+
+Checkpoint là đã đối chiếu output EC2 cùng các quan sát health check. Bước tiếp theo đưa lời gọi API quan sát vào chương trình Python theo từng phần.
+
+Kết quả người vận hành đã kiểm chứng bằng profile mcf-watcher là EC2 i-014ee6f4d204aacb7 có State running. Lời gọi Route 53 trả 16 quan sát từ 8 region, tất cả có Status Success: HTTP Status Code 200, OK. Các dòng cùng Region thuộc các health checker báo cáo từ region đó. Hai API đã trả dữ liệu thành công bằng credential watcher. Bản ghi này xác nhận quyền quan sát và kết quả tại lượt kiểm tra.
+
+### 4.76. Chuẩn bị thư viện Python cho cloud watcher
+
+Hai API quan sát đã được kiểm chứng qua CLI. Để gọi API AWS từ cloud_watcher.py, bổ sung Boto3, bộ SDK Python do AWS duy trì. SDK phụ trách tạo request, ký bằng credential và giải mã response thành dữ liệu Python. [Boto3 quickstart](https://docs.aws.amazon.com/boto3/latest/guide/quickstart.html).
+
+Watcher dự kiến là tiến trình chạy trên host Azure. Ghi dependency của tiến trình này trong deploy/watcher/requirements.txt để tái tạo môi trường chạy khi chuyển từ laptop lên host.
+
+Trên laptop, tạo deploy/watcher/requirements.txt và điền hai dòng sau.
+
+```text
+boto3==1.44.3
+httpx==0.28.1
+```
+
+Boto3 phục vụ lời gọi API AWS. HTTPX phục vụ các HTTP probe đã có trong watcher. Phiên bản Boto3 1.44.3 đã được đối chiếu trên PyPI. Cú pháp == cố định phiên bản của từng thư viện trực tiếp, giúp các lượt cài đặt dùng cùng phiên bản đã chọn. [Boto3 1.44.3](https://pypi.org/project/boto3/1.44.3/).
+
+Trên Git Bash laptop tại repository, cài bằng Python của virtual environment hiện có.
+
+```bash
+.venv/Scripts/python.exe -m pip install -r deploy/watcher/requirements.txt
+```
+
+-m pip chạy pip thuộc interpreter đã chỉ định. -r yêu cầu pip đọc danh sách thư viện từ file. Pip xử lý các dependency đi kèm, trong đó có Botocore được Boto3 sử dụng.
+
+Kiểm tra phiên bản thư viện được Python import.
+
+```bash
+.venv/Scripts/python.exe -c "import boto3; print(boto3.__version__)"
+```
+
+Kết quả mong đợi là 1.44.3. -c chạy đoạn Python truyền trong đối số. import boto3 nạp thư viện và __version__ cho biết phiên bản đã cài. Checkpoint là môi trường Python của project import được Boto3 theo phiên bản đã khai báo. Bước tiếp theo tạo Session chọn profile mcf-watcher từ cấu hình rồi thêm API quan sát vào script.
+
+### 4.77. Tạo Boto3 Session và kiểm chứng danh tính trong Python
+
+Sau khi cài dependency watcher, bổ sung Session chọn profile và region từ config.json. Gọi STS GetCallerIdentity từ Python để đối chiếu credential mà chương trình sẽ sử dụng cho các API tiếp theo.
+
+Trong scripts/cloud/cloud_watcher.py, thêm import cùng các import thư viện hiện có.
+
+```python
+import boto3
+```
+
+Đối chiếu load_config theo đoạn dưới để hàm hoàn tất việc đọc và kiểm tra cấu hình trước khi khởi tạo AWS Session.
+
+```python
+def load_config():
+    config = json.loads(CONFIG_PATH.read_text(encoding="utf-8-sig"))
+    if not isinstance(config, dict):
+        raise ValueError("Watcher config must be a JSON object.")
+    if type(config.get("enable_auto_failover")) is not bool:
+        raise ValueError("enable_auto_failover must be true or false.")
+    return config
+```
+
+Trong main, đặt đoạn tạo Session ngay sau config = load_config(). Phần đầu hàm main, đến trước dòng mode hiện có, cần là
+
+```python
+def main():
+    config = load_config()
+    session = boto3.Session(
+        profile_name=config["aws_profile"],
+        region_name=config["aws_region"],
+    )
+    identity = session.client("sts").get_caller_identity()
+    print(f"aws_identity={identity['Arn']}")
+```
+
+session là biến local của hàm tạo ra nó. Đặt session trong main cho phép các EC2 client và Route 53 client ở các bước sau trong main sử dụng cùng cấu hình AWS. load_config trả config đã được kiểm tra cho main. Sau đó main khởi tạo Session, kiểm chứng danh tính và điều phối các probe.
+
+boto3.Session giữ cấu hình dùng để tạo các service client. profile_name nhận mcf-watcher từ JSON. region_name nhận ap-southeast-1. Với profile đã cấu hình bằng aws configure, SDK tìm credential trong các file AWS của tài khoản đang chạy chương trình. [Boto3 Session](https://docs.aws.amazon.com/boto3/latest/guide/session.html), [Boto3 credentials](https://docs.aws.amazon.com/boto3/latest/guide/credentials.html).
+
+session.client("sts") tạo client của dịch vụ STS. get_caller_identity gửi request AWS để xác nhận danh tính và trả dict Python. identity["Arn"] lấy ARN từ response, rồi print hiển thị giá trị đó. Tạo Session chọn cấu hình, còn request STS kiểm chứng việc xác thực thực tế. [STS GetCallerIdentity trong Boto3](https://docs.aws.amazon.com/boto3/latest/reference/services/sts/client/get_caller_identity.html).
+
+Giữ phần mode và HTTP probe phía sau trong main. Trên Git Bash laptop, chạy lại script.
+
+```bash
+.venv/Scripts/python.exe scripts/cloud/cloud_watcher.py
+```
+
+Đầu ra cần có dòng sau trước các dòng mode và probe hiện có.
+
+```text
+aws_identity=arn:aws:iam::925271162060:user/mcf-azure-watcher
+```
+
+Với topology AWS primary, Azure standby đang hoạt động, các dòng probe dự kiến tiếp tục có aws state=writer và azure state=standby. Checkpoint là chương trình Python xác thực bằng đúng IAM user watcher. Bước tiếp theo tạo EC2 client từ cùng Session và đọc state của instance đã cấu hình.
+
+### 4.78. Đọc EC2 state từ Python
+
+Session được khởi tạo trong main để các service client dùng chung profile cùng region. Tiếp tục dùng Session này tạo EC2 client và đọc trạng thái instance được chọn trong config.json.
+
+Trong scripts/cloud/cloud_watcher.py, trong main, ngay sau dòng print aws_identity và trước dòng gán mode, thêm đoạn sau.
+
+```python
+    ec2 = session.client("ec2")
+    ec2_response = ec2.describe_instances(
+        InstanceIds=[config["aws_instance_id"]],
+    )
+    instance = ec2_response["Reservations"][0]["Instances"][0]
+    instance_state = instance["State"]["Name"]
+    print(f"aws_ec2_state={instance_state}")
+```
+
+session.client("ec2") tạo client EC2 theo cấu hình Session. describe_instances gọi API DescribeInstances. InstanceIds là tên tham số của SDK, nhận list chứa instance ID từ cấu hình. Lượt hiện tại chọn i-014ee6f4d204aacb7. [Boto3 EC2 describe_instances](https://docs.aws.amazon.com/boto3/latest/reference/services/ec2/client/describe_instances.html).
+
+ec2_response là dict Python chứa response AWS. Reservations là list các nhóm instance được trả về. [0] đầu tiên chọn nhóm đầu tiên. Instances bên trong là list instance của nhóm, và [0] tiếp theo chọn instance đầu tiên. Trong lượt kiểm tra này, request chọn một instance cụ thể.
+
+Ví dụ response rút gọn cho trạng thái đang chạy có dạng sau.
+
+```json
+{
+  "Reservations": [
+    {
+      "Instances": [
+        {
+          "InstanceId": "i-014ee6f4d204aacb7",
+          "State": {"Name": "running"}
+        }
+      ]
+    }
+  ]
+}
+```
+
+instance["State"]["Name"] lấy chuỗi trạng thái, ví dụ running, stopping hoặc stopped. EC2 state sẽ được dùng trong bước điều khiển fencing để xác nhận AWS đã dừng trước khi chuyển writer. Dữ liệu này bổ sung cho kết quả HTTP probe đang quan sát ứng dụng.
+
+Chạy trên Git Bash laptop.
+
+```bash
+.venv/Scripts/python.exe scripts/cloud/cloud_watcher.py
+```
+
+Khi EC2 đang chạy, đầu ra cần có dòng aws_ec2_state=running. Đối chiếu giá trị với kết quả CLI DescribeInstances của cùng instance. Checkpoint là Python đọc được EC2 state bằng profile watcher. Bước tiếp theo đọc các quan sát Route 53 từ cùng Session.
+
+### 4.79. Đọc các quan sát health check Route 53 từ Python
+
+Sau khi đọc EC2 state, bổ sung Route 53 client để lấy các báo cáo health check bằng cùng Session. Health check ID lấy từ cấu hình watcher và trùng với resource đã cấp quyền GetHealthCheckStatus.
+
+Trong scripts/cloud/cloud_watcher.py, trong main, ngay sau dòng print aws_ec2_state và trước dòng gán mode, thêm đoạn sau.
+
+```python
+    route53 = session.client("route53")
+    health_response = route53.get_health_check_status(
+        HealthCheckId=config["aws_health_check_id"],
+    )
+    observations = health_response["HealthCheckObservations"]
+    for observation in observations:
+        region = observation["Region"]
+        status = observation["StatusReport"]["Status"]
+        print(f"route53 region={region} status={status}")
+```
+
+session.client("route53") tạo client Route 53. get_health_check_status gọi API đã kiểm chứng bằng CLI. HealthCheckId là tên tham số của SDK, nhận chuỗi ID từ config.json. HealthCheckObservations trong response là list các quan sát của checker. Mỗi quan sát có Region và StatusReport, trong đó Status chứa nội dung báo cáo. [Boto3 Route 53 get_health_check_status](https://docs.aws.amazon.com/boto3/latest/reference/services/route53/client/get_health_check_status.html).
+
+Vòng for duyệt các quan sát để hiển thị region cùng status của từng checker. Biến region tại đây mô tả region của checker. Nó lấy từ response Route 53 và được dùng trong dòng log. Giá trị này giúp đọc các nguồn kiểm tra đã tạo ra báo cáo.
+
+Chạy trên Git Bash laptop.
+
+```bash
+.venv/Scripts/python.exe scripts/cloud/cloud_watcher.py
+```
+
+Với AWS writer đang hoạt động, ví dụ một dòng đầu ra là
+
+```text
+route53 region=us-east-1 status=Success: HTTP Status Code 200, OK
+```
+
+Số dòng cùng thứ tự region phụ thuộc các quan sát được API trả về. Trong lượt CLI đã nghiệm thu trước đó, có 16 báo cáo từ 8 region. Đối chiếu nội dung với lượt đọc CLI của cùng health check. API cung cấp các báo cáo quan sát phục vụ kiểm chứng. Bước tổng hợp trạng thái sẽ cần xét nội dung, độ mới của báo cáo cùng dữ liệu HTTP probe.
+
+Checkpoint là chương trình đọc được EC2 state, báo cáo Route 53 và HTTP probe hai origin bằng các cấu hình đã chuẩn bị. Các bước tiếp theo xây dựng xử lý lỗi và phân loại dữ liệu quan sát để phục vụ quyết định watcher.
+
+### 4.80. Giới hạn timeout và retry của AWS client
+
+Các lời gọi AWS hiện chạy tuần tự trước HTTP probe. Cấu hình timeout và số lần thử giúp kiểm soát thời gian chờ API khi xây dựng vòng quan sát. Project chọn connect timeout 5 giây, read timeout 5 giây và tối đa 2 lần gửi cho một lời gọi có lỗi được SDK cho phép retry.
+
+Trong scripts/cloud/cloud_watcher.py, thêm import sau cùng các import đầu file.
+
+```python
+from botocore.config import Config
+```
+
+Trong main, ngay sau config = load_config() và trước đoạn tạo Session, thêm cấu hình sau.
+
+```python
+    aws_client_config = Config(
+        connect_timeout=5,
+        read_timeout=5,
+        retries={"mode": "standard", "total_max_attempts": 2},
+    )
+```
+
+Config là đối tượng thiết lập hành vi của SDK client. connect_timeout giới hạn thời gian chờ thiết lập kết nối. read_timeout giới hạn thời gian chờ đọc dữ liệu từ kết nối. mode standard dùng bộ quy tắc retry chuẩn của SDK. total_max_attempts tính cả lần gửi đầu tiên, nên giá trị 2 cho phép tối đa một lần retry. [Botocore Config](https://docs.aws.amazon.com/botocore/latest/reference/config.html).
+
+Sửa dòng gọi STS hiện có thành hai dòng sau, tại vị trí đang kiểm chứng danh tính.
+
+```python
+    sts = session.client("sts", config=aws_client_config)
+    identity = sts.get_caller_identity()
+```
+
+Sửa dòng tạo EC2 client thành
+
+```python
+    ec2 = session.client("ec2", config=aws_client_config)
+```
+
+Sửa dòng tạo Route 53 client thành
+
+```python
+    route53 = session.client("route53", config=aws_client_config)
+```
+
+Ba client nhận cùng aws_client_config. Session tiếp tục cung cấp profile cùng region để khởi tạo client. Tham số config ở session.client nhận đối tượng Config của SDK, còn biến config đọc từ JSON chứa các giá trị của project.
+
+Ví dụ lỗi mạng được SDK đánh giá có thể retry sẽ đi qua lần gửi đầu, khoảng chờ backoff rồi lần thử tiếp theo. Khi vẫn thất bại và đã hết lượt thử, SDK phát sinh exception cho chương trình xử lý. Thời gian toàn bộ lời gọi bao gồm các pha kết nối, đọc và backoff của những lần thử. failure_threshold trong JSON sẽ được dùng để đếm các vòng quan sát khi xây dựng logic watcher.
+
+Chạy lại trên Git Bash laptop.
+
+```bash
+.venv/Scripts/python.exe scripts/cloud/cloud_watcher.py
+```
+
+Đối chiếu chương trình tiếp tục in danh tính, EC2 state, báo cáo Route 53 cùng HTTP probe khi các API hoạt động bình thường. Checkpoint là ba AWS client đã nhận cấu hình timeout và retry. Bước tiếp theo xử lý lỗi quan sát AWS để đưa vào trạng thái mà watcher có thể đánh giá.
+
 ## 5. Theo dõi tiến độ
 
 - [x] Nghiệm thu giai đoạn 6 và xác định phạm vi giai đoạn 7.
@@ -2642,6 +2954,15 @@ Checkpoint là phân loại được writer, paused, standby, unavailable và un
 - [x] Thêm HTTP probe và đối chiếu writer health hai origin trong mode observe.
 - [x] Thêm phân loại writer, paused, standby và unknown cho kết quả HTTP probe.
 - [ ] Bổ sung unavailable và đối chiếu phân loại timeout cùng lỗi kết nối database.
+
+- [x] Tạo và lưu riêng access key cho user mcf-azure-watcher.
+- [ ] Cấu hình profile mcf-watcher trên laptop và xác nhận account cùng ARN qua STS.
+- [x] Dùng profile mcf-watcher đọc EC2 state và quan sát health check writer AWS.
+- [ ] Khai báo dependency cloud watcher và kiểm tra import Boto3 trong virtual environment laptop.
+- [ ] Tạo Boto3 Session theo cấu hình và đối chiếu ARN watcher từ STS trong Python.
+- [ ] Đọc EC2 state từ Boto3 bằng instance ID trong cấu hình và đối chiếu CLI.
+- [ ] Đọc các quan sát health check Route 53 bằng Boto3 và đối chiếu CLI.
+- [ ] Cấu hình timeout và retry cho STS, EC2 và Route 53 client.
 
 ## 6. Tài liệu kỹ thuật
 

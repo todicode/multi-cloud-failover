@@ -1,6 +1,8 @@
 import json
 from pathlib import Path
 import httpx
+import boto3
+from botocore.config import Config
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 CONFIG_PATH = PROJECT_ROOT / "deploy" / "watcher" / "config.json"
@@ -61,6 +63,39 @@ def classify_probe(result):
 
 def main():
     config = load_config()
+
+    aws_client_config = Config(
+        connect_timeout=5,
+        read_timeout=5,
+        retries={"mode": "standard", "total_max_attempts": 2},
+    )
+
+    session = boto3.Session(
+        profile_name=config["aws_profile"],
+        region_name=config["aws_region"],
+    )
+    sts = session.client("sts", config=aws_client_config)
+    identity = sts.get_caller_identity()
+    print(f"aws_identity={identity['Arn']}")
+
+    ec2 = session.client("ec2", config=aws_client_config)
+    ec2_response = ec2.describe_instances(
+        InstanceIds=[config["aws_instance_id"]],
+    )
+    instance = ec2_response["Reservations"][0]["Instances"][0]
+    instance_state = instance["State"]["Name"]
+    print(f"aws_ec2_state={instance_state}")
+
+    route53 = session.client("route53", config=aws_client_config)
+    health_response = route53.get_health_check_status(
+        HealthCheckId=config["aws_health_check_id"],
+    )
+    observations = health_response["HealthCheckObservations"]
+    for observation in observations:
+        region = observation["Region"]
+        status = observation["StatusReport"]["Status"]
+        print(f"route53 region={region} status={status}")
+
     mode = "automatic" if config["enable_auto_failover"] else "observe"
     print(f"mode={mode}")
     print(f"aws_region={config['aws_region']}")
