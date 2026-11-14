@@ -3,6 +3,8 @@ from pathlib import Path
 import httpx
 import boto3
 from botocore.config import Config
+from botocore.exceptions import BotoCoreError, ClientError
+from datetime import datetime, timezone
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 CONFIG_PATH = PROJECT_ROOT / "deploy" / "watcher" / "config.json"
@@ -61,6 +63,38 @@ def classify_probe(result):
         return "standby"
     return "unknown"
 
+def classify_route53_report(report, now, max_age_seconds=120):
+    if not isinstance(report, dict):
+        return "unknown"
+    status = report.get("Status")
+    checked_at = report.get("CheckedTime")
+    if not isinstance(status, str) or not isinstance(checked_at, datetime):
+        return "unknown"
+    if checked_at.tzinfo is None:
+        return "unknown"
+
+    age_seconds = (now - checked_at).total_seconds()
+    if not 0 <= age_seconds <= max_age_seconds:
+        return "unknown"
+    if status.startswith("Success:"):
+        return "healthy"
+    if status.startswith("Failure:"):
+        return "unhealthy"
+    return "unknown"
+
+def classify_route53(observations, now):
+    if not observations:
+        return "unknown"
+    states = [
+        classify_route53_report(observation.get("StatusReport"), now)
+        for observation in observations
+    ]
+    if all(state == "healthy" for state in states):
+        return "healthy"
+    if all(state == "unhealthy" for state in states):
+        return "unhealthy"
+    return "unknown"
+
 def main():
     config = load_config()
 
@@ -79,22 +113,37 @@ def main():
     print(f"aws_identity={identity['Arn']}")
 
     ec2 = session.client("ec2", config=aws_client_config)
-    ec2_response = ec2.describe_instances(
-        InstanceIds=[config["aws_instance_id"]],
-    )
-    instance = ec2_response["Reservations"][0]["Instances"][0]
-    instance_state = instance["State"]["Name"]
+    try:
+        ec2_response = ec2.describe_instances(
+            InstanceIds=[config["aws_instance_id"]],
+        )
+        instance = ec2_response["Reservations"][0]["Instances"][0]
+        instance_state = instance["State"]["Name"]
+    except (BotoCoreError, ClientError) as error:
+        instance_state = "unknown"
+        print(f"aws_ec2_error={type(error).__name__}: {error}")
     print(f"aws_ec2_state={instance_state}")
 
+
     route53 = session.client("route53", config=aws_client_config)
-    health_response = route53.get_health_check_status(
-        HealthCheckId=config["aws_health_check_id"],
-    )
-    observations = health_response["HealthCheckObservations"]
-    for observation in observations:
-        region = observation["Region"]
-        status = observation["StatusReport"]["Status"]
-        print(f"route53 region={region} status={status}")
+    try:
+        health_response = route53.get_health_check_status(
+            HealthCheckId=config["aws_health_check_id"],
+        )
+        observations = health_response["HealthCheckObservations"]
+    except (BotoCoreError, ClientError) as error:
+        observations = None
+        print(f"route53_error={type(error).__name__}: {error}")
+
+    now = datetime.now(timezone.utc)
+    route53_state = classify_route53(observations, now)
+    print(f"route53_state={route53_state}")
+    if observations:
+        for observation in observations:
+            region = observation["Region"]
+            report = observation.get("StatusReport")
+            checker_state = classify_route53_report(report, now)
+            print(f"route53 region={region} state={checker_state}")
 
     mode = "automatic" if config["enable_auto_failover"] else "observe"
     print(f"mode={mode}")

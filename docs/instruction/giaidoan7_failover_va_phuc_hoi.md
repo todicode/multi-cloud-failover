@@ -2863,6 +2863,200 @@ Chạy lại trên Git Bash laptop.
 
 Đối chiếu chương trình tiếp tục in danh tính, EC2 state, báo cáo Route 53 cùng HTTP probe khi các API hoạt động bình thường. Checkpoint là ba AWS client đã nhận cấu hình timeout và retry. Bước tiếp theo xử lý lỗi quan sát AWS để đưa vào trạng thái mà watcher có thể đánh giá.
 
+### 4.81. Ghi nhận unknown khi lời gọi EC2 thất bại
+
+Sau khi giới hạn timeout và retry, bổ sung xử lý lỗi cho lần đọc EC2 trong main. Khi SDK báo lỗi, chuyển kết quả EC2 sang unknown và ghi thông tin lỗi để các nguồn quan sát phía sau vẫn được thu thập.
+
+Trong scripts/cloud/cloud_watcher.py, thêm import sau cùng các import đầu file.
+
+```python
+from botocore.exceptions import BotoCoreError, ClientError
+```
+
+BotoCoreError là lớp gốc của nhiều lỗi phía SDK, gồm lỗi kết nối và timeout. ClientError biểu diễn lỗi được dịch vụ AWS trả về, ví dụ UnauthorizedOperation. [Boto3 error handling](https://docs.aws.amazon.com/boto3/latest/guide/error-handling.html).
+
+Trong main, thay đoạn từ tạo EC2 client đến dòng print aws_ec2_state bằng đoạn sau.
+
+```python
+    ec2 = session.client("ec2", config=aws_client_config)
+    try:
+        ec2_response = ec2.describe_instances(
+            InstanceIds=[config["aws_instance_id"]],
+        )
+        instance = ec2_response["Reservations"][0]["Instances"][0]
+        instance_state = instance["State"]["Name"]
+    except (BotoCoreError, ClientError) as error:
+        instance_state = "unknown"
+        print(f"aws_ec2_error={type(error).__name__}: {error}")
+    print(f"aws_ec2_state={instance_state}")
+```
+
+try bao quanh lời gọi API và phần lấy state. Khi request thành công, instance_state nhận state AWS trả về. Khi gặp một trong hai nhóm exception đã chỉ định, except gán unknown và ghi loại lỗi cùng thông báo. Dòng print cuối nằm ngoài try và except nên hiển thị kết quả của cả hai nhánh. SDK tự thực hiện các retry phù hợp trước khi chuyển exception cho chương trình.
+
+Nếu exception của lời gọi này chưa được xử lý, chương trình dừng tại lỗi đó và bỏ qua các quan sát phía sau trong lượt chạy. Nhánh except ở đây tạo kết quả unknown rõ ràng để bước điều phối tiếp tục thu thập dữ liệu. Ví dụ timeout tới EC2 API có thể xảy ra trong lúc ứng dụng AWS vẫn phục vụ bình thường. Khi xác nhận fencing ở phần sau, stopped là trạng thái cần được AWS xác nhận.
+
+Chạy lại trên Git Bash laptop.
+
+```bash
+.venv/Scripts/python.exe scripts/cloud/cloud_watcher.py
+```
+
+Khi API thành công và máy đang chạy, kết quả cần tiếp tục có aws_ec2_state=running. Khi lời gọi phát sinh lỗi SDK hoặc lỗi dịch vụ được bắt, chương trình ghi aws_ec2_error rồi aws_ec2_state=unknown và chuyển sang phần đọc Route 53. Checkpoint là nhánh lỗi EC2 đã có kết quả quan sát riêng. Bước tiếp theo xử lý tương ứng cho nguồn Route 53.
+
+### 4.82. Xử lý lỗi đọc báo cáo Route 53
+
+Bổ sung xử lý lỗi cho nguồn quan sát Route 53 trong main. Khi API phát sinh lỗi SDK hoặc lỗi dịch vụ, gán observations thành None, ghi trạng thái unknown và tiếp tục tới HTTP probe. Khi lời gọi thành công, duyệt các báo cáo như bước trước.
+
+Trong scripts/cloud/cloud_watcher.py, thay đoạn từ tạo client route53 đến hết vòng for in từng observation bằng đoạn sau.
+
+```python
+    route53 = session.client("route53", config=aws_client_config)
+    try:
+        health_response = route53.get_health_check_status(
+            HealthCheckId=config["aws_health_check_id"],
+        )
+        observations = health_response["HealthCheckObservations"]
+    except (BotoCoreError, ClientError) as error:
+        observations = None
+        print(f"route53_error={type(error).__name__}: {error}")
+        print("route53_state=unknown")
+    else:
+        for observation in observations:
+            region = observation["Region"]
+            status = observation["StatusReport"]["Status"]
+            print(f"route53 region={region} status={status}")
+```
+
+try thực hiện lời gọi API cùng việc lấy danh sách báo cáo. except xử lý hai nhóm exception đã import. observations nhận None để biểu diễn lượt đọc đã thất bại. Hai dòng print ghi nguyên nhân cùng trạng thái unknown để đối chiếu ở terminal.
+
+else của try chạy khi khối try hoàn tất bình thường. Nhờ đó vòng for duyệt báo cáo sau một lời gọi thành công. Ví dụ mất quyền GetHealthCheckStatus sẽ đi qua except, còn response chứa báo cáo HTTP 200 sẽ đi qua else. Hết khối xử lý này, main tiếp tục phần mode cùng HTTP probe. [Boto3 error handling](https://docs.aws.amazon.com/boto3/latest/guide/error-handling.html).
+
+Tình huống cụ thể là origin AWS còn phục vụ ghi nhưng watcher gặp lỗi kết nối API Route 53. Khi ấy HTTP probe trực tiếp có thể trả writer trong khi nguồn báo cáo Route 53 là unknown. Bước quyết định phía sau cần sử dụng đúng trạng thái của từng nguồn quan sát. Việc đọc được API và kết quả checker báo origin khỏe là hai thông tin được kiểm chứng ở các bước tương ứng.
+
+Chạy lại trên Git Bash laptop.
+
+```bash
+.venv/Scripts/python.exe scripts/cloud/cloud_watcher.py
+```
+
+Khi API hoạt động, chương trình tiếp tục in các báo cáo region và status. Khi gặp lỗi được bắt, đầu ra có route53_error, route53_state=unknown rồi các dòng HTTP probe. Checkpoint là lỗi của nguồn Route 53 đã được xử lý để chương trình tiếp tục thu thập dữ liệu. Bước sau tổng hợp các báo cáo thành trạng thái, có xét trường hợp None, danh sách rỗng và thời điểm kiểm tra của từng báo cáo.
+
+### 4.83. Phân loại từng báo cáo Route 53 theo trạng thái và độ mới
+
+Mỗi StatusReport chứa Status và CheckedTime. Boto3 biểu diễn CheckedTime bằng datetime, với thời điểm kiểm tra UTC từ Route 53. Project chọn ngưỡng tuổi báo cáo 120 giây cho lượt thực hành này. Báo cáo quá ngưỡng, thiếu dữ liệu hoặc có thời điểm ở tương lai được phân loại unknown. [Boto3 Route 53 response](https://docs.aws.amazon.com/boto3/latest/reference/services/route53/client/get_health_check_status.html).
+
+Trong scripts/cloud/cloud_watcher.py, thêm import sau ở đầu file.
+
+```python
+from datetime import datetime, timezone
+```
+
+Thêm hàm sau ngay trước main.
+
+```python
+def classify_route53_report(report, now, max_age_seconds=120):
+    if not isinstance(report, dict):
+        return "unknown"
+    status = report.get("Status")
+    checked_at = report.get("CheckedTime")
+    if not isinstance(status, str) or not isinstance(checked_at, datetime):
+        return "unknown"
+    if checked_at.tzinfo is None:
+        return "unknown"
+
+    age_seconds = (now - checked_at).total_seconds()
+    if not 0 <= age_seconds <= max_age_seconds:
+        return "unknown"
+    if status.startswith("Success:"):
+        return "healthy"
+    if status.startswith("Failure:"):
+        return "unhealthy"
+    return "unknown"
+```
+
+report nhận StatusReport của một checker. now là thời điểm UTC tại lượt đánh giá. max_age_seconds có giá trị mặc định 120 do project chọn. Các kiểm tra kiểu dữ liệu yêu cầu status là chuỗi và thời điểm là datetime có timezone.
+
+now - checked_at trả khoảng thời gian đã trôi qua, còn total_seconds chuyển khoảng đó thành số giây. Điều kiện 0 <= age_seconds <= max_age_seconds giữ các báo cáo có tuổi từ 0 đến 120 giây. Sau kiểm tra thời gian, tiền tố Success: được phân loại healthy, Failure: được phân loại unhealthy, còn các nội dung khác là unknown. Ngưỡng tuổi này là lựa chọn của watcher trong lab.
+
+Trong main, thay khối else đang duyệt observations của Route 53 bằng đoạn sau.
+
+```python
+    else:
+        now = datetime.now(timezone.utc)
+        for observation in observations:
+            region = observation["Region"]
+            report = observation.get("StatusReport")
+            checker_state = classify_route53_report(report, now)
+            print(f"route53 region={region} state={checker_state}")
+```
+
+Tính now một lần để dùng chung mốc đánh giá cho các báo cáo của lượt đọc. observation.get lấy report để hàm có thể trả unknown khi trường này thiếu. Mỗi dòng log hiển thị region cùng kết quả phân loại của checker đó.
+
+Ví dụ với now là 10:00:00 UTC, báo cáo Success: được kiểm tra lúc 09:59:40 có tuổi 20 giây và được phân loại healthy. Báo cáo Failure: được kiểm tra lúc 09:55:00 có tuổi 300 giây và được phân loại unknown theo ngưỡng đã chọn. Báo cáo Failure: lúc 09:59:40 được phân loại unhealthy.
+
+Chạy lại trên Git Bash laptop.
+
+```bash
+.venv/Scripts/python.exe scripts/cloud/cloud_watcher.py
+```
+
+Khi các checker đang báo thành công với dữ liệu đủ mới, đầu ra có các dòng route53 region=... state=healthy. Checkpoint là từng báo cáo đã có trạng thái healthy, unhealthy hoặc unknown. Bước tiếp theo tổng hợp danh sách trạng thái thành kết quả quan sát chung cho watcher.
+
+### 4.84. Tổng hợp nguồn quan sát Route 53 cho watcher
+
+Sau khi mỗi báo cáo đã có trạng thái riêng, tổng hợp chúng thành một giá trị để bước quyết định có thể sử dụng. Project chọn quy tắc cho watcher trong lab là toàn bộ báo cáo đều healthy thì kết quả healthy, toàn bộ đều unhealthy thì kết quả unhealthy. Các trường hợp khác, bao gồm thiếu báo cáo hoặc có kết quả khác nhau, trả unknown.
+
+Trong scripts/cloud/cloud_watcher.py, thêm hàm sau sau classify_route53_report và trước main.
+
+```python
+def classify_route53(observations, now):
+    if not observations:
+        return "unknown"
+    states = [
+        classify_route53_report(observation.get("StatusReport"), now)
+        for observation in observations
+    ]
+    if all(state == "healthy" for state in states):
+        return "healthy"
+    if all(state == "unhealthy" for state in states):
+        return "unhealthy"
+    return "unknown"
+```
+
+if not observations xử lý cả None từ nhánh lỗi API và danh sách rỗng từ một lượt đọc chưa có báo cáo. Trong Python, all trên danh sách rỗng trả True. Kiểm tra dữ liệu rỗng trước giúp hàm trả unknown cho tình huống thiếu quan sát.
+
+List comprehension tạo states bằng cách gọi hàm phân loại hiện có cho từng StatusReport. all yêu cầu mọi phần tử đều thỏa điều kiện. Ví dụ healthy, healthy cho healthy. unhealthy, unhealthy cho unhealthy. healthy, unhealthy hoặc unhealthy, unknown đều cho unknown.
+
+Trong main, tại phần đọc Route 53, thay đoạn từ except của lời gọi Route 53 đến hết khối else đang in từng checker bằng đoạn sau.
+
+```python
+    except (BotoCoreError, ClientError) as error:
+        observations = None
+        print(f"route53_error={type(error).__name__}: {error}")
+
+    now = datetime.now(timezone.utc)
+    route53_state = classify_route53(observations, now)
+    print(f"route53_state={route53_state}")
+    if observations:
+        for observation in observations:
+            region = observation["Region"]
+            report = observation.get("StatusReport")
+            checker_state = classify_route53_report(report, now)
+            print(f"route53 region={region} state={checker_state}")
+```
+
+Sau try và except, tính now một lần để đánh giá kết quả tổng hợp cùng từng checker theo cùng mốc thời gian. classify_route53 nhận observations, xử lý được None hoặc danh sách rỗng, rồi trả trạng thái chung. if observations chỉ duyệt từng báo cáo khi có dữ liệu. Dòng route53_state được in một lần cho lượt quan sát này.
+
+Kết quả tổng hợp là giá trị do watcher tính theo quy tắc của project. Nó sẽ được kết hợp với HTTP probe và các điều kiện điều khiển failover ở các bước tiếp theo. Chọn mọi báo cáo cùng trạng thái giúp xử lý rõ trường hợp các checker đang quan sát khác nhau trong lúc sự cố hoặc khôi phục.
+
+Chạy trên Git Bash laptop.
+
+```bash
+.venv/Scripts/python.exe scripts/cloud/cloud_watcher.py
+```
+
+Khi tất cả báo cáo đủ mới và đều thành công, đầu ra có route53_state=healthy, kèm các dòng checker tương ứng. Checkpoint là chương trình đã có route53_state để dùng trong bước kết hợp các nguồn quan sát.
+
 ## 5. Theo dõi tiến độ
 
 - [x] Nghiệm thu giai đoạn 6 và xác định phạm vi giai đoạn 7.
@@ -2963,6 +3157,11 @@ Chạy lại trên Git Bash laptop.
 - [ ] Đọc EC2 state từ Boto3 bằng instance ID trong cấu hình và đối chiếu CLI.
 - [ ] Đọc các quan sát health check Route 53 bằng Boto3 và đối chiếu CLI.
 - [ ] Cấu hình timeout và retry cho STS, EC2 và Route 53 client.
+
+- [ ] Xử lý lỗi lời gọi EC2 thành state unknown và tiếp tục thu thập các quan sát phía sau.
+- [ ] Xử lý lỗi đọc Route 53 thành nguồn quan sát unknown và tiếp tục HTTP probe.
+- [ ] Phân loại từng báo cáo Route 53 theo nội dung và CheckedTime với ngưỡng tuổi 120 giây của lab.
+- [ ] Tổng hợp route53_state theo quy tắc các báo cáo cùng trạng thái và xử lý None, danh sách rỗng thành unknown.
 
 ## 6. Tài liệu kỹ thuật
 
