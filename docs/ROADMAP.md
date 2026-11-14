@@ -50,11 +50,13 @@ Public HTTP GET checks through Traefik passed for the UI, version, and database 
 
 ## Completed: DNS and HTTPS
 
-The [Stage 6 guide](instruction/giaidoan6_dns_va_https.md) records delegation of mcf.todicode.tech to a Route 53 public hosted zone, origin A records, HTTPS writer health checks, and PRIMARY/SECONDARY CNAME records for app.mcf.todicode.tech. Public DNS selected AWS during acceptance. Both origins served HTTPS successfully, and requests for the shared hostname directed to each origin IP verified its certificate, Ingress routing, environment, and matching application commit. AWS writer health returned HTTP 200 and Azure standby writer health returned HTTP 503. Certbot timers were active on both VMs, and renewal dry-runs with deploy hooks successfully synchronized the Kubernetes TLS Secrets. Cloud writer transitions and recovery exercises are the next milestone.
+The [Stage 6 guide](instruction/giaidoan6_dns_va_https.md) records delegation of mcf.todicode.tech to a Route 53 public hosted zone, origin A records, HTTPS writer health checks, and PRIMARY/SECONDARY CNAME records for app.mcf.todicode.tech. Public DNS selected AWS during acceptance. Both origins served HTTPS successfully, and requests for the shared hostname directed to each origin IP verified its certificate, Ingress routing, environment, and matching application commit. AWS writer health returned HTTP 200 and Azure standby writer health returned HTTP 503. Certbot timers were active on both VMs, and renewal dry-runs with deploy hooks successfully synchronized the Kubernetes TLS Secrets. Manual writer transitions and recovery exercises passed Stage 7 functional acceptance.
 
 ## Milestones
 
-The [Stage 7 guide](instruction/giaidoan7_failover_va_phuc_hoi.md) records the initial topology checks, K3s startup controls on both hosts, and a successful guard/recovery exercise on Azure. Manual failover from AWS to Azure has passed EC2 fencing, database promotion, DNS selection, shared-hostname HTTPS, a new application write/read, and retrieval of a pre-failure probe record. AWS rejoin and controlled failback are in progress. Repeated failure measurements and RPO evaluation are scheduled for Stage 9.
+Stage 7 manual recovery functional acceptance is complete. The manual recovery exercise covered AWS-to-Azure failover, AWS rejoin on a new PVC, controlled failback with an application write barrier and WAL replay checkpoint, and Azure rejoin on a new PVC. Cloud power-state checks confirmed fencing before writer promotion. New transactions were read on each rebuilt standby, and both applications passed the expected readiness and writer-health checks. Final DNS and shared-hostname HTTPS selected the writable AWS primary. Azure WAL receiver output and a new replicated transaction confirm restored AWS-to-Azure replication. AWS WAL sender output is pending supplementary capture. The guide records the commands, observed results, and intermediate checks awaiting output. [Stage 7 recovery guide](instruction/giaidoan7_failover_va_phuc_hoi.md).
+
+The next recovery increment adds an Azure-hosted watcher to automate AWS failure detection, confirmed fencing, standby promotion, and writer verification. Route 53 already selects DNS answers using writer health. This cloud controller is pending implementation and validation. Stage 8 covers independent monitoring. Stage 9 covers baseline comparison, repeated failure measurements, RPO evaluation, latency, and cost proxy analysis.
 
 | Phase | Deliverable | Acceptance evidence |
 |---|---|---|
@@ -64,7 +66,7 @@ The [Stage 7 guide](instruction/giaidoan7_failover_va_phuc_hoi.md) records the i
 | DNS failover | Writer health checks and Route 53 routing | Traffic reaches the promoted writer after the old writer is fenced |
 | Observability | Monitoring outside the application environments | Origin/writer availability, latency, and replication signals |
 | Cloud recovery | Manual failover, rejoin, and controlled failback | A single writer throughout; verified data after both transitions |
-| Automatic failover | Optional Azure-hosted watcher | Confirmed fencing before promotion and observable failure handling |
+| Automatic failover | Planned Azure-hosted watcher | Automatic detection, confirmed fencing, promotion, and writer verification in a cloud failure exercise |
 | Evaluation | Repeated failure exercises and operational analysis | Raw measurements for downtime, latency, errors, data loss, and cost |
 
 ## Evaluation goals

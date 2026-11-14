@@ -1,0 +1,67 @@
+# Stage 7 diagram prompts
+
+Generated with the built-in ImageGen tool. Each image was generated separately and then edited for technical accuracy.
+
+## Diagram 1 generation
+
+Create a high resolution landscape Vietnamese educational infographic, 3:2 aspect ratio, titled "GIAI ĐOẠN 7 — TOÀN BỘ VÒNG CHUYỂN ĐỔI". Use a polished hand-drawn architecture whiteboard style with black ink outlines, white background, restrained pastel washes, AWS orange and Azure blue, green WAL arrows, purple DNS dotted lines. Large accurate Vietnamese lettering, generous space. Six numbered panels in a 2-column by 3-row grid, read left to right then top to bottom. Each panel has an AWS EC2 mini-box and an Azure VM mini-box, a PostgreSQL cylinder in each, and a browser/app arrow to the serving cloud. The clouds are independent K3s clusters with one node each. Keep labels exact and short.
+Panel 1 title "1. Ban đầu". AWS PostgreSQL label "PRIMARY • đọc/ghi". Azure label "STANDBY • chỉ đọc". Green data arrow AWS to Azure labelled "WAL qua WireGuard". Browser HTTPS arrow to AWS. Small text "app.mcf.todicode.tech → AWS".
+Panel 2 title "2. Fence AWS". AWS grey stopped EC2 with red stop icon, text "EC2 Stopped". Azure remains "STANDBY • chỉ đọc". No live WAL flow or successful application write shown. Operator command chip "aws ec2 stop-instances".
+Panel 3 title "3. Promote Azure". AWS grey and stopped. Azure label "PRIMARY • đọc/ghi". Browser HTTPS arrow to Azure. Operator chip "pg_promote(true, 60)". Text "DNS tự chọn Azure khi writer sẵn sàng".
+Panel 4 title "4. Rejoin AWS". Azure "PRIMARY • đọc/ghi", AWS "STANDBY • PVC mới". Green arrow Azure to AWS labelled "Clone rồi WAL streaming". Browser arrow still to Azure.
+Panel 5 title "5. Failback về AWS". Azure grey stopped, text "VM Deallocated". AWS "PRIMARY • đọc/ghi". Browser arrow to AWS. Bottom process text "Dừng ghi → chờ replay → fence Azure → promote AWS → mở ghi".
+Panel 6 title "6. Rejoin Azure". AWS "PRIMARY • đọc/ghi", Azure "STANDBY • PVC mới". Green arrow AWS to Azure labelled "WAL qua WireGuard". Browser arrow to AWS. Text "Đã đọc được transaction mới trên Azure".
+A slim bottom legend explains "Cam/xanh dương — hai cloud", "Xanh lá — dữ liệu WAL", "Mũi tên đen — HTTPS tới origin", "Tím nét đứt — DNS". A short bottom caption "Lượt thực hành thủ công • WAL và lựa chọn DNS tự động • Cloud watcher đang chờ triển khai". Draw no HTTP request traversing Route 53. Make it clear the cloud fencing and promotion were operator actions. Do not introduce load balancers, RDS, EKS, AKS, or a single cluster spanning both clouds. No unrelated decorative labels. All six panels must be present with correct WAL direction.
+
+## Diagram 1 final edit
+
+Edit this educational infographic. Preserve its six panels, Vietnamese labels, cloud roles, colors, WAL directions, and hand-drawn style. Make one targeted correction in panel 3 "Promote Azure". Reroute the browser's black HTTPS arrow underneath the stopped AWS cloud, then turn upward to terminate at the Azure VM. The black HTTPS path must clearly bypass the stopped AWS box. Keep panel 4 HTTPS routed to Azure and green WAL routed Azure to AWS. No other changes.
+
+## Diagram 2 generation
+
+Create a detailed Vietnamese technical teaching infographic, wide landscape 3:2, whiteboard pen-and-pastel architecture style with clear black outlines, AWS orange, Azure blue, green data arrows. Title "REJOIN — ĐƯA MÁY CŨ TRỞ LẠI LÀM STANDBY". Subtitle "Ví dụ AWS rejoin từ primary Azure". This is an explanation of the exact manually exercised procedure with a temporary agentless K3s control plane. Show an eight-step connected path in two rows of four numbered cards, with explicit directional arrows, large readable labels and short command chips.
+Card 1 "1. Bật host, guard chặn K3s" depicts AWS host turned on but PostgreSQL stopped. Text "/run/issues-k3s-start-approved chưa có". Command chip "ExecStartPre=test -f ...". Explain marker existence checked, empty file sufficient.
+Card 2 "2. Chạy control plane agentless". Text "disable-agent: true". Diagram API ON, kubelet/containerd OFF. Chip "touch marker → start k3s". Small label "Cấu hình tạm • K3s experimental".
+Card 3 "3. Chuẩn bị desired state". Text "postgres = 0 • issues-app = 0". Draw StatefulSet arrow pointing to new PVC. Chip "replicas: 0". New PVC label "postgres-data-rejoin-aws-01".
+Card 4 "4. Dọn Pod object cũ". Draw old Pod document icons marked Terminating being removed from API. Text "Xác nhận process đã dừng". Chip "delete pod --force". Explain condition "Agent tắt • replicas 0".
+Card 5 "5. Bật lại agent". Chip "Gỡ 99-rejoin.yaml → start k3s". Text "Node Ready • DB vẫn replicas 0". Clearly keep database stopped at this step.
+Card 6 "6. Job clone dữ liệu". Draw live primary Azure at 10.200.29.2:5432 sending physical base backup via WireGuard to AWS new PVC. Chip "pg_basebackup -R -X stream". Text "standby.signal + cấu hình kết nối". Small "Job Complete → .clone-complete".
+Card 7 "7. Khởi động PostgreSQL". Chip "replicas: 1". Text "Mount PVC mới". Results "in_recovery = t • read_only = on". Arrow green from Azure to AWS labelled "WAL streaming".
+Card 8 "8. Khôi phục ứng dụng". Chip "apply app-deployment.yaml". Text "Readiness 200 • Writer health 503". Text "Ghi mới ở Azure → đọc lại ở AWS".
+At bottom include a storage strip with two cylinders under the same AWS host OS disk outline. Grey cylinder "PVC cũ — giữ lại". Green cylinder "PVC mới — nhận clone". Caption "Hai đường dẫn lưu trữ trên OS disk của host". Small inset "Marker /run — phê duyệt mỗi boot" and "Marker .clone-complete — bản clone hoàn tất trên PVC". These two markers must be visually distinct. Do not imply a new PVC allocates a separate EBS volume. Do not show an empty PostgreSQL database being initialized as primary. The topology direction in this example is consistently Azure primary to AWS standby.
+
+## Diagram 2 final edit
+
+Edit this Vietnamese rejoin teaching infographic preserving the eight-card grid, title, cloud colors, and Azure primary to AWS standby direction. Improve technical accuracy and readability by replacing the body bullet paragraphs in all eight cards with ONLY these exact short lines, laid out with generous whitespace. Keep the step titles, icons and short command chips.
+Card 1 lines "Marker /run chưa có" and "Guard kiểm tra file tồn tại" and "PostgreSQL đang dừng".
+Card 2 lines "API server hoạt động" and "Kubelet và containerd đang tắt" and "API vẫn lưu Pod object". Keep label "Cấu hình tạm • K3s experimental". No statement that disable-agent prevents creating Pod objects.
+Card 3 lines "postgres = 0 • issues-app = 0" and "StatefulSet trỏ PVC mới".
+Card 4 lines "Agent tắt • replicas 0" and "Xác nhận process đã dừng" and "Xóa Pod object khỏi API".
+Card 5 lines "Gỡ file cấu hình agentless" and "Node Ready" and "Database vẫn replicas 0".
+Card 6 lines "Azure → WireGuard → PVC AWS mới" and "pg_basebackup -R -X stream" and "Script tạo .clone-complete" and "Job hoàn tất". Preserve the Azure source 10.200.29.2:5432 and new PVC.
+Card 7 lines "replicas = 1 • mount PVC mới" and "in_recovery = t • read_only = on" and "WAL từ Azure sang AWS".
+Card 8 lines "Ứng dụng Ready" and "Readiness 200 • Writer health 503" and "Ghi mới Azure → đọc lại AWS".
+In bottom storage strip, replace the old PVC example name with exact "postgres-data". New PVC exact "postgres-data-rejoin-aws-01". Keep the strip showing both retained old and new storage directories on the same host OS disk.
+In bottom marker insets use only exact short texts. Upper inset "Marker /run" then "/run/issues-k3s-start-approved" then "Cho phép K3s khởi động trong boot hiện tại". Lower inset "Marker trên PVC" then ".clone-complete" then "Script xác nhận bản clone hoàn tất". Remove the invented path containing the PVC name. Avoid any explanatory colons, additional prose or new labels. Large legible text.
+
+## Diagram 3 generation
+
+Create a precise Vietnamese educational infographic, high resolution wide landscape 3:2, hand-drawn whiteboard style, clean white background, black ink outlines, pastel AWS orange, Azure blue, purple lock accents and green WAL. Title "FAILBACK — CHUYỂN WRITER TỪ AZURE VỀ AWS". Subtitle "Hai điều kiện cho phép ghi — vai trò PostgreSQL và cờ ứng dụng". Use six numbered connected panels in two rows of three, read left-to-right, showing the actual controlled manual sequence. Give each panel a short exact command chip and a cause/effect sentence. Maintain legible Vietnamese type.
+Panel 1 "1. Tạm dừng ghi Azure". Azure primary and AWS standby. Code chips "pg_advisory_lock(2900, 1)" and "writes_enabled = FALSE". Show active app transactions draining before flag commit. Caption "Đợi transaction đang ghi hoàn tất". Small diagram shared transaction locks from app versus exclusive session lock from operator, same key (2900,1).
+Panel 2 "2. Chờ AWS replay đủ". After commit on Azure, record "target_lsn = 0/5000798". AWS shows "replay_lsn = 0/50008D8". Large checked formula "replay_lsn ≥ target_lsn". Also text "AWS đã nhận writes_enabled = false".
+Panel 3 "3. Fence Azure". Command chip "az vm deallocate". Show Azure VM stopped. Large verified label "PowerState/deallocated". AWS still standby. Caption "Xác nhận writer cũ đã dừng".
+Panel 4 "4. Promote AWS". Command "pg_promote(true, 60)". AWS PostgreSQL primary. State tuple "in_recovery=f • read_only=off". Write gate still closed, text "writes_enabled = false". Writer health "503".
+Panel 5 "5. Mở ghi AWS". Chip "writes_enabled = TRUE". State "PRIMARY • cờ ghi mở". Writer health "200". Caption "Ứng dụng bắt đầu nhận ghi".
+Panel 6 "6. DNS và dữ liệu". Browser HTTPS goes directly to AWS app after DNS selection. Tiny dotted DNS lookup to Route 53 separately. Text "app.mcf.todicode.tech → AWS". Chips "POST /api/ping → 200", "GET /api/ping/... → 200". Caption "Sau đó rebuild Azure thành standby".
+Bottom inset table titled "Ba trạng thái cần phân biệt" with columns "PostgreSQL", "writes_enabled", "Writer health". Rows "Azure primary | false | 503", "AWS primary sau promote | false | 503", "AWS primary đã mở ghi | true | 200". Note "Cờ ghi ứng dụng được replicate cùng dữ liệu". Final short footnote "Khi cả hai health check unhealthy, Route 53 trả PRIMARY AWS; kiểm tra writer health trước khi nghiệm thu." Do not depict DNS as carrying HTTPS or promoting databases. Do not imply paused app flag makes PostgreSQL server read-only. Do not show automatic failback or a deployed watcher. All commands are labels for the completed manual exercise.
+
+## Diagram 3 final edit
+
+Edit this Vietnamese failback infographic preserving the title, six panels, icons, cloud roles, lock diagram, real LSN values, command chips, final table and footnote. In each of the six panels, remove the bottom paragraphs headed "Nguyên nhân" and "Kết quả" and their surrounding boxes. Replace that entire bottom area with just one large exact sentence per panel.
+Panel 1 "Đợi các transaction đang ghi hoàn tất rồi commit cờ false."
+Panel 2 "AWS replay tới mốc sau commit dừng ghi."
+Panel 3 "Azure đã deallocated • AWS còn standby."
+Panel 4 "AWS thành primary • cờ ứng dụng còn false."
+Panel 5 "Cờ ứng dụng true • writer health trả 200."
+Panel 6 "Kiểm tra POST và GET qua hostname chung."
+No colon punctuation or extra explanatory labels. Preserve correct pg_advisory_lock(2900, 1), target_lsn 0/5000798, replay_lsn 0/50008D8, az vm deallocate, pg_promote(true, 60), and Route 53 separated from HTTPS request flow. Keep all remaining diagrams and footnote accurate.

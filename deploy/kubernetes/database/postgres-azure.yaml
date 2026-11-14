@@ -62,7 +62,7 @@ spec:
       volumes:
         - name: data
           persistentVolumeClaim:
-            claimName: postgres-data
+            claimName: postgres-data-rejoin-azure-01
         - name: config
           configMap:
             name: postgres-config
