@@ -18,7 +18,7 @@ import psycopg
 from psycopg.rows import dict_row
 from psycopg import sql
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 PROJECT = os.getenv("LOCAL_REPL_PROJECT", "hetinhtoanphanbo")
 AWS_DB = int(os.getenv("AWS_DB_PORT", "55432"))

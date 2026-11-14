@@ -28,8 +28,8 @@ Tham chiếu: [Giai đoạn 1 — Ứng dụng và PostgreSQL replication local]
 | [database/](../../database/) | Mã truy cập PostgreSQL và schema ứng dụng |
 | [requirements.txt](../../requirements.txt) | Dependency chạy ứng dụng |
 | [database/compose.replication.yml](../../database/compose.replication.yml) | Hai PostgreSQL của local lab |
-| [scripts/Use-LocalLab.ps1](../../scripts/Use-LocalLab.ps1) | Cấu hình terminal cho lab hiện tại |
-| [scripts/local_replication.py](../../scripts/local_replication.py) | Điều khiển topology và các tiến trình web của giai đoạn 1 |
+| [scripts/local/Use-LocalLab.ps1](../../scripts/local/Use-LocalLab.ps1) | Cấu hình terminal cho lab hiện tại |
+| [scripts/local/local_replication.py](../../scripts/local/local_replication.py) | Điều khiển topology và các tiến trình web của giai đoạn 1 |
 
 Dockerfile mô tả cách tạo image ứng dụng. Cấu hình triển khai quyết định image chạy ở đâu, nhận biến môi trường nào, kết nối database nào và được truy cập qua mạng như thế nào.
 

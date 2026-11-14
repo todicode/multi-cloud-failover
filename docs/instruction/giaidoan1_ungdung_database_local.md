@@ -38,7 +38,7 @@ Hai FastAPI chạy trực tiếp trên Windows. Hai PostgreSQL chạy trong cont
 | [database/schema/](../../database/schema/) | Schema nghiệp vụ và gate ghi |
 | [database/compose.replication.yml](../../database/compose.replication.yml) | Hai container PostgreSQL và volumes |
 | [database/replication/](../../database/replication/) | Cấu hình replication và khởi tạo standby |
-| [scripts/local_replication.py](../../scripts/local_replication.py) | Điều phối setup và chuyển đổi vai trò |
+| [scripts/local/local_replication.py](../../scripts/local/local_replication.py) | Điều phối setup và chuyển đổi vai trò |
 | [app/local_proxy.py](../../app/local_proxy.py) | Proxy theo writer/phase đã được xác minh |
 
 Mã ứng dụng được cung cấp trong repository. Các bước dưới đây dựng và sử dụng hệ thống từ source, không yêu cầu viết lại giao diện hoặc nghiệp vụ.
@@ -86,12 +86,12 @@ Nếu `.venv` đã được tạo và dependency đã cài, có thể dùng lạ
 ## 5. Cấu hình terminal local
 
 ```powershell
-. .\scripts\Use-LocalLab.ps1
+. .\scripts\local\Use-LocalLab.ps1
 ```
 
 Dấu chấm và khoảng trắng ở đầu lệnh là dot-source: nạp cấu hình vào terminal hiện tại. Chạy lại lệnh này trong mỗi terminal mới dùng cho local lab.
 
-Các biến chính do [Use-LocalLab.ps1](../../scripts/Use-LocalLab.ps1) cấu hình:
+Các biến chính do [Use-LocalLab.ps1](../../scripts/local/Use-LocalLab.ps1) cấu hình:
 
 | Biến | Giá trị |
 |---|---|
@@ -107,7 +107,7 @@ Docker project riêng xác định tên network/container/volume. Các database 
 ## 6. Khởi tạo primary và standby
 
 ```powershell
-.\.venv\Scripts\python.exe scripts/local_replication.py setup
+.\.venv\Scripts\python.exe scripts/local/local_replication.py setup
 ```
 
 Lệnh này thực hiện:
@@ -123,7 +123,7 @@ Schema gồm `issues`, `comments`, `issue_history`, `save_requests`, `app_contro
 Kiểm tra:
 
 ```powershell
-.\.venv\Scripts\python.exe scripts/local_replication.py status
+.\.venv\Scripts\python.exe scripts/local/local_replication.py status
 docker compose -p mcf-todicode -f database/compose.replication.yml ps
 ```
 
@@ -138,8 +138,8 @@ Kết quả cần đạt:
 ## 7. Khởi động hai web và URL chung
 
 ```powershell
-.\.venv\Scripts\python.exe scripts/local_replication.py start-web
-.\.venv\Scripts\python.exe scripts/local_replication.py start-proxy
+.\.venv\Scripts\python.exe scripts/local/local_replication.py start-web
+.\.venv\Scripts\python.exe scripts/local/local_replication.py start-proxy
 ```
 
 Hai lệnh chạy các tiến trình dưới nền và lưu PID/log. Nếu cổng đã được sử dụng, xác định tiến trình đang chạy thay vì khởi động thêm một bản.
@@ -234,7 +234,7 @@ Bản nháp chưa gửi không nằm trong PostgreSQL. Receipt retry cũng đư�
 Xác nhận AWS đang primary và Azure đang streaming, sau đó chạy:
 
 ```powershell
-.\.venv\Scripts\python.exe scripts/local_replication.py switchover
+.\.venv\Scripts\python.exe scripts/local/local_replication.py switchover
 ```
 
 Thứ tự điều phối là khóa ghi ứng dụng → drain transaction → lấy WAL cuối → chờ Azure replay → fence AWS → promote Azure → kiểm tra writer → đổi proxy.
@@ -273,8 +273,8 @@ Hai response phải có cùng comment ID; chi tiết issue chỉ có một bình
 Azure tiếp tục phục vụ trong lúc dựng lại AWS:
 
 ```powershell
-.\.venv\Scripts\python.exe scripts/local_replication.py rejoin-aws
-.\.venv\Scripts\python.exe scripts/local_replication.py status
+.\.venv\Scripts\python.exe scripts/local/local_replication.py rejoin-aws
+.\.venv\Scripts\python.exe scripts/local/local_replication.py status
 ```
 
 AWS lúc này phải là standby của Azure. Nó được clone trên volume mới, volume cũ được giữ để kiểm tra. Truy cập AWS trực tiếp và xác nhận bình luận vừa tạo trên Azure đã đến:
@@ -286,8 +286,8 @@ Invoke-RestMethod "http://127.0.0.1:8180/api/issues/$($StageOneIssue.id)" | Conv
 Sau khi đồng bộ và dữ liệu khớp, chuyển về AWS:
 
 ```powershell
-.\.venv\Scripts\python.exe scripts/local_replication.py failback
-.\.venv\Scripts\python.exe scripts/local_replication.py status
+.\.venv\Scripts\python.exe scripts/local/local_replication.py failback
+.\.venv\Scripts\python.exe scripts/local/local_replication.py status
 Invoke-RestMethod "$StageOneBaseUrl/version"
 Invoke-RestMethod "$StageOneBaseUrl/api/issues/$($StageOneIssue.id)" | ConvertTo-Json -Depth 20
 ```
@@ -308,7 +308,7 @@ Chỉ chạy khi hệ thống đã về AWS primary/Azure standby sau mục 11. 
 
 ```powershell
 docker compose -p mcf-todicode -f database/compose.replication.yml kill database
-.\.venv\Scripts\python.exe scripts/local_replication.py failover
+.\.venv\Scripts\python.exe scripts/local/local_replication.py failover
 Invoke-RestMethod http://127.0.0.1:8190/api/database/status
 ```
 
@@ -321,8 +321,8 @@ Sau khi kiểm tra đọc/ghi trên Azure, chạy `rejoin-aws` và `failback` nh
 Trong terminal thứ hai, tại thư mục gốc:
 
 ```powershell
-. .\scripts\Use-LocalLab.ps1
-.\.venv\Scripts\python.exe scripts/watcher.py --interval 5 --threshold 3
+. .\scripts\local\Use-LocalLab.ps1
+.\.venv\Scripts\python.exe scripts/local/watcher.py --interval 5 --threshold 3
 ```
 
 Trong terminal điều khiển:
@@ -340,7 +340,7 @@ Không chạy lệnh promote/failover tay đồng thời với watcher. Sau khi 
 Khôi phục AWS primary trước khi chạy test database:
 
 ```powershell
-. .\scripts\Use-LocalLab.ps1
+. .\scripts\local\Use-LocalLab.ps1
 $env:TASKFLOW_DB_TESTS = '1'
 .\.venv\Scripts\python.exe -m pytest -q
 ```
@@ -350,7 +350,7 @@ Kết quả đã nghiệm thu cho phiên bản hiện tại: **19 passed**. Test
 Chạy bài end-to-end độc lập:
 
 ```powershell
-.\.venv\Scripts\python.exe scripts/check_local_lifecycle.py
+.\.venv\Scripts\python.exe scripts/local/check_local_lifecycle.py
 ```
 
 Script tạo Docker project `dcs29-cycle-<id>` riêng, dùng cổng DB 55632/55633 và web/proxy 18080/18081/18090. Các cổng này cần trống. Nó kiểm tra nhiều vòng chuyển đổi, standby từ chối ghi, retry, dữ liệu/history, failback bị ngắt rồi tiếp tục, và watcher sau kill AWS DB. Kết quả phải có dòng `PASS`; tài nguyên của project kiểm thử được dọn sau khi chạy.
@@ -360,7 +360,7 @@ Script tạo Docker project `dcs29-cycle-<id>` riêng, dùng cổng DB 55632/556
 Trong terminal đo đạc riêng:
 
 ```powershell
-. .\scripts\Use-LocalLab.ps1
+. .\scripts\local\Use-LocalLab.ps1
 $StageOneRunId = 'stage1-' + (Get-Date).ToUniversalTime().ToString('yyyyMMddTHHmmssZ')
 $StageOneRunDirectory = Join-Path 'experiments/runs' $StageOneRunId
 New-Item -ItemType Directory -Path $StageOneRunDirectory | Out-Null
@@ -386,7 +386,7 @@ Lưu bằng chứng của giai đoạn:
 Khi cần dừng:
 
 ```powershell
-.\scripts\Stop-LocalLab.ps1
+.\scripts\local\Stop-LocalLab.ps1
 ```
 
 Helper xác minh PID/module/port thuộc Python của repository trước khi dừng web/proxy, sau đó dừng hai DB. Volumes và state được giữ lại. Không dùng `docker compose down -v` để dừng hằng ngày vì lệnh đó xóa volumes.

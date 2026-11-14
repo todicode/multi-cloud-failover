@@ -22,7 +22,7 @@ An existing virtual environment can be reused. There is no need to recreate it e
 ## Configure the terminal
 
 ```powershell
-. .\scripts\Use-LocalLab.ps1
+. .\scripts\local\Use-LocalLab.ps1
 ```
 
 This selects Docker project `mcf-todicode`, sets the five local ports and `DATABASE_URL`, and enables UTF-8 for Python output. Repeat it in each new terminal used for the lab. PostgreSQL credentials are development-only and database ports bind to localhost.
@@ -30,9 +30,9 @@ This selects Docker project `mcf-todicode`, sets the five local ports and `DATAB
 ## Start the initial topology
 
 ```powershell
-.\.venv\Scripts\python.exe scripts/local_replication.py setup
-.\.venv\Scripts\python.exe scripts/local_replication.py start-web
-.\.venv\Scripts\python.exe scripts/local_replication.py start-proxy
+.\.venv\Scripts\python.exe scripts/local/local_replication.py setup
+.\.venv\Scripts\python.exe scripts/local/local_replication.py start-web
+.\.venv\Scripts\python.exe scripts/local/local_replication.py start-proxy
 ```
 
 `setup` configures the primary, creates the application schema, and initializes the standby. It preserves existing primary data. It rejects a topology that has already changed roles; use the [recovery runbook](DISASTER_RECOVERY.md) after a failover.
@@ -52,7 +52,7 @@ This creates five example issues through the API. Stable request IDs make repeat
 ## Inspect runtime state
 
 ```powershell
-.\.venv\Scripts\python.exe scripts/local_replication.py status
+.\.venv\Scripts\python.exe scripts/local/local_replication.py status
 Invoke-RestMethod http://127.0.0.1:8190/api/proxy/status
 Invoke-RestMethod http://127.0.0.1:8180/api/database/status
 Invoke-RestMethod http://127.0.0.1:8181/api/database/status
@@ -74,7 +74,7 @@ The database tests create isolated schemas and remove those schemas afterward. W
 The end-to-end lifecycle check creates its own Docker project and runs a separate set of databases and web processes:
 
 ```powershell
-.\.venv\Scripts\python.exe scripts/check_local_lifecycle.py
+.\.venv\Scripts\python.exe scripts/local/check_local_lifecycle.py
 ```
 
 Ports 55632/55633, 18080/18081, and 18090 must be available. The check verifies repeated role transitions, unsafe setup rejection, retry handling, interrupted failback, preserved data/history, and watcher-triggered failover. Cleanup is restricted to its generated test project.
@@ -82,7 +82,7 @@ Ports 55632/55633, 18080/18081, and 18090 must be available. The check verifies 
 ## Stop and restart
 
 ```powershell
-.\scripts\Stop-LocalLab.ps1
+.\scripts\local\Stop-LocalLab.ps1
 ```
 
 The stop helper validates recorded processes against the repository's Python executable, module, and port before terminating their process trees. It stops the database project while preserving volumes and topology state.

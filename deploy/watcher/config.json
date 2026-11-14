@@ -1,0 +1,14 @@
+{
+  "aws_region": "ap-southeast-1",
+  "aws_profile": "mcf-watcher",
+  "aws_instance_id": "i-014ee6f4d204aacb7",
+  "aws_health_check_id": "45a1d674-1355-5102-09ff-69e75ef12793",
+  "aws_writer_url": "https://aws.mcf.todicode.tech/health/database",
+  "azure_writer_url": "https://azure.mcf.todicode.tech/health/database",
+  "kubernetes_namespace": "issues",
+  "postgres_pod": "postgres-0",
+  "interval_seconds": 5,
+  "http_timeout_seconds": 5,
+  "failure_threshold": 3,
+  "enable_auto_failover": false
+}

@@ -10,14 +10,14 @@ from uuid import uuid4
 
 import httpx
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 os.environ.update(LOCAL_REPL_PROJECT="dcs29-cycle-" + uuid4().hex[:8], AWS_DB_PORT="55632", AZURE_DB_PORT="55633",
                   AWS_WEB_PORT="18080", AZURE_WEB_PORT="18081", PROXY_WEB_PORT="18090", LOCAL_REPL_DB_ONLY="0")
-from scripts import local_replication as demo
+from scripts.local import local_replication as demo
 from database.local_state import read_state
 from scripts import probe_failover as probe
-from scripts import watcher
+from scripts.local import watcher
 
 processes = []
 base = "http://127.0.0.1:18090"

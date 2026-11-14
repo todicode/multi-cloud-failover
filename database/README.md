@@ -33,8 +33,8 @@ Issue changes, history entries, and request receipts are committed together. Sta
 Run from the repository root:
 
 ```powershell
-. .\scripts\Use-LocalLab.ps1
-.\.venv\Scripts\python.exe scripts/local_replication.py setup
+. .\scripts\local\Use-LocalLab.ps1
+.\.venv\Scripts\python.exe scripts/local/local_replication.py setup
 ```
 
 The helper selects Docker project `mcf-todicode`, PostgreSQL host ports 56432/56433, and the development `DATABASE_URL`. The local database/user name is `taskflow`. Application processes use host ports; replication uses the internal Docker network and PostgreSQL port 5432.

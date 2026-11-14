@@ -1,6 +1,6 @@
 # Dot-source this file in EACH PowerShell window used for the local lab.
 # It changes only this terminal's environment and working directory.
-$labRepositoryRoot = Split-Path -Parent $PSScriptRoot
+$labRepositoryRoot = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
 Set-Location -LiteralPath $labRepositoryRoot
 
 $env:PYTHONUTF8 = '1'

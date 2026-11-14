@@ -2268,7 +2268,288 @@ Nghiệm thu trên xác nhận vòng chuyển vai trò và phục hồi thủ c�
 
 Cloud watcher là phần tiếp theo cần triển khai để tự phát hiện lỗi AWS, kiểm tra standby Azure, gọi AWS API để fence EC2, chờ xác nhận dừng, promote Azure và kiểm tra writer sẵn sàng. Sau đó writer health cho phép Route 53 chọn Azure. Điều kiện xác nhận fencing và kết quả promotion cần được xử lý trong controller, tương ứng các checkpoint đã thực hành.
 
-scripts/watcher.py hiện sử dụng scripts/local_replication.py và địa chỉ localhost cho lab local. Triển khai tự động trên cloud cần phần điều khiển phù hợp với API cloud và PostgreSQL trong K3s. Phần controller cloud tiếp tục được xây dựng theo từng bước trước giai đoạn observability.
+scripts/local/watcher.py hiện sử dụng scripts/local/local_replication.py và địa chỉ localhost cho lab local. Triển khai tự động trên cloud cần phần điều khiển phù hợp với API cloud và PostgreSQL trong K3s. Phần controller cloud tiếp tục được xây dựng theo từng bước trước giai đoạn observability.
+
+### 4.65. Chuẩn bị cấu hình cloud watcher
+
+Phần tự động tiếp tục từ topology AWS primary và Azure standby đã được nghiệm thu. Watcher dự kiến chạy bằng systemd trên host Azure, theo dõi writer AWS cùng trạng thái health check Route 53. Khi đủ điều kiện, controller kiểm tra standby, fence đúng EC2 và xác nhận dừng, promote Azure rồi kiểm chứng writer. Phần hiện tại chuẩn bị cấu hình đầu vào trên laptop.
+
+Trên Git Bash laptop tại thư mục gốc repository, tạo thư mục dành cho cấu hình watcher.
+
+```bash
+mkdir -p deploy/watcher
+```
+
+Tạo file deploy/watcher/config.json với nội dung sau.
+
+```json
+{
+  "aws_region": "ap-southeast-1",
+  "aws_profile": "mcf-watcher",
+  "aws_instance_id": "i-014ee6f4d204aacb7",
+  "aws_health_check_id": "45a1d674-1355-5102-09ff-69e75ef12793",
+  "aws_writer_url": "https://aws.mcf.todicode.tech/health/database",
+  "azure_writer_url": "https://azure.mcf.todicode.tech/health/database",
+  "kubernetes_namespace": "issues",
+  "postgres_pod": "postgres-0",
+  "interval_seconds": 5,
+  "http_timeout_seconds": 5,
+  "failure_threshold": 3,
+  "enable_auto_failover": false
+}
+```
+
+aws_region cùng aws_instance_id xác định EC2 mà controller được phép thao tác khi thực hiện fencing. aws_health_check_id xác định health check writer AWS đã tạo ở giai đoạn 6. Hai ID đã được đối chiếu từ Terraform state của lượt triển khai hiện tại. Khi dựng lại hạ tầng, cập nhật cấu hình theo ID của lượt mới.
+
+aws_profile đặt tên profile AWS dành cho watcher trên host Azure. Phần quyền truy cập và cấu hình profile này được thực hiện ở các bước tiếp theo. Hai writer URL dùng origin riêng để biết chính xác môi trường được kiểm tra. Hostname chung thay đổi đích theo health nên có thể dẫn tới Azure sau failover.
+
+kubernetes_namespace và postgres_pod chọn PostgreSQL local trong cluster Azure khi watcher kiểm tra standby hoặc thực hiện promotion. Tên Pod giống nhau giữa hai cluster, còn watcher sẽ chạy lệnh kubectl từ host Azure.
+
+interval_seconds đặt khoảng nghỉ giữa các lượt kiểm tra. http_timeout_seconds giới hạn thời gian chờ một HTTP request. failure_threshold đặt ngưỡng ba lượt lỗi liên tiếp đáp ứng điều kiện phát hiện mà code sẽ triển khai. Tổng thời gian phát hiện còn phụ thuộc thời gian probe và cập nhật health từ Route 53.
+
+enable_auto_failover false đặt mục tiêu chạy quan sát cho lượt kiểm tra đầu tiên. Script sẽ sử dụng giá trị này để quyết định có thực thi fencing và promotion hay tiếp tục ghi log quan sát. Sau khi các bước điều khiển được kiểm chứng, cấu hình được bật true trong lượt thử tự động. Cơ chế bỏ qua bảo trì, phân loại kết quả probe và điều kiện fencing được bổ sung khi xây dựng logic controller.
+
+Kiểm tra cú pháp JSON trên Git Bash laptop.
+
+```bash
+.venv/Scripts/python.exe -m json.tool deploy/watcher/config.json
+```
+
+Lệnh cần in lại JSON và kết thúc thành công. json.tool kiểm tra cấu trúc JSON ở máy local. Checkpoint này ghi nhận cấu hình đầu vào đã chuẩn bị. Bước tiếp theo viết phần script đọc và kiểm tra cấu hình, rồi thêm từng chức năng quan sát trước khi triển khai thao tác cloud.
+
+### 4.66. Đọc cấu hình bằng điểm vào Python của cloud watcher
+
+File config.json đã được kiểm tra cú pháp và đối chiếu các trường cấu hình. Bắt đầu script bằng chức năng đọc JSON, kiểm tra cấu trúc object cùng kiểu cờ enable_auto_failover và hiển thị các đầu vào chính.
+
+Trên laptop, tạo scripts/cloud/cloud_watcher.py với nội dung sau.
+
+```python
+import json
+from pathlib import Path
+
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+CONFIG_PATH = PROJECT_ROOT / "deploy" / "watcher" / "config.json"
+
+
+def load_config():
+    config = json.loads(CONFIG_PATH.read_text(encoding="utf-8-sig"))
+    if not isinstance(config, dict):
+        raise ValueError("Watcher config must be a JSON object.")
+    if type(config.get("enable_auto_failover")) is not bool:
+        raise ValueError("enable_auto_failover must be true or false.")
+    return config
+
+
+def main():
+    config = load_config()
+    mode = "automatic" if config["enable_auto_failover"] else "observe"
+    print(f"mode={mode}")
+    print(f"aws_region={config['aws_region']}")
+    print(f"aws_instance_id={config['aws_instance_id']}")
+    print(f"aws_writer_url={config['aws_writer_url']}")
+
+
+if __name__ == "__main__":
+    main()
+```
+
+PROJECT_ROOT được tính từ đường dẫn của script. Với scripts/cloud/cloud_watcher.py, parents[0] là thư mục cloud, parents[1] là thư mục scripts và parents[2] là thư mục gốc repository. CONFIG_PATH ghép đường dẫn tới file JSON theo vị trí project. Cách này xác định file cấu hình từ vị trí script khi terminal có working directory khác.
+
+Path.read_text đọc nội dung file. Encoding utf-8-sig hỗ trợ UTF-8 và xử lý BOM khi có trong file Windows. json.loads chuyển chuỗi JSON thành object Python. JSON object của cấu hình được biểu diễn bằng dict.
+
+load_config kiểm tra object gốc là dict. Kiểm tra type của enable_auto_failover yêu cầu đúng kiểu bool. JSON false trở thành False trong Python. Chuỗi JSON "false" có kiểu str và trong điều kiện Python có giá trị truthy, nên cần phát hiện cấu hình nhầm kiểu trước khi dùng cờ điều khiển.
+
+main gọi load_config, xác định tên chế độ từ cờ và in bốn dòng đối chiếu. F-string chèn giá trị cấu hình vào output. Điều kiện __name__ == "__main__" gọi main khi file được chạy trực tiếp bằng Python và giữ các hàm có thể import trong các bước phát triển tiếp.
+
+Trên Git Bash laptop tại repository, chạy script.
+
+```bash
+.venv/Scripts/python.exe scripts/cloud/cloud_watcher.py
+```
+
+Với cấu hình đã chuẩn bị, đầu ra mong đợi là
+
+```text
+mode=observe
+aws_region=ap-southeast-1
+aws_instance_id=i-014ee6f4d204aacb7
+aws_writer_url=https://aws.mcf.todicode.tech/health/database
+```
+
+Checkpoint là script đọc được file cấu hình và in đúng các giá trị của lượt triển khai. Đầu ra mode phản ánh cờ cấu hình cho phần watcher đang xây dựng. Bước tiếp theo bổ sung HTTP probe để quan sát writer health.
+
+### 4.67. Quan sát writer health của hai origin qua HTTP
+
+Người vận hành đã chạy scripts/cloud/cloud_watcher.py và nhận đúng mode observe, AWS region, instance ID cùng writer URL. Tiếp tục bổ sung HTTP probe dùng thư viện httpx đã có trong requirements.txt.
+
+Trong scripts/cloud/cloud_watcher.py, thêm import httpx dưới các import hiện tại.
+
+```python
+import httpx
+```
+
+Thêm hàm sau giữa load_config và main.
+
+```python
+def probe_writer(url, timeout):
+    try:
+        response = httpx.get(
+            url,
+            timeout=timeout,
+            follow_redirects=False,
+            trust_env=False,
+        )
+    except httpx.RequestError as error:
+        return {"http_status": None, "error": type(error).__name__}
+
+    try:
+        body = response.json()
+    except ValueError:
+        return {"http_status": response.status_code, "error": "invalid_json"}
+
+    return {"http_status": response.status_code, "body": body}
+```
+
+httpx.get gửi HTTP GET đến origin URL trong cấu hình. timeout lấy từ http_timeout_seconds. follow_redirects false giữ phản hồi của chính URL đã chỉ định để quan sát redirect khi có. trust_env false dùng cấu hình kết nối của code và bỏ qua cấu hình proxy từ environment.
+
+Nhánh except httpx.RequestError thu nhận lỗi mạng hoặc timeout và trả tên loại lỗi cùng http_status null khi in thành JSON. Nhánh except ValueError ghi nhận response có body đọc được nhưng chưa giải mã được thành JSON. Khi JSON được giải mã, kết quả chứa HTTP status cùng body. HTTP 503 của standby vẫn được đưa qua bước đọc JSON để quan sát role và writable. [HTTPX requests and JSON](https://www.python-httpx.org/quickstart/), [HTTPX exceptions](https://www.python-httpx.org/exceptions/).
+
+Cuối hàm main, sau bốn lệnh print hiện có, thêm vòng lặp sau với cùng mức thụt đầu dòng.
+
+```python
+    for cloud in ("aws", "azure"):
+        url = config[f"{cloud}_writer_url"]
+        result = probe_writer(url, config["http_timeout_seconds"])
+        print(f"{cloud}={json.dumps(result, ensure_ascii=False)}")
+```
+
+Vòng lặp chạy một lần cho aws và một lần cho azure. F-string tạo key aws_writer_url hoặc azure_writer_url. probe_writer nhận URL cùng timeout và trả dữ liệu quan sát. json.dumps chuyển dict kết quả thành chuỗi JSON để đọc ở terminal. ensure_ascii false giữ ký tự Unicode dễ đọc trong output.
+
+Chạy trên Git Bash laptop.
+
+```bash
+.venv/Scripts/python.exe scripts/cloud/cloud_watcher.py
+```
+
+Với topology đã nghiệm thu, dòng aws cần HTTP status 200, role primary và writable true. Dòng azure cần HTTP status 503, role standby, writable false cùng replication_connected true. Script thực hiện một lượt kiểm tra cho mỗi cloud. Nếu output có trường error, đối chiếu lỗi probe trước khi bổ sung logic quyết định.
+
+Checkpoint là HTTP status và body của hai môi trường đã được quan sát từ chương trình Python. Bước tiếp theo phân loại kết quả probe thành trạng thái phục vụ logic watcher và xử lý riêng trạng thái tạm dừng ghi có kế hoạch.
+
+### 4.68. Phân loại phản hồi writer health
+
+HTTP probe đã trả AWS status 200, role primary, writable true, writes_paused false và current_lsn 0/7000800. Azure trả status 503, role standby, writable false, replication_connected true, receive_lsn cùng replay_lsn 0/7000800. Tiếp tục chuyển các phản hồi quan sát thành trạng thái để phục vụ logic watcher.
+
+Trong scripts/cloud/cloud_watcher.py, thêm hàm sau giữa probe_writer và main.
+
+```python
+def classify_probe(result):
+    status = result.get("http_status")
+    body = result.get("body")
+    if not isinstance(body, dict) or body.get("connected") is not True:
+        return "unknown"
+
+    role = body.get("role")
+    writable = body.get("writable")
+    paused = body.get("writes_paused")
+
+    if status == 200 and role == "primary" and writable is True and paused is False:
+        return "writer"
+    if status == 503 and role == "primary" and writable is False and paused is True:
+        return "paused"
+    if status == 503 and role == "standby" and writable is False:
+        return "standby"
+    return "unknown"
+```
+
+result.get đọc từng trường từ dict kết quả probe. Phần kiểm tra đầu yêu cầu body là dict cùng connected true. Các trường thiếu hoặc body chưa giải mã được dẫn tới unknown. Các phép is True và is False yêu cầu đúng giá trị boolean.
+
+writer yêu cầu HTTP 200, PostgreSQL primary, writable true và writes_paused false. paused yêu cầu HTTP 503, PostgreSQL primary, writable false và writes_paused true. standby yêu cầu HTTP 503, role standby và writable false. Các phản hồi khác được phân loại unknown để bước quyết định có thể xử lý kết quả chưa đủ thông tin.
+
+Trạng thái paused có ý nghĩa trong failback có kế hoạch. Khi người vận hành đã đặt writes_enabled false, primary còn hoạt động và ứng dụng chủ động tạm dừng ghi. Logic watcher sẽ nhận biết trạng thái này để xử lý bảo trì có kế hoạch. Trạng thái standby mô tả vai trò của database được endpoint báo về. Kiểm tra điều kiện promotion, WAL và fencing được xây dựng trong các bước điều khiển tiếp theo.
+
+Trong main, cập nhật vòng lặp quan sát thành đoạn sau.
+
+```python
+    for cloud in ("aws", "azure"):
+        url = config[f"{cloud}_writer_url"]
+        result = probe_writer(url, config["http_timeout_seconds"])
+        state = classify_probe(result)
+        print(f"{cloud} state={state} result={json.dumps(result, ensure_ascii=False)}")
+```
+
+classify_probe nhận result từ HTTP probe và trả chuỗi trạng thái. Dòng print ghi cả state cùng response gốc để đối chiếu quyết định phân loại với dữ liệu đầu vào.
+
+Chạy trên Git Bash laptop.
+
+```bash
+.venv/Scripts/python.exe scripts/cloud/cloud_watcher.py
+```
+
+Kết quả mong đợi với topology hiện tại là dòng aws có state=writer và dòng azure có state=standby. Kịch bản primary đã tạm dừng ghi sẽ cho state=paused khi endpoint trả đầy đủ các trường tương ứng.
+
+Checkpoint là phân loại đúng hai origin hiện tại và hiểu ý nghĩa của writer, paused, standby, unknown. Các lỗi mạng và database chưa kết nối hiện rơi vào unknown. Bước tiếp theo bổ sung phân loại bằng chứng lỗi phục vụ phát hiện sự cố, cùng nguồn quan sát Route 53.
+
+### 4.69. Bổ sung bằng chứng unavailable cho HTTP probe
+
+Hàm classify_probe đã được thêm vào script và đối chiếu cấu trúc với endpoint database/role.py. Bổ sung hai tình huống unavailable để chuẩn bị phát hiện sự cố, đồng thời phân biệt kết quả paused của lượt bảo trì có kế hoạch.
+
+Trong scripts/cloud/cloud_watcher.py, thay hàm classify_probe bằng phiên bản sau.
+
+```python
+def classify_probe(result):
+    if result.get("error") in ("ConnectTimeout", "ReadTimeout"):
+        return "unavailable"
+
+    status = result.get("http_status")
+    body = result.get("body")
+    if (
+        status == 503
+        and isinstance(body, dict)
+        and body.get("connected") is False
+    ):
+        return "unavailable"
+    if not isinstance(body, dict) or body.get("connected") is not True:
+        return "unknown"
+
+    role = body.get("role")
+    writable = body.get("writable")
+    paused = body.get("writes_paused")
+
+    if status == 200 and role == "primary" and writable is True and paused is False:
+        return "writer"
+    if status == 503 and role == "primary" and writable is False and paused is True:
+        return "paused"
+    if status == 503 and role == "standby" and writable is False:
+        return "standby"
+    return "unknown"
+```
+
+ConnectTimeout cho biết probe đã hết thời gian chờ kết nối. ReadTimeout cho biết probe hết thời gian chờ nhận dữ liệu. Cả hai được ghi nhận unavailable từ góc quan sát của HTTP probe. Các lỗi ConnectError, lỗi giải mã JSON và phản hồi chưa đủ thông tin tiếp tục rơi vào unknown theo logic hiện tại. Những kết quả này cần được kết hợp với nguồn Route 53 và kiểm tra fencing khi xây dựng quyết định failover.
+
+Trường hợp HTTP 503 kèm connected false tương ứng endpoint ứng dụng báo kết nối database thất bại. Trường hợp này được kiểm tra trước nhánh unknown để phân loại unavailable. HTTP 503 của standby có connected true, còn primary tạm dừng ghi có connected true cùng writes_paused true, nên các nhánh role tiếp tục xử lý thành standby và paused.
+
+Chạy trên Git Bash laptop để đối chiếu trạng thái thực tế.
+
+```bash
+.venv/Scripts/python.exe scripts/cloud/cloud_watcher.py
+```
+
+Với topology hiện tại, AWS cần state writer và Azure cần state standby.
+
+Kiểm tra riêng nhánh timeout bằng dữ liệu mô phỏng trong Git Bash.
+
+```bash
+.venv/Scripts/python.exe - <<'PY'
+from scripts.cloud.cloud_watcher import classify_probe
+
+result = {"http_status": None, "error": "ConnectTimeout"}
+print(classify_probe(result))
+PY
+```
+
+Cú pháp heredoc truyền đoạn Python giữa hai dòng PY vào stdin của interpreter. Đầu ra cần unavailable. Phép kiểm tra truyền dữ liệu kết quả trực tiếp vào hàm phân loại, giúp kiểm chứng nhánh lỗi khi hệ thống cloud đang hoạt động bình thường.
+
+Checkpoint là phân loại được writer, paused, standby, unavailable và unknown theo dữ liệu hiện có. Unavailable là quan sát đầu vào để tiếp tục xác minh. Quyết định chuyển vai trò cần được xây dựng với ngưỡng lỗi, nguồn quan sát Route 53 và điều kiện fencing.
 
 ## 5. Theo dõi tiến độ
 
@@ -2355,6 +2636,12 @@ scripts/watcher.py hiện sử dụng scripts/local_replication.py và địa ch
 - [x] Failback và khôi phục topology AWS primary, Azure standby.
 - [x] Nghiệm thu chức năng vòng failover, rejoin và failback thủ công giai đoạn 7.
 - [ ] Triển khai và kiểm chứng cloud watcher tự động phát hiện lỗi, fence AWS và promote Azure.
+
+- [x] Chuẩn bị và kiểm tra file cấu hình cloud watcher trên laptop.
+- [x] Viết và chạy điểm vào Python đọc cấu hình cloud watcher.
+- [x] Thêm HTTP probe và đối chiếu writer health hai origin trong mode observe.
+- [x] Thêm phân loại writer, paused, standby và unknown cho kết quả HTTP probe.
+- [ ] Bổ sung unavailable và đối chiếu phân loại timeout cùng lỗi kết nối database.
 
 ## 6. Tài liệu kỹ thuật
 

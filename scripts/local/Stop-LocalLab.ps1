@@ -34,6 +34,6 @@ foreach ($labProcess in $labProcesses) {
     if ($LASTEXITCODE -ne 0) { throw "Failed to stop verified web process $($labProcess.ProcessId)." }
 }
 
-& $labPython -c "from scripts import local_replication as lab; lab.compose('stop')"
+& $labPython -c "from scripts.local import local_replication as lab; lab.compose('stop')"
 if ($LASTEXITCODE -ne 0) { throw 'Failed to stop this lab database project; inspect Docker Desktop.' }
 Write-Host 'Local lab stopped. Database volumes and topology state are preserved.'

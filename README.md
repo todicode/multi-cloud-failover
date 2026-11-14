@@ -69,10 +69,10 @@ Set-Location multi-cloud-failover
 py -3.12 -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -r requirements-dev.txt
 
-. .\scripts\Use-LocalLab.ps1
-.\.venv\Scripts\python.exe scripts/local_replication.py setup
-.\.venv\Scripts\python.exe scripts/local_replication.py start-web
-.\.venv\Scripts\python.exe scripts/local_replication.py start-proxy
+. .\scripts\local\Use-LocalLab.ps1
+.\.venv\Scripts\python.exe scripts/local/local_replication.py setup
+.\.venv\Scripts\python.exe scripts/local/local_replication.py start-web
+.\.venv\Scripts\python.exe scripts/local/local_replication.py start-proxy
 .\.venv\Scripts\python.exe scripts/seed_demo.py --url http://127.0.0.1:8190
 ```
 
@@ -93,10 +93,10 @@ Run `Use-LocalLab.ps1` in each new local-lab terminal. It selects the `mcf-todic
 With the local AWS database acting as primary:
 
 ```powershell
-. .\scripts\Use-LocalLab.ps1
+. .\scripts\local\Use-LocalLab.ps1
 $env:TASKFLOW_DB_TESTS = '1'
 .\.venv\Scripts\python.exe -m pytest -q
-.\.venv\Scripts\python.exe scripts/check_local_lifecycle.py
+.\.venv\Scripts\python.exe scripts/local/check_local_lifecycle.py
 ```
 
 The local test suite passed **19 tests**. The lifecycle check passed repeated switchover/failback cycles, interrupted recovery, standby write rejection, retry handling, data/history comparisons, and watcher-triggered failover after an abrupt database stop. Lifecycle checks use an isolated Docker project and separate ports.
@@ -104,6 +104,12 @@ The local test suite passed **19 tests**. The lifecycle check passed repeated sw
 The application image was built for Linux AMD64 and run as `appuser` in two containers using the same image ID. Local checks confirmed HTTP endpoints, primary/standby connectivity, and manual issue/comment replication through the containerized web instances.
 
 The [accepted CI run](https://github.com/todicode/multi-cloud-failover/actions/runs/42080473436) passed API/PostgreSQL tests, image build/publication, and verification on a separate runner. That runner pulled by digest, checked the image revision and default user, started the application, and checked liveness, version, and static UI over HTTP. The [Stage 3 guide](docs/instruction/giaidoan3_ci_va_container_registry.md) records the accepted commit and image digest.
+
+## Scripts
+
+- [scripts/local/](scripts/local/) contains the Docker Compose recovery lab, local watcher, lifecycle checks, and PowerShell helpers.
+- [scripts/cloud/](scripts/cloud/) is the location for cloud watcher scripts developed through the Stage 7 guide.
+- [probe_failover.py](scripts/probe_failover.py), [seed_demo.py](scripts/seed_demo.py), and [watcher_core.py](scripts/watcher_core.py) provide shared HTTP tools and watcher decision logic.
 
 ## Documentation
 

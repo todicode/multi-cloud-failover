@@ -4,7 +4,7 @@ Local stand-ins for the cloud setup: the web check is the AWS origin's /health/d
 database check is a direct connection to the AWS PostgreSQL. If only one fails the watcher keeps
 watching. Once it has failed over it stops; it never fails back or restarts the old primary.
 
-    python scripts/watcher.py --interval 5 --threshold 3
+    python scripts/local/watcher.py --interval 5 --threshold 3
 """
 import argparse
 import sys
@@ -13,9 +13,9 @@ from pathlib import Path
 import httpx
 import psycopg
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
-from scripts import local_replication as demo
+from scripts.local import local_replication as demo
 from scripts.watcher_core import run
 
 
