@@ -25,7 +25,7 @@ data:
     chmod 600 "$PGPASSFILE"
 
     gosu postgres pg_basebackup \
-      -d "host=$SOURCE_DB_HOST port=5432 user=$REPLICATION_USER passfile=$PGPASSFILE application_name=mcf-azure-standby connect_timeout=10" \
+      -d "host=$SOURCE_DB_HOST port=5432 user=$REPLICATION_USER passfile=$PGPASSFILE application_name=${PGAPPNAME:-mcf-azure-standby} connect_timeout=10" \
       -D "$PGDATA" -R -X stream -c fast -w
 
     test "$(cat "$PGDATA/PG_VERSION")" = 17

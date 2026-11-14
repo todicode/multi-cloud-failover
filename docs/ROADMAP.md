@@ -54,6 +54,8 @@ The [Stage 6 guide](instruction/giaidoan6_dns_va_https.md) records delegation of
 
 ## Milestones
 
+The [Stage 7 guide](instruction/giaidoan7_failover_va_phuc_hoi.md) records the initial topology checks, K3s startup controls on both hosts, and a successful guard/recovery exercise on Azure. Manual failover from AWS to Azure has passed EC2 fencing, database promotion, DNS selection, shared-hostname HTTPS, a new application write/read, and retrieval of a pre-failure probe record. AWS rejoin and controlled failback are in progress. Repeated failure measurements and RPO evaluation are scheduled for Stage 9.
+
 | Phase | Deliverable | Acceptance evidence |
 |---|---|---|
 | Infrastructure | Independent AWS and Azure compute, networking, IPs, and storage | Deployment, post-apply plan, and SSH validated independently on both clouds, followed by lab cleanup and recreation for Stage 5 |
