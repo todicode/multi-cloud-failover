@@ -3057,6 +3057,359 @@ Chạy trên Git Bash laptop.
 
 Khi tất cả báo cáo đủ mới và đều thành công, đầu ra có route53_state=healthy, kèm các dòng checker tương ứng. Checkpoint là chương trình đã có route53_state để dùng trong bước kết hợp các nguồn quan sát.
 
+### 4.85. Khôi phục lab sau lần nghỉ trước khi tiếp tục watcher
+
+Lượt nghỉ gần nhất đã dừng EC2 và deallocate VM Azure để tiết kiệm compute. Topology trước khi nghỉ là AWS primary và Azure standby. Sau khi bật lại host, startup guard yêu cầu phê duyệt khởi động K3s trong boot hiện tại vì marker dưới /run đã mất.
+
+Đối chiếu account và tài nguyên theo phần đầu tài liệu trước khi bật máy. Các lệnh khởi động host dùng cho topology hiện tại là
+
+```bash
+aws ec2 start-instances \
+  --profile default \
+  --region ap-southeast-1 \
+  --instance-ids i-014ee6f4d204aacb7 \
+  --no-cli-pager
+
+az vm start \
+  --subscription 52341a4a-a86f-4780-82dc-879b500022d8 \
+  --resource-group mcf-azure-rg \
+  --name mcf-azure-standby
+```
+
+Chờ EC2 running với hai status check ok và VM Azure PowerState/running. Từ Git Bash laptop, mở hai terminal SSH riêng.
+
+```bash
+ssh -i ~/.ssh/mcf-lab ubuntu@175.41.152.242
+```
+
+```bash
+ssh -i ~/.ssh/mcf-lab azureuser@4.145.30.250
+```
+
+Nếu key có passphrase, nhập tại terminal của người vận hành khi SSH hỏi. Khôi phục workload theo vai trò AWS primary và Azure standby của lượt nghỉ này. Trên mỗi host, chạy lần lượt
+
+```bash
+sudo touch /run/issues-k3s-start-approved
+sudo systemctl reset-failed k3s
+sudo systemctl start k3s
+sudo k3s kubectl -n issues rollout status statefulset/postgres --timeout=180s
+sudo k3s kubectl -n issues rollout status deployment/issues-app --timeout=180s
+```
+
+touch tạo marker phê duyệt boot mà ExecStartPre của startup guard kiểm tra. reset-failed xóa trạng thái lỗi cùng bộ đếm giới hạn khởi động của dịch vụ. start yêu cầu systemd khởi động K3s. Hai lệnh rollout status chờ PostgreSQL và ứng dụng đạt trạng thái triển khai sẵn sàng.
+
+Đối chiếu vai trò database trên từng host.
+
+```bash
+sudo k3s kubectl -n issues exec postgres-0 -- \
+  psql -X -U taskflow -d taskflow -P pager=off -c \
+  "SELECT pg_is_in_recovery() AS in_recovery,
+          current_setting('transaction_read_only') AS read_only;"
+```
+
+AWS cần in_recovery f, read_only off. Azure cần in_recovery t, read_only on. Checkpoint là workload hai cloud đã khởi động với đúng vai trò sau khi nghỉ. Tiếp tục đối chiếu WireGuard, WAL và HTTP probe trước bước quyết định failover của watcher.
+
+### 4.86. Kết hợp kết quả quan sát thành failover_candidate
+
+Người vận hành đã xác nhận workload sau khi bật máy và vai trò AWS primary, Azure standby đạt kết quả mong đợi. Tiếp tục giữ kết quả HTTP probe của từng cloud trong một dict để tính điều kiện cho lượt quan sát.
+
+Trong scripts/cloud/cloud_watcher.py, ở cuối main, thay vòng for đang probe hai cloud bằng đoạn sau, gồm cả phần tính failover_candidate sau vòng lặp.
+
+```python
+    writer_states = {}
+    for cloud in ("aws", "azure"):
+        url = config[f"{cloud}_writer_url"]
+        result = probe_writer(url, config["http_timeout_seconds"])
+        state = classify_probe(result)
+        writer_states[cloud] = state
+        print(f"{cloud} state={state}, result={json.dumps(result, ensure_ascii=False)}")
+
+    failover_candidate = (
+        writer_states["aws"] == "unavailable"
+        and route53_state == "unhealthy"
+        and writer_states["azure"] == "standby"
+    )
+    print(f"failover_candidate={failover_candidate}")
+```
+
+writer_states được tạo một lần trước vòng lặp. Mỗi lượt gán kết quả phân loại vào key aws hoặc azure. Sau vòng lặp, dict chứa đủ trạng thái của hai origin, ví dụ {"aws": "writer", "azure": "standby"} trong topology bình thường.
+
+Biểu thức and yêu cầu cả ba điều kiện cùng đúng. HTTP probe AWS cần unavailable, nguồn Route 53 cần unhealthy theo quy tắc tổng hợp đã chọn và HTTP probe Azure cần standby. Nếu một điều kiện sai, failover_candidate nhận False. Trạng thái paused của AWS trong lượt bảo trì có kế hoạch và trạng thái unknown của nguồn quan sát đều làm biểu thức này trả False.
+
+Ví dụ các kết quả của một lượt đánh giá là
+
+| AWS HTTP state | route53_state | Azure HTTP state | failover_candidate |
+|---|---|---|---|
+| writer | healthy | standby | False |
+| unavailable | healthy | standby | False |
+| unavailable | unhealthy | standby | True |
+| unavailable | unknown | standby | False |
+| paused | unhealthy | standby | False |
+| unavailable | unhealthy | writer | False |
+
+Giá trị True là đầu vào cho bộ đếm các lượt lỗi liên tiếp sẽ xây dựng tiếp theo. Trước khi chuyển writer, các bước điều khiển còn phải kiểm chứng standby, fencing AWS và trạng thái writer sau promotion.
+
+Trên Git Bash laptop, chạy script để kiểm chứng với hệ thống vừa khôi phục.
+
+```bash
+.venv/Scripts/python.exe scripts/cloud/cloud_watcher.py
+```
+
+Khi AWS phục vụ writer, Azure ở vai trò standby và các báo cáo Route 53 đủ mới đều thành công, đầu ra cần có aws state=writer, azure state=standby, route53_state=healthy và failover_candidate=False. Đối chiếu thêm replication_connected true trong body Azure để xác nhận kết nối replication sau khi bật máy.
+
+Checkpoint là đã lưu riêng HTTP state của hai cloud và tính được điều kiện của một lượt quan sát. Bước tiếp theo tổ chức việc quan sát lặp lại và đếm các lượt đáp ứng điều kiện liên tiếp theo failure_threshold.
+
+### 4.87. Lặp quan sát và đếm các lượt lỗi liên tiếp
+
+Một lượt quan sát đã tính được failover_candidate từ các nguồn hiện có. Bổ sung vòng lặp để lấy lại dữ liệu và cập nhật bộ đếm sau mỗi lượt. failure_threshold trong JSON đặt ngưỡng lượt lỗi liên tiếp, còn interval_seconds đặt thời gian nghỉ sau một lượt đã hoàn tất.
+
+Trong scripts/cloud/cloud_watcher.py, thêm import sau ở đầu file.
+
+```python
+import time
+```
+
+Trong main, chuyển dòng tạo route53 client lên ngay sau dòng tạo ec2 client. Vị trí này nằm sau phần kiểm chứng danh tính STS. Đặt bộ đếm và mở vòng lặp tại đây, để đoạn khởi tạo có dạng sau.
+
+```python
+    ec2 = session.client("ec2", config=aws_client_config)
+    route53 = session.client("route53", config=aws_client_config)
+    failure_count = 0
+    while True:
+```
+
+Chuyển dòng tạo route53 bằng thao tác cắt và dán để mỗi client được tạo một lần. Sau đó chọn toàn bộ phần đang đọc EC2, bắt đầu từ try ngay dưới đoạn khởi tạo client, đến hết dòng print failover_candidate ở cuối main. Tăng thụt đầu dòng toàn bộ đoạn đã chọn thêm 4 dấu cách để đưa các lệnh đó vào while. Trong VS Code có thể chọn đoạn và nhấn Tab một lần nếu editor đang dùng 4 dấu cách.
+
+Các lệnh cùng cấp trong thân while có 8 dấu cách đầu dòng. Nội dung của try, except, if và for bên trong tiếp tục thụt theo cấp hiện có. EC2, Route 53 và HTTP probe đều được gọi lại trong mỗi lượt. Session, STS và các client được khởi tạo trước vòng lặp.
+
+Ngay sau dòng print failover_candidate, trong thân while, thêm đoạn sau với 8 dấu cách đầu dòng.
+
+```python
+        if failover_candidate:
+            failure_count += 1
+        else:
+            failure_count = 0
+        threshold_reached = failure_count >= config["failure_threshold"]
+        print(f"consecutive_failures={failure_count}")
+        print(f"failover_threshold_reached={threshold_reached}")
+        time.sleep(config["interval_seconds"])
+```
+
+failure_count được khởi tạo trước while để giữ giá trị giữa các lượt. Khi failover_candidate True, += 1 tăng bộ đếm. Khi False, đặt bộ đếm về 0, bắt đầu lại yêu cầu các lượt lỗi liên tiếp. Theo biểu thức đã viết, lượt có dữ liệu unknown hoặc AWS paused cũng làm failover_candidate False và ngắt chuỗi đếm.
+
+threshold_reached nhận True khi bộ đếm đạt hoặc vượt ngưỡng failure_threshold. Với ngưỡng 3, chuỗi True, True, False, True tạo các số đếm 1, 2, 0, 1. Chuỗi True, True, True tạo các số đếm 1, 2, 3 và cờ đạt ngưỡng True ở lượt thứ ba.
+
+time.sleep nghỉ theo interval_seconds rồi vòng lặp bắt đầu lượt quan sát mới. Một vòng gồm thời gian gọi API, HTTP probe cùng thời gian nghỉ. Các dòng trạng thái của từng lượt giúp đối chiếu dữ liệu đầu vào với bộ đếm và cờ đạt ngưỡng. Cờ này sẽ được đưa vào phần điều khiển failover ở các bước tiếp theo.
+
+Trên Git Bash laptop, kiểm tra cú pháp sau khi chỉnh thụt đầu dòng rồi chạy chương trình.
+
+```bash
+.venv/Scripts/python.exe -m py_compile scripts/cloud/cloud_watcher.py
+.venv/Scripts/python.exe scripts/cloud/cloud_watcher.py
+```
+
+Khi topology AWS primary, Azure standby hoạt động bình thường, mỗi lượt cần có failover_candidate=False, consecutive_failures=0 và failover_threshold_reached=False. Sau vài lượt quan sát, dùng Ctrl+C để kết thúc chương trình trên laptop. Checkpoint là mỗi vòng đọc lại dữ liệu, bộ đếm giữ qua các vòng và ngắt chuỗi khi điều kiện của lượt quan sát False.
+
+Người vận hành đã đối chiếu vòng quan sát bình thường. EC2 running, nguồn Route 53 cùng các checker healthy, AWS writer và Azure standby có replication_connected true. current_lsn trên AWS cùng receive_lsn và replay_lsn trên Azure đều là 0/70009B8 trong lượt này. Bộ đếm giữ 0 và cờ đạt ngưỡng False. KeyboardInterrupt tại time.sleep xuất hiện khi kết thúc bằng Ctrl+C.
+
+Trước khi chuyển chương trình sang host Azure, đối chiếu dòng tạo client route53 chỉ có một vị trí ở đầu main, cạnh dòng tạo client ec2. Xóa dòng tạo lại route53 còn nằm trong while nếu thao tác chuyển dòng trước đó đã để lại bản sao. Client ở đầu main được dùng qua các vòng quan sát.
+
+### 4.88. Chuẩn bị môi trường chạy watcher trên host Azure
+
+Chuẩn bị runtime Python trên VM Azure để triển khai watcher theo vị trí chạy đã thiết kế. Watcher dự kiến là tiến trình trên host, có thể quan sát AWS và thực hiện các thao tác điều phối khi đạt điều kiện. Thư mục runtime được chọn là /home/azureuser/mcf-watcher, thuộc tài khoản azureuser.
+
+Trong terminal SSH Azure, chạy lần lượt
+
+```bash
+sudo apt-get update
+sudo apt-get install -y python3-venv
+mkdir -p ~/mcf-watcher/scripts/cloud ~/mcf-watcher/deploy/watcher
+python3 -m venv ~/mcf-watcher/.venv
+~/mcf-watcher/.venv/bin/python --version
+```
+
+apt-get update cập nhật danh mục package. apt-get install cài module venv của Python hệ thống trên Ubuntu. mkdir -p tạo cây thư mục runtime, bao gồm thư mục cha khi cần. python3 -m venv tạo môi trường thư viện riêng cho tiến trình watcher. Lệnh cuối dùng interpreter bên trong môi trường đó để đối chiếu phiên bản. [Ubuntu python3-venv](https://packages.ubuntu.com/noble/python3-venv), [Python venv](https://docs.python.org/3.12/library/venv.html).
+
+Với Ubuntu 24.04 của lab, phiên bản dự kiến là Python 3.12.x. Trên Linux, interpreter của virtual environment nằm dưới .venv/bin/python. Cây scripts/cloud và deploy/watcher được tạo để giữ đúng quan hệ đường dẫn mà PROJECT_ROOT trong cloud_watcher.py sử dụng. Khi chuyển code, script sẽ ở scripts/cloud và đọc JSON từ deploy/watcher trong cùng runtime root.
+
+Checkpoint là môi trường Python trên host Azure đã được tạo và interpreter chạy được. Bước tiếp theo chuyển script, config cùng requirements từ laptop lên cây thư mục này, rồi cài dependency và cấu hình profile AWS cho tài khoản chạy watcher.
+
+### 4.89. Chuyển code watcher lên Azure và cài dependency
+
+Sau khi có cây thư mục runtime cùng virtual environment trên host Azure, chuyển ba file từ laptop vào vị trí tương ứng. Lượt này dùng cloud_watcher.py, config.json và requirements.txt dành cho watcher.
+
+Trên Git Bash laptop tại thư mục gốc repository, chạy lần lượt
+
+```bash
+cd /d/multi-cloud-failover
+
+scp -i ~/.ssh/mcf-lab \
+  scripts/cloud/cloud_watcher.py \
+  azureuser@4.145.30.250:/home/azureuser/mcf-watcher/scripts/cloud/
+
+scp -i ~/.ssh/mcf-lab \
+  deploy/watcher/config.json deploy/watcher/requirements.txt \
+  azureuser@4.145.30.250:/home/azureuser/mcf-watcher/deploy/watcher/
+```
+
+scp truyền file qua kết nối SSH. -i chọn private key dùng để xác thực kết nối. Đối số nguồn là file trên laptop. Phần azureuser@4.145.30.250 xác định tài khoản cùng host nhận file, còn đường dẫn sau dấu hai chấm chọn thư mục đích. Lệnh thứ hai gửi hai file vào cùng thư mục đích. Nhập passphrase tại terminal nếu SSH yêu cầu. [OpenSSH scp](https://man.openbsd.org/scp).
+
+Trong terminal SSH Azure, chuyển vào runtime root và cài dependency bằng Python của virtual environment đã tạo.
+
+```bash
+cd ~/mcf-watcher
+.venv/bin/python -m pip install -r deploy/watcher/requirements.txt
+```
+
+-m pip sử dụng pip thuộc interpreter .venv/bin/python. -r yêu cầu đọc danh sách phiên bản từ file requirements. Lượt cài này chuẩn bị Boto3, HTTPX và các dependency đi kèm cho môi trường Linux của host Azure. [pip install](https://pip.pypa.io/en/stable/cli/pip_install/).
+
+Kiểm tra phiên bản hai thư viện và cú pháp Python trên Azure.
+
+```bash
+.venv/bin/python -c "import boto3; import httpx; print(boto3.__version__, httpx.__version__)"
+.venv/bin/python -m py_compile scripts/cloud/cloud_watcher.py
+```
+
+Dòng đầu cần in 1.44.3 0.28.1 theo requirements đã chuẩn bị. py_compile cần kết thúc thành công. Checkpoint là ba file ở đúng cây thư mục, dependency đã cài và script qua kiểm tra cú pháp trên host Azure. Bước tiếp theo chuẩn bị profile mcf-watcher trong môi trường tài khoản azureuser rồi chạy quan sát từ Azure.
+
+### 4.90. Cấu hình credential profile và chạy quan sát từ Azure
+
+Watcher trên host Azure được chạy bằng tài khoản azureuser trong lượt này. Chuẩn bị profile mcf-watcher trong shared credentials file thuộc tài khoản đó, dùng cặp access key đã tạo cho IAM user mcf-azure-watcher.
+
+Trong terminal SSH Azure, chạy lần lượt
+
+```bash
+mkdir -p ~/.aws
+chmod 700 ~/.aws
+touch ~/.aws/credentials
+chmod 600 ~/.aws/credentials
+nano ~/.aws/credentials
+```
+
+Trong file, tạo hoặc cập nhật section sau. Thay hai giá trị mẫu bằng credential của IAM user watcher đã chuẩn bị.
+
+```ini
+[mcf-watcher]
+aws_access_key_id = YOUR_WATCHER_ACCESS_KEY_ID
+aws_secret_access_key = YOUR_WATCHER_SECRET_ACCESS_KEY
+```
+
+Lưu trong nano bằng Ctrl+O, Enter rồi Ctrl+X. mkdir tạo thư mục cấu hình của AWS SDK. chmod 700 cho phép chủ sở hữu truy cập thư mục. chmod 600 cho phép chủ sở hữu đọc và ghi file credential. Quyền được đặt trước khi nhập key. Giữ kín credential và lưu tại ~/.aws/credentials của tài khoản chạy watcher.
+
+Section mcf-watcher khớp với aws_profile trong config.json. Session trong chương trình chọn section này để xác thực. Region được chương trình truyền qua region_name từ JSON. Shared credentials file hỗ trợ các section theo tên profile và được Boto3 đọc trực tiếp. [Boto3 named profiles and shared credentials](https://docs.aws.amazon.com/boto3/latest/guide/credentials.html#shared-credentials-file).
+
+Kiểm tra quyền cùng owner bằng lệnh sau, chỉ hiển thị metadata file.
+
+```bash
+stat -c '%a %U:%G %n' ~/.aws ~/.aws/credentials
+```
+
+Mong đợi thư mục có mode 700, file có mode 600 và owner là azureuser. Sau đó chạy chương trình từ runtime root trên Azure.
+
+```bash
+cd ~/mcf-watcher
+.venv/bin/python scripts/cloud/cloud_watcher.py
+```
+
+Đối chiếu dòng aws_identity là arn:aws:iam::925271162060:user/mcf-azure-watcher. Khi topology đang khỏe, chương trình cần in mode observe, EC2 running, route53_state healthy, AWS writer, Azure standby, consecutive_failures 0 và failover_threshold_reached False. Body Azure cần replication_connected true trong lượt kiểm tra sau khôi phục.
+
+Lượt chạy này kiểm chứng từ host Azure gồm chọn credential, truy cập AWS API, HTTPS tới hai origin và vòng quan sát. Sau vài vòng đã đối chiếu, dùng Ctrl+C để kết thúc tiến trình chạy trong terminal. Checkpoint là watcher đã hoạt động ở mode observe từ đúng host sẽ điều phối failover. Bước tiếp theo kiểm tra thao tác đọc PostgreSQL trong K3s bằng tài khoản chạy watcher để chuẩn bị preflight standby.
+
+### 4.91. Kiểm chứng đường đọc PostgreSQL của watcher trên Azure
+
+Người vận hành đã xác nhận watcher chạy observe thành công trên host Azure. Tiếp tục kiểm tra đường thực thi lệnh PostgreSQL bằng tài khoản azureuser để chuẩn bị preflight standby trong chương trình.
+
+Trong terminal SSH Azure, kết thúc lượt observe bằng Ctrl+C nếu chương trình đang chạy, rồi thực hiện lệnh sau.
+
+```bash
+sudo -n k3s kubectl -n issues exec postgres-0 -- \
+  psql -X -v ON_ERROR_STOP=1 -U taskflow -d taskflow -At -c \
+  "SELECT json_build_object(
+      'in_recovery', pg_is_in_recovery(),
+      'read_only', current_setting('transaction_read_only'),
+      'receive_lsn', pg_last_wal_receive_lsn()::text,
+      'replay_lsn', pg_last_wal_replay_lsn()::text
+  );"
+```
+
+sudo -n yêu cầu thực thi với quyền sudo theo chế độ non-interactive, phù hợp với tiến trình watcher chạy bằng systemd sau này. Khi sudo yêu cầu mật khẩu, tùy chọn này trả lỗi để chương trình có thể xử lý. k3s kubectl chọn công cụ Kubernetes của cluster trên host Azure. -n issues chọn namespace. exec postgres-0 thực thi psql trong container PostgreSQL. Dấu -- ngăn phần đối số kubectl và lệnh chạy trong container. [kubectl exec](https://kubernetes.io/docs/reference/kubectl/generated/kubectl_exec/).
+
+psql -X bỏ qua cấu hình psqlrc của người dùng. -v ON_ERROR_STOP=1 yêu cầu dừng và báo lỗi khi câu SQL thất bại. -U và -d chọn role cùng database taskflow. -A dùng output unaligned và -t dùng tuples-only, giúp lấy một dòng JSON để Python giải mã ở bước tiếp theo.
+
+json_build_object tạo JSON từ các cặp tên trường và giá trị. in_recovery biểu diễn vai trò recovery của PostgreSQL. read_only cho biết trạng thái transaction_read_only của phiên kết nối. Hai hàm WAL trả vị trí đã nhận qua streaming và vị trí đã replay. ::text biểu diễn LSN thành chuỗi trong JSON. [PostgreSQL JSON functions](https://www.postgresql.org/docs/17/functions-json.html), [PostgreSQL recovery functions](https://www.postgresql.org/docs/17/functions-admin.html#FUNCTIONS-RECOVERY-INFO-TABLE).
+
+Ví dụ dạng kết quả là
+
+```json
+{"in_recovery": true, "read_only": "on", "receive_lsn": "0/70009B8", "replay_lsn": "0/70009B8"}
+```
+
+Đối chiếu in_recovery true và read_only on cho Azure standby. Giá trị LSN cụ thể phản ánh WAL tại lượt kiểm tra. Lượt này cần có receive_lsn cùng replay_lsn để đối chiếu việc standby đã nhận và áp dụng WAL trước đó.
+
+Checkpoint là tài khoản chạy watcher có thể gọi sudo -n, truy cập Pod PostgreSQL của Azure và nhận dữ liệu JSON từ SQL. Bước tiếp theo đưa đường đọc này vào Python bằng subprocess để chương trình tự kiểm chứng standby khi đạt ngưỡng phát hiện lỗi.
+
+### 4.92. Đọc trạng thái PostgreSQL từ Python bằng subprocess
+
+Lệnh SQL trên Azure đã trả in_recovery true, read_only on, receive_lsn và replay_lsn cùng 0/70009B8 trong lượt đối chiếu. Chuyển đường đọc đã kiểm chứng thành hàm Python để phần preflight có thể sử dụng.
+
+Trên laptop, trong scripts/cloud/cloud_watcher.py, thêm import subprocess ở đầu file. Thêm hàm sau trước main.
+
+```python
+def read_postgres_status(config):
+    sql = """SELECT json_build_object(
+        'in_recovery', pg_is_in_recovery(),
+        'read_only', current_setting('transaction_read_only'),
+        'receive_lsn', pg_last_wal_receive_lsn()::text,
+        'replay_lsn', pg_last_wal_replay_lsn()::text
+    );"""
+    command = [
+        "sudo", "-n", "k3s", "kubectl",
+        "-n", config["kubernetes_namespace"],
+        "exec", config["postgres_pod"], "--",
+        "psql", "-X", "-v", "ON_ERROR_STOP=1",
+        "-U", "taskflow", "-d", "taskflow",
+        "-At", "-c", sql,
+    ]
+    result = subprocess.run(
+        command,
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=20,
+    )
+    status = json.loads(result.stdout)
+    if not isinstance(status, dict):
+        raise ValueError("PostgreSQL status must be a JSON object.")
+    return status
+```
+
+command biểu diễn chương trình cùng từng đối số bằng list Python. Namespace và Pod nhận từ JSON cấu hình. sql được truyền thành một đối số của psql -c. subprocess.run tạo tiến trình, đợi hoàn tất và trả CompletedProcess. check=True phát sinh CalledProcessError khi exit code khác 0. capture_output=True thu riêng stdout cùng stderr. text=True giải mã output thành chuỗi. timeout=20 giới hạn thời gian chờ thực thi và phát sinh TimeoutExpired khi hết hạn. [Python subprocess.run](https://docs.python.org/3.12/library/subprocess.html#subprocess.run).
+
+result.stdout chứa dòng JSON từ psql. json.loads chuyển chuỗi thành dữ liệu Python. Kiểm tra dict yêu cầu object để phần preflight đọc các trường trạng thái. Các lỗi thực thi, timeout và giải mã được chuyển tới nơi gọi hàm để xử lý trong bước điều phối tiếp theo.
+
+Trên Git Bash laptop, chuyển bản script đã chỉnh sang Azure.
+
+```bash
+scp -i ~/.ssh/mcf-lab \
+  scripts/cloud/cloud_watcher.py \
+  azureuser@4.145.30.250:/home/azureuser/mcf-watcher/scripts/cloud/
+```
+
+Trong terminal SSH Azure, gọi riêng hàm để đối chiếu đường đọc từ Python.
+
+```bash
+cd ~/mcf-watcher
+.venv/bin/python - <<'PY'
+import json
+from scripts.cloud.cloud_watcher import load_config, read_postgres_status
+
+status = read_postgres_status(load_config())
+print(json.dumps(status))
+PY
+```
+
+Import module cung cấp các hàm, còn đoạn Python trên gọi load_config rồi read_postgres_status. Output cần là object JSON với in_recovery true, read_only on cùng các vị trí WAL của Azure tại lượt query. Checkpoint là hàm Python chạy được trên host Azure và trả trạng thái PostgreSQL dạng dict. Bước tiếp theo sử dụng dữ liệu đó để kiểm chứng standby khi đạt ngưỡng phát hiện lỗi.
+
 ## 5. Theo dõi tiến độ
 
 - [x] Nghiệm thu giai đoạn 6 và xác định phạm vi giai đoạn 7.
@@ -3162,6 +3515,16 @@ Khi tất cả báo cáo đủ mới và đều thành công, đầu ra có rout
 - [ ] Xử lý lỗi đọc Route 53 thành nguồn quan sát unknown và tiếp tục HTTP probe.
 - [ ] Phân loại từng báo cáo Route 53 theo nội dung và CheckedTime với ngưỡng tuổi 120 giây của lab.
 - [ ] Tổng hợp route53_state theo quy tắc các báo cáo cùng trạng thái và xử lý None, danh sách rỗng thành unknown.
+
+- [x] Khôi phục workload sau lần nghỉ lab và đối chiếu lại AWS primary, Azure standby trước khi tiếp tục watcher.
+- [ ] Lưu HTTP state hai cloud và tính failover_candidate từ HTTP AWS, Route 53 cùng vai trò Azure trong một lượt quan sát.
+- [x] Chạy vòng quan sát lặp lại và đối chiếu bộ đếm 0 trong topology khỏe với AWS writer, Azure standby streaming.
+- [x] Đối chiếu các AWS client được tạo một lần và tái sử dụng qua các vòng quan sát.
+- [ ] Tạo thư mục runtime và virtual environment của watcher trên host Azure.
+- [ ] Chuyển ba file runtime lên Azure, cài dependency và kiểm tra phiên bản cùng cú pháp script.
+- [x] Cấu hình profile mcf-watcher cho azureuser và đối chiếu vòng observe chạy từ host Azure.
+- [x] Dùng azureuser đọc trạng thái PostgreSQL trong K3s bằng sudo -n và nhận JSON cho preflight standby.
+- [ ] Thêm read_postgres_status dùng subprocess và đối chiếu kết quả hàm trên host Azure.
 
 ## 6. Tài liệu kỹ thuật
 
