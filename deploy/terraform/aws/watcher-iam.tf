@@ -27,3 +27,20 @@ resource "aws_iam_user_policy" "watcher_observe" {
     ]
   })
 }
+
+
+resource "aws_iam_user_policy" "watcher_fence" {
+  name = "mcf-watcher-fence"
+  user = aws_iam_user.watcher.name
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect   = "Allow"
+        Action   = "ec2:StopInstances"
+        Resource = aws_instance.primary.arn
+      }
+    ]
+  })
+}

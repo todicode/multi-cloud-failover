@@ -3,13 +3,11 @@ import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-
-import boto3
-from botocore.config import Config
 from botocore.exceptions import BotoCoreError, ClientError
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(PROJECT_ROOT))
+from scripts.cloud.aws_ops import create_aws_clients, read_instance_state
 
 from scripts.cloud.checks import (
     classify_probe,
@@ -34,32 +32,15 @@ def load_config():
 
 def main():
     config = load_config()
-
-    aws_client_config = Config(
-        connect_timeout=5,
-        read_timeout=5,
-        retries={"mode": "standard", "total_max_attempts": 2},
-    )
-
-    session = boto3.Session(
-        profile_name=config["aws_profile"],
-        region_name=config["aws_region"],
-    )
-    sts = session.client("sts", config=aws_client_config)
+    sts, ec2, route53 = create_aws_clients(config)
     identity = sts.get_caller_identity()
     print(f"aws_identity={identity['Arn']}")
 
-    ec2 = session.client("ec2", config=aws_client_config)
-    route53 = session.client("route53", config=aws_client_config)
     failure_count = 0
     while True:
         try:
-            ec2_response = ec2.describe_instances(
-                InstanceIds=[config["aws_instance_id"]],
-            )
-            instance = ec2_response["Reservations"][0]["Instances"][0]
-            instance_state = instance["State"]["Name"]
-        except (BotoCoreError, ClientError) as error:
+            instance_state = read_instance_state(ec2, config["aws_instance_id"])
+        except (BotoCoreError, ClientError, RuntimeError) as error:
             instance_state = "unknown"
             print(f"aws_ec2_error={type(error).__name__}: {error}")
         print(f"aws_ec2_state={instance_state}")

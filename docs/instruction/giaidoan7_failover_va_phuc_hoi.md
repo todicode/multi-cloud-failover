@@ -3721,6 +3721,312 @@ Kết quả mong đợi là JSON của Azure standby với in_recovery true, rea
 
 Checkpoint là hàm kiểm chứng standby chạy được từ host Azure và logic PostgreSQL có vị trí riêng trong postgres_ops.py. Bước tiếp theo tổ chức phần thao tác AWS trong module riêng để chuẩn bị fencing và kết nối các bước vào điều phối.
 
+### 4.96. Nhóm việc khởi tạo AWS client trong aws_ops.py
+
+Chuẩn bị module dành cho thao tác AWS trước khi bổ sung phần fencing. Chuyển cấu hình SDK, Session và việc tạo client vào aws_ops.py. cloud_watcher gọi hàm khởi tạo một lần rồi dùng các client trong vòng điều phối.
+
+Trên laptop, tạo scripts/cloud/aws_ops.py với nội dung sau.
+
+```python
+import boto3
+from botocore.config import Config
+
+
+def create_aws_clients(config):
+    client_config = Config(
+        connect_timeout=5,
+        read_timeout=5,
+        retries={"mode": "standard", "total_max_attempts": 2},
+    )
+    session = boto3.Session(
+        profile_name=config["aws_profile"],
+        region_name=config["aws_region"],
+    )
+    sts = session.client("sts", config=client_config)
+    ec2 = session.client("ec2", config=client_config)
+    route53 = session.client("route53", config=client_config)
+    return sts, ec2, route53
+```
+
+Hàm sử dụng các giá trị profile và region từ JSON cùng thiết lập timeout, retry đã xây dựng. Ba client nhận cùng client_config. return trả ba đối tượng theo thứ tự STS, EC2, Route 53. [Boto3 Session](https://docs.aws.amazon.com/boto3/latest/guide/session.html).
+
+Trong cloud_watcher.py, thêm import sau cùng nhóm import module nội bộ, phía dưới phần xác định PROJECT_ROOT và sys.path.
+
+```python
+from scripts.cloud.aws_ops import create_aws_clients
+```
+
+Xóa import boto3 và from botocore.config import Config khỏi cloud_watcher.py sau khi chuyển phần khởi tạo. Import BotoCoreError cùng ClientError tiếp tục phục vụ xử lý lỗi ở vòng điều phối.
+
+Trong main, thay toàn bộ đoạn từ aws_client_config = Config(...) đến hết dòng tạo route53 client, ngay trước failure_count = 0, bằng đoạn sau.
+
+```python
+    sts, ec2, route53 = create_aws_clients(config)
+    identity = sts.get_caller_identity()
+    print(f"aws_identity={identity['Arn']}")
+```
+
+Cú pháp gán ba tên bên trái nhận ba đối tượng trả về theo thứ tự tương ứng. Main gọi STS để đối chiếu danh tính, rồi đi vào vòng quan sát bằng các client đã khởi tạo. Nhóm thao tác AWS có vị trí riêng để tiếp tục thêm hàm đọc state cùng fencing.
+
+Trên Git Bash laptop tại repository, kiểm tra cú pháp và chuyển hai file sang Azure.
+
+```bash
+.venv/Scripts/python.exe -m py_compile scripts/cloud/aws_ops.py scripts/cloud/cloud_watcher.py
+
+scp -i ~/.ssh/mcf-lab \
+  scripts/cloud/aws_ops.py scripts/cloud/cloud_watcher.py \
+  azureuser@4.145.30.250:/home/azureuser/mcf-watcher/scripts/cloud/
+```
+
+Trong terminal SSH Azure, chạy điểm vào watcher.
+
+```bash
+cd ~/mcf-watcher
+.venv/bin/python scripts/cloud/cloud_watcher.py
+```
+
+Đối chiếu IAM user watcher, các trạng thái nguồn quan sát và bộ đếm trong topology đang khỏe. Sau vài vòng, dùng Ctrl+C để kết thúc. Checkpoint là các client đã được khởi tạo qua aws_ops.py và dùng lại trong vòng quan sát. Bước tiếp theo đưa việc đọc EC2 state vào module này để chuẩn bị thao tác fencing.
+
+### 4.97. Đọc trạng thái EC2 qua aws_ops.py
+
+Hàm đọc trạng thái được dùng trong vòng quan sát và sẽ được dùng để đối chiếu fencing. Đặt thao tác AWS vào aws_ops.py giúp các điểm gọi dùng chung cách đọc phản hồi EC2.
+
+Thêm hàm sau vào cuối scripts/cloud/aws_ops.py.
+
+```python
+def read_instance_state(ec2, instance_id):
+    response = ec2.describe_instances(InstanceIds=[instance_id])
+    reservations = response["Reservations"]
+    if not reservations or not reservations[0]["Instances"]:
+        raise RuntimeError(f"EC2 instance {instance_id} was not returned.")
+
+    instance = reservations[0]["Instances"][0]
+    return instance["State"]["Name"]
+```
+
+ec2 là client đã tạo ở bước trước. InstanceIds nhận một danh sách có đúng ID của máy cần theo dõi. Phản hồi lồng thông tin instance bên trong Reservations rồi Instances. Với truy vấn một ID, lấy instance đầu tiên và trả State.Name, ví dụ running, stopping hoặc stopped. Nếu kết quả rỗng, hàm báo lỗi để bên gọi quyết định cách xử lý. Lỗi SDK cũng truyền lên bên gọi. [EC2 describe_instances](https://docs.aws.amazon.com/boto3/latest/reference/services/ec2/client/describe_instances.html).
+
+Trong cloud_watcher.py, cập nhật import hiện có.
+
+```python
+from scripts.cloud.aws_ops import create_aws_clients, read_instance_state
+```
+
+Trong while True, thay khối try/except đọc EC2 cùng dòng in aws_ec2_state bằng đoạn sau.
+
+```python
+        try:
+            instance_state = read_instance_state(ec2, config["aws_instance_id"])
+        except (BotoCoreError, ClientError, RuntimeError) as error:
+            instance_state = "unknown"
+            print(f"aws_ec2_error={type(error).__name__}: {error}")
+        print(f"aws_ec2_state={instance_state}")
+```
+
+Vòng điều phối chuyển lỗi thành trạng thái unknown và ghi nguyên nhân ra log. Khi làm fencing, chỉ kết quả stopped mới xác nhận máy đã dừng. unknown thể hiện chưa xác định được trạng thái từ API. Trạng thái máy ảo running cũng cần được kết hợp với HTTP và PostgreSQL để đánh giá dịch vụ.
+
+Trên Git Bash laptop tại thư mục repo, kiểm tra cú pháp rồi chuyển hai file sang Azure.
+
+```bash
+.venv/Scripts/python.exe -m py_compile scripts/cloud/aws_ops.py scripts/cloud/cloud_watcher.py
+
+scp -i ~/.ssh/mcf-lab \
+  scripts/cloud/aws_ops.py scripts/cloud/cloud_watcher.py \
+  azureuser@4.145.30.250:/home/azureuser/mcf-watcher/scripts/cloud/
+```
+
+Trong terminal SSH Azure, chạy watcher.
+
+```bash
+cd ~/mcf-watcher
+.venv/bin/python scripts/cloud/cloud_watcher.py
+```
+
+Trong topology đang khỏe, đối chiếu aws_ec2_state=running, AWS writer, Azure standby và bộ đếm lỗi bằng 0. Dừng bằng Ctrl+C sau vài vòng. Bước tiếp theo chuẩn bị quyền StopInstances giới hạn cho đúng EC2 của đồ án.
+
+### 4.98. Chuẩn bị quyền fencing cho đúng EC2
+
+Watcher dùng quyền ec2:StopInstances để yêu cầu dừng writer AWS trước khi promote Azure. IAM kiểm tra quyền khi request đến AWS. Việc xác nhận instance đã stopped sẽ được triển khai trong logic fencing.
+
+Trong deploy/terraform/aws/watcher-iam.tf, thêm resource sau ở cuối file. Nhóm IAM của watcher tiếp tục nằm cùng file này.
+
+```hcl
+resource "aws_iam_user_policy" "watcher_fence" {
+  name = "mcf-watcher-fence"
+  user = aws_iam_user.watcher.name
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect   = "Allow"
+        Action   = "ec2:StopInstances"
+        Resource = aws_instance.primary.arn
+      }
+    ]
+  })
+}
+```
+
+aws_iam_user_policy tạo inline policy gắn trực tiếp với IAM user watcher. user tham chiếu danh tính mcf-azure-watcher đã tạo. jsonencode chuyển object HCL thành JSON policy mà IAM nhận. Effect Allow cấp quyền cho Action trên Resource được chỉ định.
+
+Resource lấy ARN từ aws_instance.primary trong cùng Terraform root module. ARN xác định partition, service, region, account và instance. Tham chiếu này giúp Terraform tính đúng ARN cho hạ tầng đang quản lý và cập nhật policy khi instance được thay thế. StopInstances hỗ trợ giới hạn quyền theo ARN instance. [AWS EC2 instance policies](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/ExamplePolicies_EC2.html#iam-example-instances).
+
+Policy quan sát và policy fencing cùng gắn vào IAM user. Profile mcf-watcher tiếp tục dùng credential của user này. Quyền IAM có hiệu lực sau khi thay đổi được apply và lan truyền.
+
+Trên Git Bash laptop tại thư mục repo, chạy các lệnh sau để kiểm tra cấu hình và xem thay đổi dự kiến.
+
+```bash
+terraform -chdir=deploy/terraform/aws fmt
+terraform -chdir=deploy/terraform/aws validate
+terraform -chdir=deploy/terraform/aws plan
+```
+
+Với hạ tầng đang khớp cấu hình, phần thay đổi dự kiến là tạo aws_iam_user_policy.watcher_fence, name mcf-watcher-fence, user mcf-azure-watcher, Action ec2:StopInstances và Resource ARN của EC2 primary. Tổng kết dự kiến Plan: 1 to add, 0 to change, 0 to destroy. Các phần Refreshing state hoặc Reading phục vụ đối chiếu hạ tầng hiện có.
+
+Checkpoint của bước này là đối chiếu plan với policy đã giải thích. Bước tiếp theo apply policy rồi dùng EC2 DryRun để kiểm chứng quyền trước khi xây dựng thao tác fencing.
+
+### 4.99. Apply policy và kiểm chứng quyền bằng DryRun
+
+Sau khi plan được đối chiếu với policy watcher_fence, trên Git Bash laptop tại thư mục repo, apply cấu hình AWS.
+
+```bash
+terraform -chdir=deploy/terraform/aws apply
+```
+
+Đối chiếu phần thay đổi tạo aws_iam_user_policy.watcher_fence rồi nhập yes tại prompt xác nhận. Với plan đã kiểm tra ở bước trước, tổng kết dự kiến là Resources: 1 added, 0 changed, 0 destroyed. Provider Terraform dùng profile default theo providers.tf để tạo inline policy cho user watcher.
+
+Lấy instance ID từ output Terraform để phép thử trỏ đúng máy đang được root module AWS quản lý.
+
+```bash
+MCF_AWS_INSTANCE_ID=$(terraform -chdir=deploy/terraform/aws output -raw aws_instance_id)
+printf '%s\n' "$MCF_AWS_INSTANCE_ID"
+```
+
+output -raw lấy giá trị chuỗi thuần. Cú pháp $(...) đưa kết quả lệnh vào biến shell. Biến này tồn tại trong terminal Git Bash hiện tại.
+
+Gửi phép kiểm tra quyền bằng profile watcher.
+
+```bash
+aws ec2 stop-instances \
+  --profile mcf-watcher \
+  --region ap-southeast-1 \
+  --instance-ids "$MCF_AWS_INSTANCE_ID" \
+  --dry-run \
+  --no-cli-pager
+```
+
+--profile chọn credential của mcf-azure-watcher, --region chọn Singapore, --instance-ids xác định EC2 cần kiểm chứng quyền. --dry-run yêu cầu AWS kiểm tra quyền cho thao tác mà không thực thi việc dừng máy. --no-cli-pager hiển thị phản hồi trực tiếp trong terminal.
+
+Kết quả kỳ vọng có mã DryRunOperation. Ví dụ phản hồi có dạng sau.
+
+```text
+An error occurred (DryRunOperation) when calling the StopInstances operation: Request would have succeeded, but DryRun flag is set.
+```
+
+Đây là quy ước phản hồi DryRun của EC2. DryRunOperation xác nhận danh tính gọi API có quyền cho thao tác được kiểm tra, dù CLI kết thúc với exit code khác 0. UnauthorizedOperation thể hiện thiếu quyền tại thời điểm phép thử. Các lỗi khác cần được đọc theo mã lỗi cụ thể. [AWS CLI StopInstances DryRun](https://docs.aws.amazon.com/cli/latest/reference/ec2/stop-instances.html).
+
+Nếu mới apply mà gặp UnauthorizedOperation, chờ một khoảng ngắn rồi chạy lại đúng lệnh dry-run. IAM thay đổi theo cơ chế eventual consistency nên quyền mới có thể cần thời gian lan truyền. Nếu vẫn lỗi, đối chiếu danh tính profile watcher và ARN instance trong policy. [IAM eventual consistency](https://docs.aws.amazon.com/IAM/latest/UserGuide/troubleshoot.html#troubleshoot_general_eventual-consistency).
+
+Checkpoint là policy đã apply và phép thử trả DryRunOperation. Bước tiếp theo xây dựng hàm fencing trong aws_ops.py, gồm gửi yêu cầu dừng và chờ xác nhận trạng thái stopped.
+
+### 4.100. Viết hàm fencing EC2 và kiểm tra cú pháp
+
+Phép thử DryRun đã xác nhận quyền StopInstances. Thêm hàm sau ở cuối scripts/cloud/aws_ops.py để đóng gói thao tác fencing.
+
+```python
+def fence_instance(ec2, instance_id):
+    state = read_instance_state(ec2, instance_id)
+    if state == "stopped":
+        return state
+
+    if state == "running":
+        ec2.stop_instances(InstanceIds=[instance_id])
+    elif state != "stopping":
+        raise RuntimeError(f"Cannot fence EC2 instance in state {state}.")
+
+    waiter = ec2.get_waiter("instance_stopped")
+    waiter.wait(
+        InstanceIds=[instance_id],
+        WaiterConfig={"Delay": 5, "MaxAttempts": 60},
+    )
+    return "stopped"
+```
+
+Hàm đọc trạng thái mới từ AWS ngay khi được gọi. Nếu máy đã stopped, kết quả xác nhận được trả về ngay. Nếu running, StopInstances gửi yêu cầu dừng theo cơ chế shutdown mặc định của EC2. Nếu stopping, hàm tiếp tục tới bước chờ. Các trạng thái khác gây RuntimeError để bên điều phối xử lý. Việc xử lý running, stopping và stopped giúp hàm có thể gọi lại sau khi lượt trước đã gửi yêu cầu dừng.
+
+StopInstances có thể trả về trong khi EC2 còn stopping. instance_stopped là waiter của Boto3, tự gọi DescribeInstances cho tới khi instance đạt stopped hoặc gặp lỗi. Delay 5 là khoảng chờ giữa các lượt poll. MaxAttempts 60 giới hạn số lượt poll. Đây là cấu hình chọn cho lab, thời gian thực tế còn gồm thời gian API và SDK retry. [Boto3 InstanceStopped waiter](https://docs.aws.amazon.com/boto3/latest/reference/services/ec2/waiter/InstanceStopped.html), [Boto3 StopInstances](https://docs.aws.amazon.com/boto3/latest/reference/services/ec2/client/stop_instances.html).
+
+waiter.wait chỉ kết thúc thành công khi điều kiện waiter đạt. Nếu vượt ngưỡng hoặc thất bại, WaiterError truyền lên bên gọi. Các lỗi API cũng truyền lên. Vì dòng return nằm sau waiter, bên điều phối chỉ nhận kết quả stopped sau khi bước xác nhận thành công. Luồng điều phối cần xử lý lỗi fencing bằng cách kết thúc lượt chuyển writer.
+
+Đối chiếu khối xử lý lỗi đọc EC2 trong cloud_watcher.py với mục 4.97 và bổ sung RuntimeError nếu còn thiếu.
+
+```python
+        except (BotoCoreError, ClientError, RuntimeError) as error:
+```
+
+RuntimeError phục vụ trường hợp kết quả DescribeInstances rỗng mà read_instance_state đã phát hiện. Watcher ghi trạng thái unknown cho lỗi này.
+
+Trên Git Bash laptop tại thư mục repo, kiểm tra cú pháp hai file.
+
+```bash
+.venv/Scripts/python.exe -m py_compile \
+  scripts/cloud/aws_ops.py \
+  scripts/cloud/cloud_watcher.py
+```
+
+py_compile kiểm tra cú pháp và tạo bytecode. Điểm gọi fence_instance sẽ được bổ sung cùng preflight và xử lý lỗi trong luồng điều phối. Checkpoint của bước này là có hàm fencing và kiểm tra cú pháp thành công.
+
+### 4.101. Kiểm thử fencing bằng EC2 giả lập
+
+Trên Git Bash laptop tại thư mục repo, chạy đoạn sau trực tiếp trong terminal.
+
+```bash
+.venv/Scripts/python.exe - <<'PY'
+from unittest.mock import Mock, call
+from botocore.exceptions import WaiterError
+from scripts.cloud.aws_ops import fence_instance
+
+ec2 = Mock()
+ec2.describe_instances.return_value = {
+    "Reservations": [{"Instances": [{"State": {"Name": "running"}}]}]
+}
+
+result = fence_instance(ec2, "i-test")
+assert result == "stopped"
+assert ec2.mock_calls == [
+    call.describe_instances(InstanceIds=["i-test"]),
+    call.stop_instances(InstanceIds=["i-test"]),
+    call.get_waiter("instance_stopped"),
+    call.get_waiter().wait(
+        InstanceIds=["i-test"],
+        WaiterConfig={"Delay": 5, "MaxAttempts": 60},
+    ),
+]
+print("PASS: running -> stop request -> waiter -> stopped")
+
+ec2.get_waiter.return_value.wait.side_effect = WaiterError(
+    name="InstanceStopped", reason="test timeout", last_response={}
+)
+try:
+    fence_instance(ec2, "i-test")
+except WaiterError:
+    print("PASS: waiter failure propagates to caller")
+else:
+    raise AssertionError("Fencing returned success after waiter failure")
+PY
+```
+
+Mock thuộc thư viện chuẩn unittest.mock của Python. Nó tạo đối tượng giả và ghi lại các lời gọi. return_value đặt dữ liệu trả về của phương thức giả. ec2 trong phép thử là đối tượng Mock được truyền vào fence_instance. Các thao tác describe, stop và waiter được thực hiện trên đối tượng giả này. [Python unittest.mock](https://docs.python.org/3.12/library/unittest.mock.html).
+
+Phần đầu mô phỏng EC2 running và waiter hoàn tất thành công. assert result kiểm tra giá trị trả về. Danh sách call mô tả thứ tự và tham số mong đợi. So sánh mock_calls giúp phát hiện thao tác bị thiếu, thừa, sai thứ tự hoặc sai tham số.
+
+Phần sau dùng side_effect để phương thức wait phát sinh WaiterError. Khối try gọi lại hàm fencing. except xác nhận lỗi tới được bên gọi. else của try chạy nếu hàm hoàn tất bình thường, khi đó AssertionError đánh dấu lỗi logic vì fencing đã trả thành công sau khi waiter thất bại.
+
+Kết quả kỳ vọng là hai dòng PASS. Phép thử kiểm chứng thứ tự điều phối và lỗi waiter bằng giả lập. Việc dừng EC2 thực tế sẽ được kiểm chứng trong lượt failover có kiểm soát sau khi luồng điều phối hoàn chỉnh.
+
+Checkpoint là hai kiểm tra thành công. Bước tiếp theo ghép preflight và fencing vào một hàm điều phối riêng để cloud_watcher giữ vai trò vòng quan sát và kích hoạt.
+
 ## 5. Theo dõi tiến độ
 
 - [x] Nghiệm thu giai đoạn 6 và xác định phạm vi giai đoạn 7.
@@ -3838,6 +4144,12 @@ Checkpoint là hàm kiểm chứng standby chạy được từ host Azure và l
 - [x] Tách read_postgres_status sang postgres_ops.py và đối chiếu điểm vào cùng đường import sau khi chuyển module.
 - [x] Tách nhóm HTTP probe và phân loại Route 53 sang checks.py, đối chiếu vòng quan sát sau khi chuyển module.
 - [x] Thêm preflight_standby trong postgres_ops.py và đối chiếu vai trò standby từ host Azure.
+- [x] Tách cấu hình SDK, Session và việc tạo AWS client sang aws_ops.py rồi đối chiếu vòng observe.
+- [ ] Chuyển thao tác đọc EC2 state sang aws_ops.py và đối chiếu vòng observe.
+- [x] Thêm policy watcher_fence giới hạn StopInstances theo ARN EC2 primary và đối chiếu plan.
+- [x] Apply policy watcher_fence và kiểm chứng quyền bằng EC2 DryRunOperation.
+- [x] Viết fence_instance trong aws_ops.py và kiểm tra cú pháp.
+- [ ] Kiểm thử thứ tự fencing và lỗi waiter bằng EC2 giả lập.
 
 ## 6. Tài liệu kỹ thuật
 
