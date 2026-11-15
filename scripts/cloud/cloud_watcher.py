@@ -4,10 +4,12 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 from botocore.exceptions import BotoCoreError, ClientError
+import subprocess
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(PROJECT_ROOT))
 from scripts.cloud.aws_ops import create_aws_clients, read_instance_state
+from scripts.cloud.failover_ops import run_failover
 
 from scripts.cloud.checks import (
     classify_probe,
@@ -92,8 +94,32 @@ def main():
         threshold_reached = failure_count >= config["failure_threshold"]
         print(f"consecutive_failures={failure_count}")
         print(f"failover_threshold_reached={threshold_reached}")
+
+        if config["enable_auto_failover"] and threshold_reached:
+            print("failover_triggered=true")
+            try:
+                run_failover(config, ec2)
+            except (
+                BotoCoreError,
+                ClientError,
+                OSError,
+                subprocess.SubprocessError,
+                ValueError,
+                RuntimeError,
+            ) as error:
+                print(
+                    f"failover_result=failed error_type={type(error).__name__} error={error}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                if isinstance(error, subprocess.CalledProcessError) and error.stderr:
+                    print(error.stderr.strip(), file=sys.stderr, flush=True)
+                return 1
+
+            print("failover_result=success")
+            return 0
         time.sleep(config["interval_seconds"])
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

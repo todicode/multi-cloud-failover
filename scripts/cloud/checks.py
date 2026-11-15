@@ -1,5 +1,5 @@
 from datetime import datetime
-
+import time
 import httpx
 
 def probe_writer(url, timeout):
@@ -46,6 +46,23 @@ def classify_probe(result):
     if status == 503 and role == "standby" and writable is False:
         return "standby"
     return "unknown"
+
+def wait_for_writer(url, timeout, interval, max_attempts=12):
+    if max_attempts < 1:
+        raise ValueError("max_attempts must be positive.")
+
+    for attempt in range(1, max_attempts + 1):
+        result = probe_writer(url, timeout)
+        state = classify_probe(result)
+        print(f"writer_check attempt={attempt} state={state}")
+        if state == "writer":
+            return result["body"]
+        if attempt < max_attempts:
+            time.sleep(interval)
+
+    raise RuntimeError(
+        f"Writer verification failed after {max_attempts} attempts: {result}"
+    )
 
 def classify_route53_report(report, now, max_age_seconds=120):
     if not isinstance(report, dict):

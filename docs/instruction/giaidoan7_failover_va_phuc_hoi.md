@@ -3977,55 +3977,600 @@ Trên Git Bash laptop tại thư mục repo, kiểm tra cú pháp hai file.
 
 py_compile kiểm tra cú pháp và tạo bytecode. Điểm gọi fence_instance sẽ được bổ sung cùng preflight và xử lý lỗi trong luồng điều phối. Checkpoint của bước này là có hàm fencing và kiểm tra cú pháp thành công.
 
-### 4.101. Kiểm thử fencing bằng EC2 giả lập
+### 4.101. Gom preflight và fencing vào hàm điều phối riêng
 
-Trên Git Bash laptop tại thư mục repo, chạy đoạn sau trực tiếp trong terminal.
+Tạo scripts/cloud/failover_ops.py để lưu thứ tự các bước chuyển writer. cloud_watcher phụ trách vòng quan sát và phát hiện điều kiện. aws_ops xử lý API AWS. postgres_ops xử lý thao tác PostgreSQL. failover_ops gọi các module theo thứ tự nghiệp vụ.
+
+Trong file mới, nhập nội dung sau.
+
+```python
+from scripts.cloud.aws_ops import fence_instance
+from scripts.cloud.postgres_ops import preflight_standby
+
+
+def prepare_failover(config, ec2):
+    print("failover_step=preflight_standby")
+    preflight_standby(config)
+
+    print("failover_step=fence_aws")
+    state = fence_instance(ec2, config["aws_instance_id"])
+
+    print(f"failover_step=fence_confirmed aws_ec2_state={state}")
+    return state
+```
+
+preflight_standby truy vấn PostgreSQL cục bộ của host chạy watcher bằng kubectl exec. Trong triển khai, host đó là Azure. Nó xác nhận in_recovery true và read_only on trước khi bắt đầu fencing. Kiểm tra này giúp phát hiện Azure chưa sẵn sàng làm standby trước khi gửi yêu cầu dừng AWS. Các mốc LSN được đọc ở bước preflight phản ánh thời điểm kiểm tra. WAL có thể tiếp tục tới Azure trong lúc AWS shutdown, và sẽ được xử lý ở bước kiểm tra trước promotion.
+
+Sau khi preflight thành công, fence_instance nhận client EC2 dùng chung và ID từ JSON. Hàm gửi yêu cầu dừng khi cần, chờ stopped rồi trả trạng thái. Log fence_confirmed chỉ xuất hiện sau khi hàm fencing hoàn tất thành công. return truyền kết quả về bên gọi.
+
+Nếu preflight phát sinh lỗi, việc gọi fence_instance chưa được thực hiện. Nếu fencing phát sinh lỗi, việc ghi log fence_confirmed và return chưa được thực hiện. Hàm để exception truyền lên để điểm điều phối cao hơn xử lý lỗi và kết thúc lượt chuyển writer.
+
+Khi được gọi bằng client AWS thật, hàm này thực hiện thao tác fencing trên EC2 cấu hình. Trong bước hiện tại, chạy kiểm tra cú pháp tại Git Bash laptop từ thư mục repo.
 
 ```bash
-.venv/Scripts/python.exe - <<'PY'
-from unittest.mock import Mock, call
-from botocore.exceptions import WaiterError
-from scripts.cloud.aws_ops import fence_instance
+.venv/Scripts/python.exe -m py_compile \
+  scripts/cloud/failover_ops.py \
+  scripts/cloud/aws_ops.py \
+  scripts/cloud/postgres_ops.py
+```
 
-ec2 = Mock()
-ec2.describe_instances.return_value = {
-    "Reservations": [{"Instances": [{"State": {"Name": "running"}}]}]
-}
+Checkpoint là có module failover_ops với hàm prepare_failover và kiểm tra cú pháp thành công. Những bước tiếp theo bổ sung xử lý WAL, promotion, xác minh writer và điểm kích hoạt có kiểm tra cờ enable_auto_failover trong watcher.
 
-result = fence_instance(ec2, "i-test")
-assert result == "stopped"
-assert ec2.mock_calls == [
-    call.describe_instances(InstanceIds=["i-test"]),
-    call.stop_instances(InstanceIds=["i-test"]),
-    call.get_waiter("instance_stopped"),
-    call.get_waiter().wait(
-        InstanceIds=["i-test"],
-        WaiterConfig={"Delay": 5, "MaxAttempts": 60},
-    ),
-]
-print("PASS: running -> stop request -> waiter -> stopped")
+### 4.102. Dùng chung cách gọi SQL trước khi thêm promotion
 
-ec2.get_waiter.return_value.wait.side_effect = WaiterError(
-    name="InstanceStopped", reason="test timeout", last_response={}
-)
-try:
-    fence_instance(ec2, "i-test")
-except WaiterError:
-    print("PASS: waiter failure propagates to caller")
-else:
-    raise AssertionError("Fencing returned success after waiter failure")
+Khi standby được promote, PostgreSQL phục hồi WAL đang sẵn có trong archive hoặc pg_wal trước khi chuyển sang hoạt động bình thường. Luồng tự động sẽ sử dụng cơ chế này sau khi fencing AWS được xác nhận. Với replication bất đồng bộ, các transaction chưa truyền tới Azure vẫn có thể bị mất khi AWS lỗi. receive_lsn và replay_lsn dùng để quan sát phần WAL bên nhận. [PostgreSQL standby operation](https://www.postgresql.org/docs/17/warm-standby.html#STANDBY-SERVER-OPERATION).
+
+Đọc trạng thái và promotion đều gọi SQL qua cùng đường sudo, kubectl exec và psql. Tách phần gọi lệnh có sẵn thành hàm dùng chung trong scripts/cloud/postgres_ops.py. Thêm hàm sau phía dưới import và phía trên read_postgres_status.
+
+```python
+def run_postgres_sql(config, sql, timeout=20):
+    command = [
+        "sudo", "-n", "k3s", "kubectl",
+        "-n", config["kubernetes_namespace"],
+        "exec", config["postgres_pod"], "--",
+        "psql", "-X", "-v", "ON_ERROR_STOP=1",
+        "-U", "taskflow", "-d", "taskflow",
+        "-At", "-c", sql,
+    ]
+    result = subprocess.run(
+        command,
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+    )
+    return result.stdout.strip()
+```
+
+Hàm nhận config để xác định namespace và Pod, sql là câu lệnh cần chạy, timeout là giới hạn chờ subprocess tính bằng giây. Giá trị mặc định là 20 cho các truy vấn trạng thái. Lượt gọi promotion sẽ truyền timeout dài hơn để PostgreSQL có thời gian chờ chuyển vai trò.
+
+check=True phát sinh CalledProcessError khi lệnh kết thúc với mã lỗi. timeout phát sinh TimeoutExpired khi subprocess vượt thời gian chờ. capture_output=True thu stdout và stderr, text=True trả chuỗi. strip bỏ khoảng trắng ở hai đầu stdout. Tham số lệnh được truyền dạng danh sách trực tiếp vào subprocess. [Python subprocess.run](https://docs.python.org/3.12/library/subprocess.html#subprocess.run).
+
+Trong read_postgres_status, giữ biến sql cùng phần kiểm tra JSON object. Thay đoạn từ command = [...] qua subprocess.run và dòng status = json.loads(result.stdout) bằng dòng sau.
+
+```python
+    status = json.loads(run_postgres_sql(config, sql))
+```
+
+Luồng đọc trạng thái trở thành read_postgres_status gọi run_postgres_sql, nhận chuỗi JSON, parse thành dict rồi kiểm tra kiểu. preflight_standby tiếp tục sử dụng read_postgres_status.
+
+Trên Git Bash laptop tại thư mục repo, kiểm tra cú pháp.
+
+```bash
+.venv/Scripts/python.exe -m py_compile scripts/cloud/postgres_ops.py
+```
+
+Để kiểm chứng đường đọc SQL từ host Azure, chuyển file cập nhật.
+
+```bash
+scp -i ~/.ssh/mcf-lab \
+  scripts/cloud/postgres_ops.py \
+  azureuser@4.145.30.250:/home/azureuser/mcf-watcher/scripts/cloud/
+```
+
+Trong terminal SSH Azure, chạy phép đọc trạng thái.
+
+```bash
+cd ~/mcf-watcher
+.venv/bin/python - <<'PY'
+import json
+from scripts.cloud.cloud_watcher import load_config
+from scripts.cloud.postgres_ops import preflight_standby
+
+print(json.dumps(preflight_standby(load_config())))
 PY
 ```
 
-Mock thuộc thư viện chuẩn unittest.mock của Python. Nó tạo đối tượng giả và ghi lại các lời gọi. return_value đặt dữ liệu trả về của phương thức giả. ec2 trong phép thử là đối tượng Mock được truyền vào fence_instance. Các thao tác describe, stop và waiter được thực hiện trên đối tượng giả này. [Python unittest.mock](https://docs.python.org/3.12/library/unittest.mock.html).
+Trong topology AWS primary và Azure standby đang khỏe, đối chiếu in_recovery true, read_only on cùng các mốc WAL. Checkpoint là đọc trạng thái thành công qua hàm SQL dùng chung. Bước tiếp theo thêm lời gọi pg_promote bằng hàm này và kiểm tra kết quả promotion.
 
-Phần đầu mô phỏng EC2 running và waiter hoàn tất thành công. assert result kiểm tra giá trị trả về. Danh sách call mô tả thứ tự và tham số mong đợi. So sánh mock_calls giúp phát hiện thao tác bị thiếu, thừa, sai thứ tự hoặc sai tham số.
+### 4.103. Viết hàm promote standby và xác minh vai trò
 
-Phần sau dùng side_effect để phương thức wait phát sinh WaiterError. Khối try gọi lại hàm fencing. except xác nhận lỗi tới được bên gọi. else của try chạy nếu hàm hoàn tất bình thường, khi đó AssertionError đánh dấu lỗi logic vì fencing đã trả thành công sau khi waiter thất bại.
+Thêm hàm sau ở cuối scripts/cloud/postgres_ops.py. Hàm sử dụng run_postgres_sql để gọi promotion, rồi read_postgres_status mở lượt gọi SQL mới để xác minh vai trò.
 
-Kết quả kỳ vọng là hai dòng PASS. Phép thử kiểm chứng thứ tự điều phối và lỗi waiter bằng giả lập. Việc dừng EC2 thực tế sẽ được kiểm chứng trong lượt failover có kiểm soát sau khi luồng điều phối hoàn chỉnh.
+```python
+def promote_standby(config):
+    sql = "SELECT json_build_object('promoted', pg_promote(true, 60));"
+    result = json.loads(run_postgres_sql(config, sql, timeout=75))
+    if not isinstance(result, dict) or result.get("promoted") is not True:
+        raise RuntimeError("PostgreSQL promotion was not confirmed.")
 
-Checkpoint là hai kiểm tra thành công. Bước tiếp theo ghép preflight và fencing vào một hàm điều phối riêng để cloud_watcher giữ vai trò vòng quan sát và kích hoạt.
+    status = read_postgres_status(config)
+    if status.get("in_recovery") is not False or status.get("read_only") != "off":
+        raise RuntimeError("PostgreSQL primary role was not confirmed.")
+    return status
+```
+
+pg_promote(true, 60) yêu cầu chuyển PostgreSQL standby thành primary. Tham số true yêu cầu chờ hoàn tất. Tham số 60 giới hạn thời gian chờ của hàm SQL tính bằng giây. Hàm trả true khi promotion hoàn tất trong thời gian chờ và false nếu chưa được xác nhận thành công. json_build_object đóng gói boolean thành object JSON với trường promoted. [PostgreSQL recovery control functions](https://www.postgresql.org/docs/17/functions-admin.html#FUNCTIONS-RECOVERY-CONTROL).
+
+timeout 75 là giới hạn chọn cho subprocess, tạo khoảng chờ thêm cho sudo, kubectl và psql quanh lượt chờ 60 giây của PostgreSQL. Nếu SQL lỗi, JSON không hợp lệ, kết quả sai kiểu hoặc promoted khác boolean true, exception truyền lên bên gọi. Timeout hay kết quả false biểu thị kết quả promotion chưa được xác nhận. Trạng thái PostgreSQL thực tế cần được đọc lại khi xử lý lượt dang dở.
+
+Sau kết quả true, read_postgres_status gọi psql qua một tiến trình mới và đối chiếu in_recovery false cùng read_only off. Bước này xác minh trạng thái qua kết nối mới sau promotion. return trả dict trạng thái cho điểm điều phối. Quyền ghi của ứng dụng tiếp tục được đánh giá qua app_control và writer health khi xây dựng bước xác minh writer.
+
+Hàm promotion sẽ được gọi sau prepare_failover trong luồng điều phối, khi fencing AWS đã được xác nhận. Trong bước hiện tại, tại Git Bash laptop từ thư mục repo, kiểm tra cú pháp.
+
+```bash
+.venv/Scripts/python.exe -m py_compile scripts/cloud/postgres_ops.py
+```
+
+Checkpoint là thêm promote_standby và kiểm tra cú pháp thành công. Bước tiếp theo ghép promotion sau fencing trong luồng điều phối.
+
+### 4.104. Ghép fencing và promotion trong hàm điều phối
+
+Trong scripts/cloud/failover_ops.py, cập nhật dòng import từ postgres_ops.
+
+```python
+from scripts.cloud.postgres_ops import preflight_standby, promote_standby
+```
+
+Thêm hàm sau bên dưới prepare_failover.
+
+```python
+def run_failover(config, ec2):
+    prepare_failover(config, ec2)
+
+    print("failover_step=promote_azure")
+    status = promote_standby(config)
+
+    print("failover_step=promotion_confirmed")
+    return status
+```
+
+prepare_failover thực hiện preflight trên PostgreSQL Azure rồi fence EC2 AWS và chờ stopped. Sau khi hàm này trả về thành công, promote_standby mới được gọi. Hàm promotion kiểm tra kết quả pg_promote và đọc lại vai trò PostgreSQL qua kết nối mới. status là dict trạng thái từ lượt xác minh này và được trả về cho bên gọi.
+
+Các lời gọi chạy tuần tự trong cùng luồng thực thi. Exception từ preflight hoặc fencing truyền lên và kết thúc run_failover trước lời gọi promotion. Exception từ promotion kết thúc hàm trước log promotion_confirmed. Bên gọi sẽ xử lý lỗi của lượt failover khi xây dựng điểm kích hoạt trong watcher.
+
+Khi được kích hoạt thành công, thứ tự log dự kiến là như sau.
+
+```text
+failover_step=preflight_standby
+failover_step=fence_aws
+failover_step=fence_confirmed aws_ec2_state=stopped
+failover_step=promote_azure
+failover_step=promotion_confirmed
+```
+
+Hàm này thực hiện fencing và promotion khi được gọi bằng client cùng cấu hình thật trên host Azure. Trong bước hiện tại, trên Git Bash laptop tại thư mục repo, kiểm tra cú pháp các module.
+
+```bash
+.venv/Scripts/python.exe -m py_compile \
+  scripts/cloud/failover_ops.py \
+  scripts/cloud/aws_ops.py \
+  scripts/cloud/postgres_ops.py
+```
+
+Checkpoint là run_failover ghép đúng thứ tự preflight, fencing và promotion, cùng kiểm tra cú pháp thành công. Phần tiếp theo bổ sung xác minh writer qua HTTPS, rồi ghép điểm kích hoạt với enable_auto_failover và ngưỡng lỗi trong vòng watcher. promotion_confirmed phản ánh vai trò database đã được xác minh. Writer health sẽ kiểm chứng thêm đường ứng dụng và trạng thái ghi của ứng dụng.
+
+### 4.105. Xác minh Azure writer qua HTTPS sau promotion
+
+Trong scripts/cloud/checks.py, thêm import time vào nhóm import đầu file. Thêm hàm sau phía dưới classify_probe.
+
+```python
+def wait_for_writer(url, timeout, interval, max_attempts=12):
+    if max_attempts < 1:
+        raise ValueError("max_attempts must be positive.")
+
+    for attempt in range(1, max_attempts + 1):
+        result = probe_writer(url, timeout)
+        state = classify_probe(result)
+        print(f"writer_check attempt={attempt} state={state}")
+        if state == "writer":
+            return result["body"]
+        if attempt < max_attempts:
+            time.sleep(interval)
+
+    raise RuntimeError(
+        f"Writer verification failed after {max_attempts} attempts: {result}"
+    )
+```
+
+Hàm dùng lại probe_writer và classify_probe để xác minh cùng quy tắc với vòng quan sát. writer yêu cầu HTTP 200 và JSON connected true, role primary, writable true, writes_paused false. Trong database/role.py, endpoint /health/database kiểm tra vai trò PostgreSQL và trạng thái cho phép ghi từ app_control. Các trạng thái standby, paused, unavailable và unknown tiếp tục được ghi vào log trong lúc chờ.
+
+Chọn 12 lượt thử cho lab để chờ đường HTTP sẵn sàng sau promotion. timeout áp dụng cho probe HTTP, interval là khoảng nghỉ giữa hai lượt thử. Thời gian thực tế phụ thuộc thời gian phản hồi của mỗi probe. Hàm trả JSON body ngay khi xác nhận writer. Nếu hết lượt thử, RuntimeError kèm kết quả cuối truyền lên bên điều phối. max_attempts phải là số nguyên dương.
+
+Trong scripts/cloud/failover_ops.py, thêm import cùng nhóm module nội bộ.
+
+```python
+from scripts.cloud.checks import wait_for_writer
+```
+
+Trong run_failover, ngay sau log promotion_confirmed và trước return status, thêm đoạn sau.
+
+```python
+    print("failover_step=verify_azure_writer")
+    wait_for_writer(
+        config["azure_writer_url"],
+        config["http_timeout_seconds"],
+        config["interval_seconds"],
+    )
+    print("failover_step=writer_confirmed")
+```
+
+azure_writer_url trỏ trực tiếp origin Azure tại https://azure.mcf.todicode.tech/health/database. Hostname này kiểm chứng đúng phía vừa promote qua HTTPS, Traefik, Service, ứng dụng và database. Hostname chung app.mcf.todicode.tech được kiểm chứng cùng hành vi DNS trong lượt failover end-to-end.
+
+Log promotion_confirmed xác nhận vai trò PostgreSQL. Log writer_confirmed xác nhận writer health qua ứng dụng. Nếu app_control còn tạm dừng ghi hoặc đường HTTP gặp lỗi, bước xác minh sẽ phát sinh exception sau số lượt thử đã định. Khi xử lý lỗi này, PostgreSQL Azure có thể đã là primary và AWS đã stopped. Điểm điều phối cần đối chiếu trạng thái thực tế để xử lý lượt dang dở.
+
+Trên Git Bash laptop tại thư mục repo, kiểm tra cú pháp.
+
+```bash
+.venv/Scripts/python.exe -m py_compile \
+  scripts/cloud/checks.py \
+  scripts/cloud/failover_ops.py
+```
+
+Tiếp theo kiểm tra Python nạp được module cùng các import.
+
+```bash
+.venv/Scripts/python.exe -c "from scripts.cloud.failover_ops import run_failover; print('Import OK')"
+```
+
+py_compile kiểm tra cú pháp của từng file. Lệnh import ở trên nạp các module phụ thuộc để kiểm tra tên hàm được import. Nếu gặp ImportError với wait_for_writer, đối chiếu import time cùng định nghĩa wait_for_writer trong bản checks.py đã lưu trên đĩa. Kết quả mong đợi là Import OK.
+
+Checkpoint là hàm xác minh writer được gọi sau promotion trong run_failover và module được import thành công. Bước tiếp theo ghép điểm kích hoạt với cờ enable_auto_failover và ngưỡng lỗi trong watcher.
+
+### 4.106. Ghép điểm kích hoạt failover vào vòng watcher
+
+Trong scripts/cloud/cloud_watcher.py, thêm import cùng nhóm module nội bộ, dưới phần thiết lập PROJECT_ROOT và sys.path.
+
+```python
+from scripts.cloud.failover_ops import run_failover
+```
+
+Ở cuối vòng while True, thay đoạn in failover_threshold_reached cùng dòng time.sleep bằng đoạn sau.
+
+```python
+        print(f"failover_threshold_reached={threshold_reached}")
+
+        if config["enable_auto_failover"] and threshold_reached:
+            print("failover_triggered=true")
+            run_failover(config, ec2)
+            print("failover_result=success")
+            return
+
+        time.sleep(config["interval_seconds"])
+```
+
+Hai toán hạng của and phải cùng true mới kích hoạt run_failover. enable_auto_failover xác định chế độ vận hành. threshold_reached phản ánh bộ đếm các vòng liên tiếp đủ điều kiện failover_candidate. Với cấu hình failure_threshold 3, cần ba vòng liên tiếp gồm probe AWS unavailable, kết quả Route 53 unhealthy và probe Azure standby.
+
+Nếu cờ false hoặc ngưỡng chưa đạt, vòng quan sát đi tới time.sleep rồi kiểm tra tiếp. Nếu cả hai true, hàm điều phối thực hiện preflight, fencing, promotion và xác minh writer. Log success chỉ xuất hiện khi hàm điều phối trả về thành công.
+
+Chọn kết thúc tiến trình watcher sau một lượt chuyển writer thành công. return thoát main và kết thúc tiến trình bình thường. Exception từ lượt điều phối truyền lên main sẽ kết thúc tiến trình với mã lỗi theo cơ chế Python hiện tại. Phần xử lý lỗi có cấu trúc sẽ được bổ sung tiếp để ghi rõ trạng thái lượt dang dở trước lượt thử tự động thực tế.
+
+Trên Git Bash laptop tại thư mục repo, kiểm tra cú pháp và khả năng nạp module.
+
+```bash
+.venv/Scripts/python.exe -m py_compile scripts/cloud/cloud_watcher.py
+
+.venv/Scripts/python.exe -c "from scripts.cloud.cloud_watcher import main; print('Import OK')"
+```
+
+Đối chiếu cấu hình chế độ vận hành.
+
+```bash
+.venv/Scripts/python.exe -c "from scripts.cloud.cloud_watcher import load_config; print('enable_auto_failover=' + str(load_config()['enable_auto_failover']))"
+```
+
+Checkpoint của bước ghép code là import thành công và cấu hình enable_auto_failover=False cho giai đoạn kiểm tra quan sát. Điểm thực thi tự động sẽ chạy trên host Azure khi cấu hình được bật trong lượt thực hành tự động. Bước tiếp theo bổ sung xử lý lỗi và chuẩn bị runtime trên Azure.
+
+### 4.107. Ghi lỗi lượt failover và trả mã thoát
+
+Trong scripts/cloud/cloud_watcher.py, thêm import subprocess vào nhóm import đầu file để bắt lỗi tiến trình psql hoặc kubectl. Thay khối if kích hoạt failover đã viết ở bước trước bằng đoạn sau.
+
+```python
+        if config["enable_auto_failover"] and threshold_reached:
+            print("failover_triggered=true")
+            try:
+                run_failover(config, ec2)
+            except (
+                BotoCoreError,
+                ClientError,
+                OSError,
+                subprocess.SubprocessError,
+                ValueError,
+                RuntimeError,
+            ) as error:
+                print(
+                    f"failover_result=failed error_type={type(error).__name__} error={error}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                if isinstance(error, subprocess.CalledProcessError) and error.stderr:
+                    print(error.stderr.strip(), file=sys.stderr, flush=True)
+                return 1
+
+            print("failover_result=success")
+            return 0
+```
+
+Khối try bao quanh một lượt điều phối. BotoCoreError bao gồm lỗi waiter, ClientError là lỗi API AWS. OSError bao gồm lỗi khởi chạy công cụ. subprocess.SubprocessError bao gồm CalledProcessError và TimeoutExpired từ đường gọi SQL. ValueError bao gồm lỗi parse JSON và kiểm tra kiểu kết quả. RuntimeError chứa các điều kiện preflight, fencing, promotion và writer health chưa đạt.
+
+except ghi loại lỗi và nội dung vào stderr, flush=True đẩy dòng log ra ngay. Với CalledProcessError có stderr, in thêm nội dung lỗi mà subprocess đã thu từ kubectl hoặc psql. Các dòng failover_step trước lỗi giúp xác định bước đang thực hiện. return 1 kết thúc main với kết quả lỗi. return 0 thể hiện toàn bộ lượt điều phối đã thành công.
+
+Ở cuối file, sửa điểm vào chương trình thành như sau.
+
+```python
+if __name__ == "__main__":
+    sys.exit(main())
+```
+
+main trả số nguyên cho sys.exit để tiến trình có mã thoát tương ứng. Thành công là 0, lỗi lượt failover là 1. Lỗi khởi tạo hoặc lỗi lập trình ngoài khối bắt lỗi vẫn phát sinh exception theo cơ chế Python.
+
+Ví dụ writer health có thể thất bại sau khi Azure đã promote và AWS đã stopped. Khi đó mã 1 phản ánh lượt điều phối gặp lỗi ở bước xác minh. Vai trò PostgreSQL thực tế cần được đọc lại khi chẩn đoán và phục hồi. Việc return kết thúc lượt chạy tại lỗi, giúp người vận hành đối chiếu log cùng trạng thái thực tế trước lượt xử lý tiếp theo.
+
+Trên Git Bash laptop tại thư mục repo, kiểm tra cú pháp và import.
+
+```bash
+.venv/Scripts/python.exe -m py_compile scripts/cloud/cloud_watcher.py
+
+.venv/Scripts/python.exe -c "from scripts.cloud.cloud_watcher import main; print('Import OK')"
+```
+
+Checkpoint là khối kích hoạt trả 0 hoặc 1 theo kết quả và điểm vào dùng sys.exit(main()). Bước tiếp theo chuyển runtime sang Azure, xác nhận chế độ observe và cấu hình service watcher. Sau đó thực hành failover tự động, kiểm tra DNS cùng dữ liệu và phục hồi topology.
+
+### 4.108. Cập nhật runtime trên Azure và chạy observe
+
+Runtime Azure dùng virtual environment và profile mcf-watcher đã chuẩn bị ở các bước trước. Cập nhật đủ các module để điểm vào watcher nạp được luồng điều phối mới.
+
+Trên Git Bash laptop tại thư mục repo, chuyển năm file Python sang thư mục runtime Azure.
+
+```bash
+scp -i ~/.ssh/mcf-lab \
+  scripts/cloud/cloud_watcher.py \
+  scripts/cloud/aws_ops.py \
+  scripts/cloud/checks.py \
+  scripts/cloud/postgres_ops.py \
+  scripts/cloud/failover_ops.py \
+  azureuser@4.145.30.250:/home/azureuser/mcf-watcher/scripts/cloud/
+```
+
+cloud_watcher là điểm vào, aws_ops chứa thao tác AWS, checks xử lý probe và phân loại, postgres_ops chứa thao tác SQL, failover_ops điều phối chuyển writer. Các import trong điểm vào cần đủ các module này trong runtime.
+
+Chuyển cấu hình của lượt triển khai. Cấu hình local đã được đối chiếu với enable_auto_failover false cho bước chạy observe.
+
+```bash
+scp -i ~/.ssh/mcf-lab \
+  deploy/watcher/config.json \
+  azureuser@4.145.30.250:/home/azureuser/mcf-watcher/deploy/watcher/config.json
+```
+
+Trong terminal SSH Azure của azureuser, chạy watcher từ thư mục runtime.
+
+```bash
+cd ~/mcf-watcher
+.venv/bin/python -u scripts/cloud/cloud_watcher.py
+```
+
+.venv/bin/python sử dụng môi trường có boto3 và httpx đã cài cho watcher. -u đẩy log stdout và stderr ra ngay. Điểm vào đọc cấu hình, đối chiếu danh tính AWS, rồi quan sát EC2, Route 53 và hai origin theo chu kỳ.
+
+Trong topology AWS primary và Azure standby đang khỏe, đối chiếu mode observe, EC2 running, Route 53 healthy, HTTP AWS writer và HTTP Azure standby. failover_candidate False cùng consecutive_failures 0 cho thấy vòng quan sát nhận đúng trạng thái ban đầu. Cờ false chọn nhánh quan sát tại điểm kích hoạt.
+
+Sau vài vòng log, dùng Ctrl+C để kết thúc lượt chạy foreground. Checkpoint là runtime mới chạy observe trên Azure với đúng topology. Bước tiếp theo cấu hình systemd service để vận hành watcher trên host Azure trước lượt thực hành failover tự động.
+
+### 4.109. Vận hành watcher bằng systemd trên Azure
+
+Tạo deploy/watcher/mcf-watcher.service trên laptop với nội dung sau.
+
+```ini
+[Unit]
+Description=Multi-cloud failover watcher
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=exec
+User=azureuser
+WorkingDirectory=/home/azureuser/mcf-watcher
+Environment=HOME=/home/azureuser
+ExecStart=/home/azureuser/mcf-watcher/.venv/bin/python -u /home/azureuser/mcf-watcher/scripts/cloud/cloud_watcher.py
+Restart=no
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Wants kéo network-online.target vào lượt khởi động và After đặt thứ tự chạy sau target này. Type exec coi bước khởi chạy thành công khi thực thi được chương trình. User azureuser khớp với tài khoản đã có profile mcf-watcher và quyền sudo -n dùng cho đường gọi kubectl. WorkingDirectory chọn thư mục runtime. HOME xác định thư mục người dùng chứa .aws/credentials. ExecStart dùng đường dẫn tuyệt đối tới Python trong virtual environment cùng điểm vào watcher, và -u đẩy log ra ngay. [systemd service](https://www.freedesktop.org/software/systemd/man/latest/systemd.service.html), [systemd execution environment](https://www.freedesktop.org/software/systemd/man/latest/systemd.exec.html).
+
+Chọn Restart no phù hợp với lượt điều phối hiện tại kết thúc bằng mã 0 hoặc 1. Sau khi tiến trình kết thúc, người vận hành đọc log và trạng thái hệ thống rồi dùng systemctl start để chạy lượt tiếp theo. WantedBy multi-user.target cho phép enable service trong chế độ vận hành thông thường của máy.
+
+Trên Git Bash laptop tại thư mục repo, chuyển unit file sang Azure.
+
+```bash
+scp -i ~/.ssh/mcf-lab \
+  deploy/watcher/mcf-watcher.service \
+  azureuser@4.145.30.250:/home/azureuser/mcf-watcher.service
+```
+
+Trong terminal SSH Azure, cài unit vào thư mục systemd và khởi động service.
+
+```bash
+sudo install -m 644 -o root -g root \
+  /home/azureuser/mcf-watcher.service \
+  /etc/systemd/system/mcf-watcher.service
+
+sudo systemctl daemon-reload
+sudo systemctl enable --now mcf-watcher.service
+sudo systemctl status mcf-watcher.service --no-pager --full
+```
+
+install đặt file cấu hình với owner root và mode 644. daemon-reload yêu cầu systemd đọc lại unit. enable cấu hình chạy service khi host khởi động, --now đồng thời khởi động ngay. status hiển thị tiến trình cùng trạng thái service. Trong lượt observe đang khỏe, kết quả mong đợi là active running. [systemctl](https://www.freedesktop.org/software/systemd/man/latest/systemctl.html).
+
+Xem log vận hành.
+
+```bash
+sudo journalctl -u mcf-watcher.service -n 30 -f
+```
+
+-u chọn service, -n 30 hiển thị 30 dòng gần nhất, -f theo dõi log mới. Đối chiếu mode observe cùng AWS writer và Azure standby. Ctrl+C kết thúc lượt xem journalctl, service tiếp tục chạy do systemd quản lý. [journalctl](https://www.freedesktop.org/software/systemd/man/latest/journalctl.html).
+
+Checkpoint là service active running và ghi đúng trạng thái observe trong journal. Bước tiếp theo chuẩn bị lượt thực hành failover tự động từ topology AWS primary và Azure standby đã xác nhận.
+
+### 4.110. Bật chế độ tự động trên runtime Azure
+
+Service đã chạy observe và nhận đúng topology AWS writer, Azure standby. Trong terminal SSH Azure, mở cấu hình runtime.
+
+```bash
+nano ~/mcf-watcher/deploy/watcher/config.json
+```
+
+Đổi giá trị enable_auto_failover thành boolean true.
+
+```json
+"enable_auto_failover": true
+```
+
+Lưu bằng Ctrl+O, Enter rồi thoát bằng Ctrl+X. Cấu hình này nằm trong runtime của host Azure. Cờ true cho phép nhánh điều phối thực thi khi bộ đếm đồng thời đạt failure_threshold. Trong topology khỏe, AWS writer và Route 53 healthy làm failover_candidate False nên vòng quan sát tiếp tục.
+
+Khởi động lại service để điểm vào đọc cấu hình mới.
+
+```bash
+sudo systemctl restart mcf-watcher.service
+sudo journalctl -u mcf-watcher.service -n 30 -f
+```
+
+main đọc JSON một lần lúc tiến trình khởi động, vì vậy restart tạo tiến trình mới với cấu hình vừa lưu. Trong log của tiến trình mới, đối chiếu mode automatic, AWS writer, Azure standby, failover_candidate False và consecutive_failures 0. Các dòng observe cũ có thể xuất hiện trong phần lịch sử -n 30. Dòng mode automatic của lượt khởi động mới xác nhận đã nạp cờ.
+
+Khi phát hiện đủ ba lượt liên tiếp thỏa điều kiện lỗi, watcher sẽ thực hiện preflight, xác nhận fencing EC2, promote Azure và kiểm tra writer qua HTTPS. Sau một lượt điều phối, tiến trình kết thúc với mã 0 hoặc 1 theo kết quả. Với Restart no, người vận hành đọc log và trạng thái thực tế trước lượt chạy tiếp theo.
+
+Checkpoint là service đang chạy mode automatic trong topology AWS writer và Azure standby. Bước tiếp theo ghi dữ liệu kiểm chứng trước sự cố rồi mô phỏng mất khả dụng AWS để quan sát failover tự động.
+
+### 4.111. Ghi dữ liệu kiểm chứng trước lượt failover tự động
+
+Watcher đã chạy automatic trong topology AWS writer và Azure standby. Chuẩn bị một bản ghi để đối chiếu dữ liệu sau chuyển writer.
+
+Trên Git Bash laptop tại thư mục repo, tạo run ID cho lượt thực hành và ghi bản ghi seq 1 qua hostname chung.
+
+```bash
+MCF_AUTO_RUN_ID="stage7-auto-$(date -u +%Y%m%dT%H%M%SZ)"
+printf 'MCF_AUTO_RUN_ID=%s\n' "$MCF_AUTO_RUN_ID"
+
+printf '{"run_id":"%s","seq":1}\n' "$MCF_AUTO_RUN_ID" |
+  /c/Windows/System32/curl.exe -fsS --max-time 10 \
+    -H 'Content-Type: application/json' \
+    --data-binary @- \
+    -w '\nHTTP %{http_code}\n' \
+    https://app.mcf.todicode.tech/api/ping
+```
+
+run_id nhận diện lượt thực hành, seq 1 nhận diện bản ghi trước sự cố. printf tạo JSON và pipe chuyển nội dung vào curl. --data-binary @- đọc JSON từ stdin, Content-Type xác định định dạng body, -w hiển thị mã HTTP. curl.exe của Windows là công cụ đã dùng thành công cho HTTPS trong lab.
+
+Trong topology hiện tại, kết quả mong đợi là HTTP 200 cùng run_id vừa tạo, seq 1 và environment aws. Lưu lại run ID đã in ở đầu để dùng khi đối chiếu sau failover. Biến shell tồn tại trong terminal Git Bash hiện tại.
+
+Đọc cùng run ID trực tiếp qua origin Azure.
+
+```bash
+/c/Windows/System32/curl.exe -fsS --max-time 10 \
+  -w '\nHTTP %{http_code}\n' \
+  "https://azure.mcf.todicode.tech/api/ping/$MCF_AUTO_RUN_ID"
+```
+
+Kết quả mong đợi là HTTP 200, count 1 và pings chứa seq 1 với environment aws. Endpoint GET thực hiện SELECT trên PostgreSQL Azure standby. Đọc được bản ghi cho thấy dữ liệu vừa ghi trên AWS đã được WAL replication chuyển và replay trên Azure. Nếu kết quả count 0, chạy lại lệnh GET để chờ bản ghi xuất hiện trước lượt gây sự cố.
+
+Checkpoint là bản ghi trước sự cố được ghi trên AWS và đọc được trên Azure. Bước tiếp theo mô phỏng mất khả dụng AWS rồi theo dõi watcher tự xác nhận fencing, promote Azure và kiểm chứng writer.
+
+### 4.112. Mô phỏng AWS mất khả dụng và theo dõi failover tự động
+
+Bản ghi seq 1 đã được ghi qua ứng dụng AWS và đọc được từ Azure standby. Watcher trên Azure đang chạy automatic. Lượt này dùng dừng EC2 để mô phỏng mất khả dụng toàn bộ workload trên host AWS.
+
+Trong terminal SSH Azure, mở log service để theo dõi quá trình.
+
+```bash
+sudo journalctl -u mcf-watcher.service -n 10 -f
+```
+
+Trên Git Bash laptop tại thư mục repo, lấy ID từ Terraform output rồi gửi yêu cầu dừng EC2.
+
+```bash
+MCF_AWS_INSTANCE_ID=$(terraform -chdir=deploy/terraform/aws output -raw aws_instance_id)
+
+aws ec2 stop-instances \
+  --profile default \
+  --region ap-southeast-1 \
+  --instance-ids "$MCF_AWS_INSTANCE_ID" \
+  --no-cli-pager
+```
+
+Lệnh dùng danh tính vận hành default và chọn EC2 đang được Terraform quản lý. StopInstances thực hiện shutdown hệ điều hành theo mặc định. Response thường có CurrentState stopping. Khi EC2 dừng, PostgreSQL, ứng dụng và K3s trên host AWS mất khả dụng. [AWS StopInstances](https://docs.aws.amazon.com/cli/latest/reference/ec2/stop-instances.html).
+
+Trong kịch bản này, người vận hành tạo sự cố bằng yêu cầu dừng EC2. Hàm fencing của watcher đọc trạng thái và xác nhận stopped trước khi promotion. Nhánh gửi StopInstances trong hàm fencing được dùng khi watcher bắt đầu fencing mà EC2 còn running.
+
+Quan sát log Azure. HTTP probe AWS chuyển unavailable và báo cáo Route 53 chuyển unhealthy. Khi Azure còn standby và ba lượt liên tiếp đạt điều kiện, bộ đếm lần lượt lên 1, 2, 3 và kích hoạt run_failover. Độ trễ phát hiện phụ thuộc timeout của probe, thời điểm cập nhật báo cáo Route 53 và các vòng quan sát liên tiếp.
+
+Các mốc chính mong đợi sau khi điều kiện kích hoạt đạt là như sau.
+
+```text
+failover_threshold_reached=True
+failover_triggered=true
+failover_step=preflight_standby
+failover_step=fence_aws
+failover_step=fence_confirmed aws_ec2_state=stopped
+failover_step=promote_azure
+failover_step=promotion_confirmed
+failover_step=verify_azure_writer
+failover_step=writer_confirmed
+failover_result=success
+```
+
+Writer check có thể ghi thêm các lượt chờ giữa verify_azure_writer và writer_confirmed. Sau khi run_failover thành công, tiến trình trả mã 0 và service chuyển inactive dead theo thiết kế kết thúc một lượt. journal ghi nhận tiến trình hoàn tất thành công.
+
+Checkpoint là log xác nhận EC2 stopped trước promotion và kết thúc bằng failover_result success. Nếu lượt điều phối ghi failover_result failed, dùng loại lỗi cùng dòng failover_step cuối để xác định bước cần xử lý. Bước tiếp theo đối chiếu HTTPS hostname chung, bản ghi seq 1 và khả năng ghi mới trên Azure.
+
+### 4.113. Nghiệm thu DNS và dữ liệu qua hostname chung sau failover tự động
+
+Log lượt thực hành ngày 2026-11-15 ghi nhận failover_candidate true liên tiếp với bộ đếm 1 lúc 14:26:50, 2 lúc 14:27:03 và 3 lúc 14:27:14. Watcher kích hoạt lúc 14:27:14, xác nhận EC2 stopped trước promotion, rồi ghi promotion_confirmed, writer_confirmed và failover_result success lúc 14:27:15. systemd ghi Deactivated successfully sau khi tiến trình kết thúc. Các mốc này dùng timestamp trong journal của host Azure.
+
+Đối chiếu DNS trên Git Bash laptop.
+
+```bash
+nslookup -type=CNAME app.mcf.todicode.tech 1.1.1.1
+```
+
+Kết quả mong đợi là app.mcf.todicode.tech có canonical name azure.mcf.todicode.tech. Nếu vẫn trả AWS, chờ health check và DNS cập nhật rồi chạy lại lệnh. Tiếp tục ghi qua hostname chung khi kết quả DNS đã chọn Azure.
+
+Trong cùng terminal Git Bash đã tạo MCF_AUTO_RUN_ID, ghi bản ghi thứ hai của lượt thực hành.
+
+```bash
+printf '{"run_id":"%s","seq":2}\n' "$MCF_AUTO_RUN_ID" |
+  /c/Windows/System32/curl.exe -fsS --max-time 10 \
+    -H 'Content-Type: application/json' \
+    --data-binary @- \
+    -w '\nHTTP %{http_code}\n' \
+    https://app.mcf.todicode.tech/api/ping
+```
+
+Kết quả mong đợi là HTTP 200, đúng run_id đang dùng, seq 2 và environment azure. Đây là request ghi qua hostname chung sau chuyển writer. Nếu dùng terminal mới, gán lại MCF_AUTO_RUN_ID bằng giá trị đã lưu ở bước 4.111 trước khi gửi request.
+
+Đọc lại toàn bộ bản ghi của run ID.
+
+```bash
+/c/Windows/System32/curl.exe -fsS --max-time 10 \
+  -w '\nHTTP %{http_code}\n' \
+  "https://app.mcf.todicode.tech/api/ping/$MCF_AUTO_RUN_ID"
+```
+
+Kết quả mong đợi là HTTP 200, count 2 và danh sách pings gồm seq 1 với environment aws cùng seq 2 với environment azure. seq 1 đối chiếu bản ghi trước sự cố đã có trên Azure standby. seq 2 chứng minh ứng dụng trên writer Azure chấp nhận ghi mới sau promotion. Hai trường environment lưu nơi tạo từng bản ghi.
+
+Lượt nghiệm thu ngày 2026-11-15 xác nhận app.mcf.todicode.tech trỏ CNAME tới azure.mcf.todicode.tech. Run ID stage7-auto-20261115T142154Z ghi seq 2 qua hostname chung với environment azure và HTTP 200. Lượt GET cùng run ID trả count 2, gồm seq 1 với environment aws và seq 2 với environment azure, cùng HTTP 200.
+
+Checkpoint là DNS chọn Azure và API hostname chung ghi, đọc được dữ liệu trước cùng sau chuyển writer. Sau lượt này, topology vận hành là Azure primary và EC2 AWS stopped. Bước tiếp theo đưa watcher về observe và chuẩn bị phục hồi AWS theo quy trình rejoin.
 
 ## 5. Theo dõi tiến độ
 
@@ -4149,7 +4694,19 @@ Checkpoint là hai kiểm tra thành công. Bước tiếp theo ghép preflight 
 - [x] Thêm policy watcher_fence giới hạn StopInstances theo ARN EC2 primary và đối chiếu plan.
 - [x] Apply policy watcher_fence và kiểm chứng quyền bằng EC2 DryRunOperation.
 - [x] Viết fence_instance trong aws_ops.py và kiểm tra cú pháp.
-- [ ] Kiểm thử thứ tự fencing và lỗi waiter bằng EC2 giả lập.
+- [x] Tạo failover_ops.py, ghép preflight với fencing trong prepare_failover và kiểm tra cú pháp.
+- [ ] Tách run_postgres_sql trong postgres_ops.py và đối chiếu preflight từ host Azure.
+- [x] Thêm promote_standby, kiểm tra kết quả pg_promote và đối chiếu vai trò qua kết nối mới.
+- [x] Ghép prepare_failover và promote_standby trong run_failover, kiểm tra cú pháp các module.
+- [x] Thêm wait_for_writer và ghép xác minh HTTPS origin Azure sau promotion.
+- [x] Ghép run_failover vào watcher với cờ enable_auto_failover và ngưỡng lỗi, kiểm tra import cùng chế độ observe.
+- [x] Bổ sung bắt lỗi lượt failover, ghi stderr và trả mã thoát 0 hoặc 1.
+- [x] Cập nhật năm module và cấu hình runtime trên Azure, chạy observe với AWS writer và Azure standby.
+- [x] Cài mcf-watcher.service trên Azure, enable service và đối chiếu log observe trong journal.
+- [x] Bật enable_auto_failover trên runtime Azure và xác nhận mode automatic trong topology khỏe.
+- [x] Ghi bản ghi seq 1 trước sự cố và đọc được qua origin Azure standby.
+- [x] Mô phỏng mất khả dụng EC2 AWS và đối chiếu watcher tự xác nhận fencing, promote Azure, xác minh writer.
+- [x] Đối chiếu DNS chọn Azure, ghi seq 2 và đọc seq 1/2 qua hostname chung sau failover tự động.
 
 ## 6. Tài liệu kỹ thuật
 

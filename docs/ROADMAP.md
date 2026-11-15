@@ -56,7 +56,7 @@ The [Stage 6 guide](instruction/giaidoan6_dns_va_https.md) records delegation of
 
 Stage 7 manual recovery functional acceptance is complete. The manual recovery exercise covered AWS-to-Azure failover, AWS rejoin on a new PVC, controlled failback with an application write barrier and WAL replay checkpoint, and Azure rejoin on a new PVC. Cloud power-state checks confirmed fencing before writer promotion. New transactions were read on each rebuilt standby, and both applications passed the expected readiness and writer-health checks. Final DNS and shared-hostname HTTPS selected the writable AWS primary. Azure WAL receiver output and a new replicated transaction confirm restored AWS-to-Azure replication. AWS WAL sender output is pending supplementary capture. The guide records the commands, observed results, and intermediate checks awaiting output. [Stage 7 recovery guide](instruction/giaidoan7_failover_va_phuc_hoi.md).
 
-The next recovery increment adds an Azure-hosted watcher to automate AWS failure detection, confirmed fencing, standby promotion, and writer verification. Route 53 already selects DNS answers using writer health. This cloud controller is pending implementation and validation. Stage 8 covers independent monitoring. Stage 9 covers baseline comparison, repeated failure measurements, RPO evaluation, latency, and cost proxy analysis.
+The Azure-hosted systemd watcher completed an automatic failover exercise on 2026-11-15. The operator stopped the AWS EC2 instance to simulate host loss. The watcher detected consecutive failures, confirmed the instance was stopped, promoted Azure, and verified writer health. Route 53 selected Azure for the shared hostname. API requests for run ID stage7-auto-20261115T142154Z returned HTTP 200 and both the pre-failure AWS record and a new Azure record. The exercise ended with Azure primary and AWS stopped. Restoring the AWS-primary/Azure-standby topology is the next recovery step. Stage 8 covers independent monitoring. Stage 9 covers baseline comparison, repeated failure measurements, RPO evaluation, latency, and cost proxy analysis.
 
 | Phase | Deliverable | Acceptance evidence |
 |---|---|---|
@@ -66,7 +66,7 @@ The next recovery increment adds an Azure-hosted watcher to automate AWS failure
 | DNS failover | Writer health checks and Route 53 routing | Traffic reaches the promoted writer after the old writer is fenced |
 | Observability | Monitoring outside the application environments | Origin/writer availability, latency, and replication signals |
 | Cloud recovery | Manual failover, rejoin, and controlled failback | A single writer throughout; verified data after both transitions |
-| Automatic failover | Planned Azure-hosted watcher | Automatic detection, confirmed fencing, promotion, and writer verification in a cloud failure exercise |
+| Automatic failover | Azure-hosted systemd watcher | EC2-loss exercise passed with confirmed stopped state, Azure promotion, DNS selection, and pre/post-failover API data |
 | Evaluation | Repeated failure exercises and operational analysis | Raw measurements for downtime, latency, errors, data loss, and cost |
 
 ## Evaluation goals

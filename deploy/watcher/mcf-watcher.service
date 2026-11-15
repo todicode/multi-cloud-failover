@@ -1,0 +1,15 @@
+[Unit]
+Description=Multi-cloud failover watcher
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=exec
+User=azureuser
+WorkingDirectory=/home/azureuser/mcf-watcher
+Environment=HOME=/home/azureuser
+ExecStart=/home/azureuser/mcf-watcher/.venv/bin/python -u /home/azureuser/mcf-watcher/scripts/cloud/cloud_watcher.py
+Restart=no
+
+[Install]
+WantedBy=multi-user.target
