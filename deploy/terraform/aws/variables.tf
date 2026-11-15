@@ -12,3 +12,8 @@ variable "dns_zone_id" {
   description = "Route 53 hosted zone ID used for certificate DNS validation"
   type        = string
 }
+
+variable "aws_writer_health_check_id" {
+  description = "Route 53 health check observed by the cloud watcher"
+  type        = string
+}

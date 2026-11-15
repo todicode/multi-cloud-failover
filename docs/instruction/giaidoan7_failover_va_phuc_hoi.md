@@ -2551,6 +2551,143 @@ Cú pháp heredoc truyền đoạn Python giữa hai dòng PY vào stdin của i
 
 Checkpoint là phân loại được writer, paused, standby, unavailable và unknown theo dữ liệu hiện có. Unavailable là quan sát đầu vào để tiếp tục xác minh. Quyết định chuyển vai trò cần được xây dựng với ngưỡng lỗi, nguồn quan sát Route 53 và điều kiện fencing.
 
+### 4.70. Khai báo IAM user dành cho cloud watcher
+
+Script đã có các nhánh writer, paused, standby, unavailable và unknown. Để bổ sung nguồn quan sát Route 53 và thao tác fencing ở phần điều khiển, chuẩn bị danh tính AWS dành cho watcher. Controller dự kiến dùng quyền DescribeInstances, GetHealthCheckStatus của health check AWS và StopInstances đối với EC2 primary. Các quyền được bổ sung từng phần ở các bước tiếp theo.
+
+Trên laptop, tạo deploy/terraform/aws/watcher-iam.tf với nội dung sau.
+
+```hcl
+resource "aws_iam_user" "watcher" {
+  name = "mcf-azure-watcher"
+
+  tags = {
+    Name    = "mcf-azure-watcher"
+    Project = "multi-cloud-failover"
+  }
+}
+```
+
+aws_iam_user là resource Terraform quản lý IAM user. watcher là tên tham chiếu bên trong module, ví dụ aws_iam_user.watcher.name. name là tên user thực tế trong AWS account. Azure trong tên thể hiện nơi watcher dự kiến chạy. IAM user này thuộc AWS để xác thực các lời gọi API AWS từ controller trên Azure. Các tags nhận diện resource của project.
+
+IAM user và các permission policy là hai phần của cấu hình. User mới có danh tính, quyền thực hiện các thao tác được quyết định bởi policy áp dụng. Bước hiện tại mới khai báo user, phần policy sẽ được xây dựng sau. [Creating IAM users](https://docs.aws.amazon.com/IAM/latest/UserGuide/id_users_create.html), [Terraform aws_iam_user](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/iam_user).
+
+Trên Git Bash laptop, xác nhận account của profile triển khai.
+
+```bash
+aws sts get-caller-identity \
+  --profile default \
+  --query Account \
+  --output text \
+  --no-cli-pager
+```
+
+Account của lượt thực hành là 925271162060. AWS provider của root module hiện dùng profile default, tương ứng danh tính người vận hành quản lý Terraform. Profile mcf-watcher trong JSON là tên profile sẽ cấu hình cho controller sau khi user cùng policy đã được chuẩn bị.
+
+Kiểm tra Terraform.
+
+```bash
+terraform -chdir=deploy/terraform/aws fmt
+terraform -chdir=deploy/terraform/aws validate
+terraform -chdir=deploy/terraform/aws plan
+```
+
+Plan mong đợi thêm aws_iam_user.watcher với name mcf-azure-watcher, tổng 1 to add, 0 to change, 0 to destroy nếu hạ tầng còn lại khớp cấu hình. Nếu plan có thay đổi khác, đối chiếu các resource đó trước khi chuyển sang bước tiếp theo. Checkpoint của bước này là account đã được xác nhận và plan IAM user đã được kiểm tra. Bước sau bổ sung policy quan sát Route 53 cùng EC2, rồi kiểm tra phạm vi quyền fencing.
+
+### 4.71. Khai báo policy quan sát EC2 và Route 53
+
+Plan IAM user đã được người vận hành đối chiếu thành công. Bổ sung inline policy cho hai API quan sát đã xác định trong thiết kế watcher, gồm DescribeInstances của EC2 và GetHealthCheckStatus của Route 53. Các action cùng kiểu resource đã được đối chiếu bằng AWS Service Authorization Reference.
+
+Trong deploy/terraform/aws/variables.tf, thêm biến sau.
+
+```hcl
+variable "aws_writer_health_check_id" {
+  description = "Route 53 health check observed by the cloud watcher"
+  type        = string
+}
+```
+
+Biến đưa health check ID từ cấu hình triển khai vào policy AWS. Root module DNS đã tạo resource health check, còn root module AWS nhận ID để giới hạn quyền đọc đúng health check đó.
+
+Trong deploy/terraform/aws/terraform.tfvars, thêm giá trị của lượt triển khai hiện tại.
+
+```hcl
+aws_writer_health_check_id = "45a1d674-1355-5102-09ff-69e75ef12793"
+```
+
+Đây là cùng ID aws_health_check_id trong deploy/watcher/config.json. Khi tái tạo health check, hai cấu hình cần dùng ID của resource mới.
+
+Trong deploy/terraform/aws/watcher-iam.tf, bên dưới resource IAM user đã viết, thêm toàn bộ resource policy sau.
+
+```hcl
+resource "aws_iam_user_policy" "watcher_observe" {
+  name = "mcf-watcher-observe"
+  user = aws_iam_user.watcher.name
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect   = "Allow"
+        Action   = "ec2:DescribeInstances"
+        Resource = "*"
+      },
+      {
+        Effect   = "Allow"
+        Action   = "route53:GetHealthCheckStatus"
+        Resource = "arn:aws:route53:::healthcheck/${var.aws_writer_health_check_id}"
+      }
+    ]
+  })
+}
+```
+
+aws_iam_user_policy quản lý inline policy gắn trực tiếp với một IAM user. user tham chiếu tên resource aws_iam_user.watcher để Terraform xác định quan hệ phụ thuộc. jsonencode chuyển object HCL thành JSON policy mà IAM nhận. Version là phiên bản ngôn ngữ policy của IAM. Hai phần tử Statement cấp hai quyền quan sát.
+
+ec2:DescribeInstances dùng Resource * do action này có phạm vi resource ở mức toàn bộ, thay vì hỗ trợ ARN instance riêng. Client watcher sẽ truy vấn EC2 ID đã cấu hình khi đọc trạng thái. route53:GetHealthCheckStatus hỗ trợ resource healthcheck, nên Resource dùng ARN của đúng health check AWS writer. Action và ARN được xác minh từ danh mục AWS. [EC2 service reference](https://servicereference.us-east-1.amazonaws.com/v1/ec2/ec2.json), [Route 53 service reference](https://servicereference.us-east-1.amazonaws.com/v1/route53/route53.json).
+
+Trên Git Bash laptop, kiểm tra các thay đổi.
+
+```bash
+terraform -chdir=deploy/terraform/aws fmt
+terraform -chdir=deploy/terraform/aws validate
+terraform -chdir=deploy/terraform/aws plan
+```
+
+Với Terraform state đã đối chiếu trước bước này, IAM user còn nằm trong plan tạo mới. Kết quả mong đợi thêm aws_iam_user.watcher cùng aws_iam_user_policy.watcher_observe, tổng 2 to add, 0 to change, 0 to destroy. Nếu có thay đổi khác, đối chiếu các resource liên quan trước khi tiếp tục.
+
+Checkpoint là plan có đúng user và policy quan sát với hai Statement đã được giải thích. Bước tiếp theo apply cấu hình đã kiểm tra, rồi chuẩn bị credential profile để quan sát từ script. Quyền StopInstances được bổ sung khi xây dựng phần fencing.
+
+### 4.72. Tạo IAM user và policy quan sát đã kiểm tra
+
+Người vận hành đã đối chiếu plan gồm aws_iam_user.watcher và aws_iam_user_policy.watcher_observe, tổng 2 to add, 0 to change, 0 to destroy. Tiếp tục tạo hai resource trong AWS account của project.
+
+Trên Git Bash laptop tại thư mục gốc repository, chạy lệnh sau.
+
+```bash
+terraform -chdir=deploy/terraform/aws apply
+```
+
+-chdir chọn root module AWS. Provider của module sử dụng profile default để gọi API bằng danh tính người vận hành. Terraform tạo IAM user mcf-azure-watcher trước, sau đó gắn inline policy mcf-watcher-observe. Tham chiếu user = aws_iam_user.watcher.name giúp Terraform xác định thứ tự phụ thuộc này.
+
+Vì lệnh plan trước đó chưa lưu plan file, apply tính lại kế hoạch rồi yêu cầu xác nhận. Đối chiếu lần nữa hai resource cùng tổng 2 to add, 0 to change, 0 to destroy. Khi khớp, nhập yes và Enter. Nếu có thêm thay đổi, kiểm tra các resource phát sinh trước khi xác nhận. [Terraform apply](https://developer.hashicorp.com/terraform/cli/commands/apply).
+
+Kết quả mong đợi là
+
+```text
+Apply complete! Resources: 2 added, 0 changed, 0 destroyed.
+```
+
+Kiểm tra thông tin user được lưu trong Terraform state.
+
+```bash
+terraform -chdir=deploy/terraform/aws state show aws_iam_user.watcher
+```
+
+Đối chiếu name mcf-azure-watcher và ARN arn:aws:iam::925271162060:user/mcf-azure-watcher. ARN xác định user cùng AWS account chứa user. state show đọc thuộc tính resource đã được Terraform ghi nhận trong state. [Terraform state show](https://developer.hashicorp.com/terraform/cli/commands/state/show).
+
+Hai quyền trong policy phục vụ quan sát trạng thái EC2 và health check writer AWS. Danh tính này sẽ được script sử dụng khi bổ sung credential profile và lời gọi API ở các bước sau. Checkpoint hiện tại là apply thành công và user có đúng tên cùng account trong state.
+
 ### 4.73. Tạo access key cho danh tính watcher
 
 User mcf-azure-watcher đã được đối chiếu trong account 925271162060. Terraform state đã có cả user và inline policy watcher_observe. Chuẩn bị credential để CLI và chương trình watcher có thể xác thực bằng danh tính này.
@@ -3410,6 +3547,180 @@ PY
 
 Import module cung cấp các hàm, còn đoạn Python trên gọi load_config rồi read_postgres_status. Output cần là object JSON với in_recovery true, read_only on cùng các vị trí WAL của Azure tại lượt query. Checkpoint là hàm Python chạy được trên host Azure và trả trạng thái PostgreSQL dạng dict. Bước tiếp theo sử dụng dữ liệu đó để kiểm chứng standby khi đạt ngưỡng phát hiện lỗi.
 
+### 4.93. Tách thao tác PostgreSQL thành module riêng
+
+Hàm read_postgres_status đã được người vận hành gọi thành công trên Azure, trả in_recovery true, read_only on và hai LSN cùng 0/70009B8. Tách nhóm thao tác PostgreSQL vào postgres_ops.py để các bước đọc trạng thái và promotion sau này có vị trí rõ ràng. cloud_watcher.py tiếp tục điều phối cấu hình, các nguồn quan sát cùng vòng quyết định. Nhóm HTTP probe và phân loại Route 53 sẽ được tổ chức tiếp theo trong checks.py.
+
+Trên laptop, tạo scripts/cloud/postgres_ops.py. Thêm hai import sau ở đầu file, rồi cắt toàn bộ hàm read_postgres_status từ cloud_watcher.py sang dưới hai import.
+
+```python
+import json
+import subprocess
+```
+
+Hàm được chuyển gồm dòng def read_postgres_status(config) đến hết return status. Các tên namespace và Pod tiếp tục nhận qua tham số config. Module mới sử dụng json để giải mã output và subprocess để thực thi lệnh PostgreSQL.
+
+Trong cloud_watcher.py, thêm import sys cùng các import đầu file. Xóa import subprocess sau khi chuyển hàm. Sửa khối PROJECT_ROOT và CONFIG_PATH thành đoạn sau.
+
+```python
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(PROJECT_ROOT))
+
+from scripts.cloud.postgres_ops import read_postgres_status
+
+CONFIG_PATH = PROJECT_ROOT / "deploy" / "watcher" / "config.json"
+```
+
+PROJECT_ROOT xác định thư mục gốc từ vị trí script. sys.path là danh sách thư mục Python dùng để tìm module. insert đưa root lên đầu danh sách để lệnh chạy trực tiếp scripts/cloud/cloud_watcher.py tìm được scripts.cloud.postgres_ops. Repo cũng sử dụng cách xác định root này trong các script local.
+
+Import đưa tên read_postgres_status vào namespace của cloud_watcher. Các đoạn kiểm chứng trước đó import hàm từ scripts.cloud.cloud_watcher tiếp tục truy cập được tên hàm. Thân hàm được đặt trong postgres_ops.py, còn nơi gọi truyền config như bước trước.
+
+Trên Git Bash laptop tại thư mục gốc repository, kiểm tra cú pháp và chuyển hai file sang Azure.
+
+```bash
+.venv/Scripts/python.exe -m py_compile scripts/cloud/cloud_watcher.py scripts/cloud/postgres_ops.py
+
+scp -i ~/.ssh/mcf-lab \
+  scripts/cloud/cloud_watcher.py scripts/cloud/postgres_ops.py \
+  azureuser@4.145.30.250:/home/azureuser/mcf-watcher/scripts/cloud/
+```
+
+Trong terminal SSH Azure, gọi lại đường kiểm chứng đã sử dụng ở bước trước.
+
+```bash
+cd ~/mcf-watcher
+.venv/bin/python - <<'PY'
+import json
+from scripts.cloud.cloud_watcher import load_config, read_postgres_status
+
+status = read_postgres_status(load_config())
+print(json.dumps(status))
+PY
+```
+
+Đối chiếu JSON của Azure standby. Sau đó có thể chạy điểm vào hiện tại để kiểm tra vòng quan sát.
+
+```bash
+.venv/bin/python scripts/cloud/cloud_watcher.py
+```
+
+Checkpoint là thao tác PostgreSQL đã nằm trong module riêng, điểm vào watcher cùng đường import kiểm chứng hoạt động sau khi tách. Bước tiếp theo tổ chức nhóm probe và phân loại thành checks.py, rồi dùng các module này trong preflight và điều phối failover.
+
+### 4.94. Tách HTTP probe và phân loại Route 53 sang checks.py
+
+Tách nhóm quan sát thành module riêng để cloud_watcher.py tập trung vào cấu hình, khởi tạo client và vòng điều phối. checks.py chứa HTTP probe cùng các hàm phân loại kết quả. postgres_ops.py chứa đường truy cập PostgreSQL đã tách ở bước trước.
+
+Trên laptop, tạo scripts/cloud/checks.py và thêm các import sau.
+
+```python
+from datetime import datetime
+
+import httpx
+```
+
+Cắt toàn bộ bốn hàm sau từ cloud_watcher.py, dán dưới phần import của checks.py theo thứ tự hiện tại.
+
+- probe_writer
+- classify_probe
+- classify_route53_report
+- classify_route53
+
+HTTPX được probe_writer dùng để gọi origin. datetime được classify_route53_report dùng để kiểm tra CheckedTime. classify_route53 gọi hàm phân loại từng report ngay trong cùng module.
+
+Trong cloud_watcher.py, thay phần đầu file từ các import đến hết CONFIG_PATH bằng đoạn sau.
+
+```python
+import json
+import sys
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+
+import boto3
+from botocore.config import Config
+from botocore.exceptions import BotoCoreError, ClientError
+
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(PROJECT_ROOT))
+
+from scripts.cloud.checks import (
+    classify_probe,
+    classify_route53,
+    classify_route53_report,
+    probe_writer,
+)
+from scripts.cloud.postgres_ops import read_postgres_status
+
+CONFIG_PATH = PROJECT_ROOT / "deploy" / "watcher" / "config.json"
+```
+
+cloud_watcher sử dụng json để đọc cấu hình và ghi log, datetime cùng timezone để lấy mốc UTC của lượt quan sát. Các hàm từ checks được đưa vào namespace của watcher qua import, nên main gọi chúng bằng tên đang sử dụng. Đường import kiểm chứng trước đó tiếp tục có thể truy cập các hàm được đưa vào cloud_watcher. Khối import đầu file cũng gom sys thành một vị trí.
+
+Trên Git Bash laptop tại repository, kiểm tra cú pháp và chuyển ba module sang Azure.
+
+```bash
+.venv/Scripts/python.exe -m py_compile scripts/cloud/cloud_watcher.py scripts/cloud/checks.py scripts/cloud/postgres_ops.py
+
+scp -i ~/.ssh/mcf-lab \
+  scripts/cloud/checks.py scripts/cloud/postgres_ops.py scripts/cloud/cloud_watcher.py \
+  azureuser@4.145.30.250:/home/azureuser/mcf-watcher/scripts/cloud/
+```
+
+Trong terminal SSH Azure, chạy lại điểm vào watcher.
+
+```bash
+cd ~/mcf-watcher
+.venv/bin/python scripts/cloud/cloud_watcher.py
+```
+
+Đối chiếu AWS writer, Azure standby, Route 53 healthy và bộ đếm 0 khi topology đang khỏe. Sau vài vòng, kết thúc bằng Ctrl+C. Checkpoint là ba module được import đúng và vòng quan sát hoạt động sau khi tách. Bước tiếp theo bổ sung điều kiện preflight từ dữ liệu PostgreSQL đã đọc được.
+
+### 4.95. Kiểm chứng vai trò standby trong postgres_ops.py
+
+Sau khi tách module và đối chiếu vòng quan sát, bổ sung kiểm chứng vai trò PostgreSQL trong postgres_ops.py. Mã Python được nhóm theo trách nhiệm quan sát, PostgreSQL, thao tác AWS và điều phối. Terraform được nhóm theo network, compute, IAM và DNS trong các root module tương ứng. Mỗi phần mới được đặt cùng logic liên quan để giữ luồng phụ thuộc rõ ràng.
+
+Trên laptop, thêm hàm sau ở cuối scripts/cloud/postgres_ops.py, sau read_postgres_status.
+
+```python
+def preflight_standby(config):
+    status = read_postgres_status(config)
+    if status.get("in_recovery") is not True:
+        raise RuntimeError("Target PostgreSQL must be a standby.")
+    if status.get("read_only") != "on":
+        raise RuntimeError("Standby PostgreSQL must be read-only.")
+    return status
+```
+
+preflight_standby gọi đường đọc trạng thái đã kiểm chứng. Điều kiện đầu yêu cầu in_recovery là boolean True. Điều kiện thứ hai yêu cầu read_only là chuỗi on. RuntimeError chuyển thông tin thất bại về nơi gọi để phần điều phối quyết định dừng lượt thao tác. Khi hai kiểm tra đạt, hàm trả dict trạng thái để tiếp tục đối chiếu các trường WAL.
+
+Các trường có nguồn từ pg_is_in_recovery và current_setting transaction_read_only trong SQL. PostgreSQL trả true từ pg_is_in_recovery khi recovery còn diễn ra. [PostgreSQL recovery information](https://www.postgresql.org/docs/17/functions-admin.html#FUNCTIONS-RECOVERY-INFO-TABLE).
+
+Trên Git Bash laptop tại repository, chuyển module đã bổ sung sang Azure.
+
+```bash
+scp -i ~/.ssh/mcf-lab \
+  scripts/cloud/postgres_ops.py \
+  azureuser@4.145.30.250:/home/azureuser/mcf-watcher/scripts/cloud/
+```
+
+Trong terminal SSH Azure, gọi hàm kiểm chứng.
+
+```bash
+cd ~/mcf-watcher
+.venv/bin/python - <<'PY'
+import json
+from scripts.cloud.cloud_watcher import load_config
+from scripts.cloud.postgres_ops import preflight_standby
+
+status = preflight_standby(load_config())
+print(json.dumps(status))
+PY
+```
+
+Kết quả mong đợi là JSON của Azure standby với in_recovery true, read_only on cùng các trường receive_lsn và replay_lsn. Khi query thất bại hoặc vai trò được báo về chưa đáp ứng điều kiện, exception được chuyển tới nơi gọi. Kiểm chứng vai trò này là một phần của preflight, các bước sau tiếp tục kiểm chứng fencing, WAL và promotion.
+
+Checkpoint là hàm kiểm chứng standby chạy được từ host Azure và logic PostgreSQL có vị trí riêng trong postgres_ops.py. Bước tiếp theo tổ chức phần thao tác AWS trong module riêng để chuẩn bị fencing và kết nối các bước vào điều phối.
+
 ## 5. Theo dõi tiến độ
 
 - [x] Nghiệm thu giai đoạn 6 và xác định phạm vi giai đoạn 7.
@@ -3495,13 +3806,14 @@ Import module cung cấp các hàm, còn đoạn Python trên gọi load_config 
 - [x] Failback và khôi phục topology AWS primary, Azure standby.
 - [x] Nghiệm thu chức năng vòng failover, rejoin và failback thủ công giai đoạn 7.
 - [ ] Triển khai và kiểm chứng cloud watcher tự động phát hiện lỗi, fence AWS và promote Azure.
-
 - [x] Chuẩn bị và kiểm tra file cấu hình cloud watcher trên laptop.
 - [x] Viết và chạy điểm vào Python đọc cấu hình cloud watcher.
 - [x] Thêm HTTP probe và đối chiếu writer health hai origin trong mode observe.
 - [x] Thêm phân loại writer, paused, standby và unknown cho kết quả HTTP probe.
 - [ ] Bổ sung unavailable và đối chiếu phân loại timeout cùng lỗi kết nối database.
-
+- [x] Khai báo IAM user watcher trong Terraform và đối chiếu account cùng plan.
+- [x] Khai báo policy quan sát EC2 và Route 53, đối chiếu Terraform plan.
+- [x] Apply IAM user cùng policy quan sát và đối chiếu user trong Terraform state.
 - [x] Tạo và lưu riêng access key cho user mcf-azure-watcher.
 - [ ] Cấu hình profile mcf-watcher trên laptop và xác nhận account cùng ARN qua STS.
 - [x] Dùng profile mcf-watcher đọc EC2 state và quan sát health check writer AWS.
@@ -3510,12 +3822,10 @@ Import module cung cấp các hàm, còn đoạn Python trên gọi load_config 
 - [ ] Đọc EC2 state từ Boto3 bằng instance ID trong cấu hình và đối chiếu CLI.
 - [ ] Đọc các quan sát health check Route 53 bằng Boto3 và đối chiếu CLI.
 - [ ] Cấu hình timeout và retry cho STS, EC2 và Route 53 client.
-
 - [ ] Xử lý lỗi lời gọi EC2 thành state unknown và tiếp tục thu thập các quan sát phía sau.
 - [ ] Xử lý lỗi đọc Route 53 thành nguồn quan sát unknown và tiếp tục HTTP probe.
 - [ ] Phân loại từng báo cáo Route 53 theo nội dung và CheckedTime với ngưỡng tuổi 120 giây của lab.
 - [ ] Tổng hợp route53_state theo quy tắc các báo cáo cùng trạng thái và xử lý None, danh sách rỗng thành unknown.
-
 - [x] Khôi phục workload sau lần nghỉ lab và đối chiếu lại AWS primary, Azure standby trước khi tiếp tục watcher.
 - [ ] Lưu HTTP state hai cloud và tính failover_candidate từ HTTP AWS, Route 53 cùng vai trò Azure trong một lượt quan sát.
 - [x] Chạy vòng quan sát lặp lại và đối chiếu bộ đếm 0 trong topology khỏe với AWS writer, Azure standby streaming.
@@ -3524,7 +3834,10 @@ Import module cung cấp các hàm, còn đoạn Python trên gọi load_config 
 - [ ] Chuyển ba file runtime lên Azure, cài dependency và kiểm tra phiên bản cùng cú pháp script.
 - [x] Cấu hình profile mcf-watcher cho azureuser và đối chiếu vòng observe chạy từ host Azure.
 - [x] Dùng azureuser đọc trạng thái PostgreSQL trong K3s bằng sudo -n và nhận JSON cho preflight standby.
-- [ ] Thêm read_postgres_status dùng subprocess và đối chiếu kết quả hàm trên host Azure.
+- [x] Thêm read_postgres_status dùng subprocess và đối chiếu kết quả hàm trên host Azure.
+- [x] Tách read_postgres_status sang postgres_ops.py và đối chiếu điểm vào cùng đường import sau khi chuyển module.
+- [x] Tách nhóm HTTP probe và phân loại Route 53 sang checks.py, đối chiếu vòng quan sát sau khi chuyển module.
+- [x] Thêm preflight_standby trong postgres_ops.py và đối chiếu vai trò standby từ host Azure.
 
 ## 6. Tài liệu kỹ thuật
 
