@@ -8,6 +8,8 @@ Giai đoạn này phục vụ các yêu cầu S2 về chuyển traffic, S3 về 
 
 Phần 7 nối các bước thực hành thành một luồng, kèm ba hình minh họa và bảng giải thích nhóm lệnh. [Bức tranh tổng thể và cách đọc lệnh](#7-bức-tranh-tổng-thể-và-cách-đọc-lệnh).
 
+Mục tiêu automation được cập nhật ở mục 4.128 thành vòng failover, rejoin và failback tự động sau khi controller được cấu hình và khởi chạy. Vòng rejoin và failback thủ công đã được nghiệm thu ở phần trước. Các mục 4.117–4.121 ghi lại những thao tác phục hồi đã hướng dẫn sau lượt failover tự động. Phần Python từ mục 4.122 xây dựng các thao tác phục hồi để controller điều phối theo trạng thái thực tế.
+
 ## 2. Trạng thái bắt đầu
 
 - Giai đoạn 6 đã nghiệm thu DNS, HTTPS, writer health checks và renewal dry-run kèm deploy hook trên hai cloud.
@@ -43,6 +45,20 @@ Các định danh trên thuộc lượt triển khai hiện tại. Người tái
 PostgreSQL lưu vai trò cùng dữ liệu trên disk. Sau khi promote Azure, AWS cũ cần được đưa trở lại theo vai trò và dữ liệu phù hợp để duy trì một writer. DNS chọn đích truy cập dựa trên health check. Việc kiểm soát writer được thực hiện ở luồng fencing và phục hồi database. [PostgreSQL failover](https://www.postgresql.org/docs/17/warm-standby-failover.html).
 
 ## 4. Thực hành từng bước
+
+Code cloud được tổ chức theo quy trình trong scripts/cloud. Package failover chứa watcher cùng các module AWS, PostgreSQL, probe và điều phối. Package rejoin và failback là vị trí triển khai các bước phục hồi tiếp theo.
+
+```text
+scripts/cloud/
+├── failover/
+│   ├── cloud_watcher.py
+│   ├── aws_ops.py
+│   ├── checks.py
+│   ├── postgres_ops.py
+│   └── failover_ops.py
+├── rejoin/
+└── failback/
+```
 
 ### 4.1. Xác nhận AWS account và EC2 trước khi vận hành
 
@@ -2321,13 +2337,13 @@ Lệnh cần in lại JSON và kết thúc thành công. json.tool kiểm tra c�
 
 File config.json đã được kiểm tra cú pháp và đối chiếu các trường cấu hình. Bắt đầu script bằng chức năng đọc JSON, kiểm tra cấu trúc object cùng kiểu cờ enable_auto_failover và hiển thị các đầu vào chính.
 
-Trên laptop, tạo scripts/cloud/cloud_watcher.py với nội dung sau.
+Trên laptop, tạo scripts/cloud/failover/cloud_watcher.py với nội dung sau.
 
 ```python
 import json
 from pathlib import Path
 
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
+PROJECT_ROOT = Path(__file__).resolve().parents[3]
 CONFIG_PATH = PROJECT_ROOT / "deploy" / "watcher" / "config.json"
 
 
@@ -2353,7 +2369,7 @@ if __name__ == "__main__":
     main()
 ```
 
-PROJECT_ROOT được tính từ đường dẫn của script. Với scripts/cloud/cloud_watcher.py, parents[0] là thư mục cloud, parents[1] là thư mục scripts và parents[2] là thư mục gốc repository. CONFIG_PATH ghép đường dẫn tới file JSON theo vị trí project. Cách này xác định file cấu hình từ vị trí script khi terminal có working directory khác.
+PROJECT_ROOT được tính từ đường dẫn của script. Với scripts/cloud/failover/cloud_watcher.py, parents[0] là thư mục failover, parents[1] là thư mục cloud, parents[2] là thư mục scripts và parents[3] là thư mục gốc repository. CONFIG_PATH ghép đường dẫn tới file JSON theo vị trí project. Cách này xác định file cấu hình từ vị trí script khi terminal có working directory khác.
 
 Path.read_text đọc nội dung file. Encoding utf-8-sig hỗ trợ UTF-8 và xử lý BOM khi có trong file Windows. json.loads chuyển chuỗi JSON thành object Python. JSON object của cấu hình được biểu diễn bằng dict.
 
@@ -2364,7 +2380,7 @@ main gọi load_config, xác định tên chế độ từ cờ và in bốn dò
 Trên Git Bash laptop tại repository, chạy script.
 
 ```bash
-.venv/Scripts/python.exe scripts/cloud/cloud_watcher.py
+.venv/Scripts/python.exe scripts/cloud/failover/cloud_watcher.py
 ```
 
 Với cấu hình đã chuẩn bị, đầu ra mong đợi là
@@ -2380,9 +2396,9 @@ Checkpoint là script đọc được file cấu hình và in đúng các giá t
 
 ### 4.67. Quan sát writer health của hai origin qua HTTP
 
-Người vận hành đã chạy scripts/cloud/cloud_watcher.py và nhận đúng mode observe, AWS region, instance ID cùng writer URL. Tiếp tục bổ sung HTTP probe dùng thư viện httpx đã có trong requirements.txt.
+Người vận hành đã chạy scripts/cloud/failover/cloud_watcher.py và nhận đúng mode observe, AWS region, instance ID cùng writer URL. Tiếp tục bổ sung HTTP probe dùng thư viện httpx đã có trong requirements.txt.
 
-Trong scripts/cloud/cloud_watcher.py, thêm import httpx dưới các import hiện tại.
+Trong scripts/cloud/failover/cloud_watcher.py, thêm import httpx dưới các import hiện tại.
 
 ```python
 import httpx
@@ -2428,7 +2444,7 @@ Vòng lặp chạy một lần cho aws và một lần cho azure. F-string tạo
 Chạy trên Git Bash laptop.
 
 ```bash
-.venv/Scripts/python.exe scripts/cloud/cloud_watcher.py
+.venv/Scripts/python.exe scripts/cloud/failover/cloud_watcher.py
 ```
 
 Với topology đã nghiệm thu, dòng aws cần HTTP status 200, role primary và writable true. Dòng azure cần HTTP status 503, role standby, writable false cùng replication_connected true. Script thực hiện một lượt kiểm tra cho mỗi cloud. Nếu output có trường error, đối chiếu lỗi probe trước khi bổ sung logic quyết định.
@@ -2439,7 +2455,7 @@ Checkpoint là HTTP status và body của hai môi trường đã được quan 
 
 HTTP probe đã trả AWS status 200, role primary, writable true, writes_paused false và current_lsn 0/7000800. Azure trả status 503, role standby, writable false, replication_connected true, receive_lsn cùng replay_lsn 0/7000800. Tiếp tục chuyển các phản hồi quan sát thành trạng thái để phục vụ logic watcher.
 
-Trong scripts/cloud/cloud_watcher.py, thêm hàm sau giữa probe_writer và main.
+Trong scripts/cloud/failover/cloud_watcher.py, thêm hàm sau giữa probe_writer và main.
 
 ```python
 def classify_probe(result):
@@ -2482,7 +2498,7 @@ classify_probe nhận result từ HTTP probe và trả chuỗi trạng thái. D�
 Chạy trên Git Bash laptop.
 
 ```bash
-.venv/Scripts/python.exe scripts/cloud/cloud_watcher.py
+.venv/Scripts/python.exe scripts/cloud/failover/cloud_watcher.py
 ```
 
 Kết quả mong đợi với topology hiện tại là dòng aws có state=writer và dòng azure có state=standby. Kịch bản primary đã tạm dừng ghi sẽ cho state=paused khi endpoint trả đầy đủ các trường tương ứng.
@@ -2493,7 +2509,7 @@ Checkpoint là phân loại đúng hai origin hiện tại và hiểu ý nghĩa 
 
 Hàm classify_probe đã được thêm vào script và đối chiếu cấu trúc với endpoint database/role.py. Bổ sung hai tình huống unavailable để chuẩn bị phát hiện sự cố, đồng thời phân biệt kết quả paused của lượt bảo trì có kế hoạch.
 
-Trong scripts/cloud/cloud_watcher.py, thay hàm classify_probe bằng phiên bản sau.
+Trong scripts/cloud/failover/cloud_watcher.py, thay hàm classify_probe bằng phiên bản sau.
 
 ```python
 def classify_probe(result):
@@ -2531,7 +2547,7 @@ Trường hợp HTTP 503 kèm connected false tương ứng endpoint ứng dụn
 Chạy trên Git Bash laptop để đối chiếu trạng thái thực tế.
 
 ```bash
-.venv/Scripts/python.exe scripts/cloud/cloud_watcher.py
+.venv/Scripts/python.exe scripts/cloud/failover/cloud_watcher.py
 ```
 
 Với topology hiện tại, AWS cần state writer và Azure cần state standby.
@@ -2540,7 +2556,7 @@ Kiểm tra riêng nhánh timeout bằng dữ liệu mô phỏng trong Git Bash.
 
 ```bash
 .venv/Scripts/python.exe - <<'PY'
-from scripts.cloud.cloud_watcher import classify_probe
+from scripts.cloud.failover.cloud_watcher import classify_probe
 
 result = {"http_status": None, "error": "ConnectTimeout"}
 print(classify_probe(result))
@@ -2811,7 +2827,7 @@ Kết quả mong đợi là 1.44.3. -c chạy đoạn Python truyền trong đ�
 
 Sau khi cài dependency watcher, bổ sung Session chọn profile và region từ config.json. Gọi STS GetCallerIdentity từ Python để đối chiếu credential mà chương trình sẽ sử dụng cho các API tiếp theo.
 
-Trong scripts/cloud/cloud_watcher.py, thêm import cùng các import thư viện hiện có.
+Trong scripts/cloud/failover/cloud_watcher.py, thêm import cùng các import thư viện hiện có.
 
 ```python
 import boto3
@@ -2851,7 +2867,7 @@ session.client("sts") tạo client của dịch vụ STS. get_caller_identity g�
 Giữ phần mode và HTTP probe phía sau trong main. Trên Git Bash laptop, chạy lại script.
 
 ```bash
-.venv/Scripts/python.exe scripts/cloud/cloud_watcher.py
+.venv/Scripts/python.exe scripts/cloud/failover/cloud_watcher.py
 ```
 
 Đầu ra cần có dòng sau trước các dòng mode và probe hiện có.
@@ -2866,7 +2882,7 @@ Với topology AWS primary, Azure standby đang hoạt động, các dòng probe
 
 Session được khởi tạo trong main để các service client dùng chung profile cùng region. Tiếp tục dùng Session này tạo EC2 client và đọc trạng thái instance được chọn trong config.json.
 
-Trong scripts/cloud/cloud_watcher.py, trong main, ngay sau dòng print aws_identity và trước dòng gán mode, thêm đoạn sau.
+Trong scripts/cloud/failover/cloud_watcher.py, trong main, ngay sau dòng print aws_identity và trước dòng gán mode, thêm đoạn sau.
 
 ```python
     ec2 = session.client("ec2")
@@ -2904,7 +2920,7 @@ instance["State"]["Name"] lấy chuỗi trạng thái, ví dụ running, stoppin
 Chạy trên Git Bash laptop.
 
 ```bash
-.venv/Scripts/python.exe scripts/cloud/cloud_watcher.py
+.venv/Scripts/python.exe scripts/cloud/failover/cloud_watcher.py
 ```
 
 Khi EC2 đang chạy, đầu ra cần có dòng aws_ec2_state=running. Đối chiếu giá trị với kết quả CLI DescribeInstances của cùng instance. Checkpoint là Python đọc được EC2 state bằng profile watcher. Bước tiếp theo đọc các quan sát Route 53 từ cùng Session.
@@ -2913,7 +2929,7 @@ Khi EC2 đang chạy, đầu ra cần có dòng aws_ec2_state=running. Đối ch
 
 Sau khi đọc EC2 state, bổ sung Route 53 client để lấy các báo cáo health check bằng cùng Session. Health check ID lấy từ cấu hình watcher và trùng với resource đã cấp quyền GetHealthCheckStatus.
 
-Trong scripts/cloud/cloud_watcher.py, trong main, ngay sau dòng print aws_ec2_state và trước dòng gán mode, thêm đoạn sau.
+Trong scripts/cloud/failover/cloud_watcher.py, trong main, ngay sau dòng print aws_ec2_state và trước dòng gán mode, thêm đoạn sau.
 
 ```python
     route53 = session.client("route53")
@@ -2934,7 +2950,7 @@ Vòng for duyệt các quan sát để hiển thị region cùng status của t�
 Chạy trên Git Bash laptop.
 
 ```bash
-.venv/Scripts/python.exe scripts/cloud/cloud_watcher.py
+.venv/Scripts/python.exe scripts/cloud/failover/cloud_watcher.py
 ```
 
 Với AWS writer đang hoạt động, ví dụ một dòng đầu ra là
@@ -2951,7 +2967,7 @@ Checkpoint là chương trình đọc được EC2 state, báo cáo Route 53 và
 
 Các lời gọi AWS hiện chạy tuần tự trước HTTP probe. Cấu hình timeout và số lần thử giúp kiểm soát thời gian chờ API khi xây dựng vòng quan sát. Project chọn connect timeout 5 giây, read timeout 5 giây và tối đa 2 lần gửi cho một lời gọi có lỗi được SDK cho phép retry.
 
-Trong scripts/cloud/cloud_watcher.py, thêm import sau cùng các import đầu file.
+Trong scripts/cloud/failover/cloud_watcher.py, thêm import sau cùng các import đầu file.
 
 ```python
 from botocore.config import Config
@@ -2995,7 +3011,7 @@ Ví dụ lỗi mạng được SDK đánh giá có thể retry sẽ đi qua lầ
 Chạy lại trên Git Bash laptop.
 
 ```bash
-.venv/Scripts/python.exe scripts/cloud/cloud_watcher.py
+.venv/Scripts/python.exe scripts/cloud/failover/cloud_watcher.py
 ```
 
 Đối chiếu chương trình tiếp tục in danh tính, EC2 state, báo cáo Route 53 cùng HTTP probe khi các API hoạt động bình thường. Checkpoint là ba AWS client đã nhận cấu hình timeout và retry. Bước tiếp theo xử lý lỗi quan sát AWS để đưa vào trạng thái mà watcher có thể đánh giá.
@@ -3004,7 +3020,7 @@ Chạy lại trên Git Bash laptop.
 
 Sau khi giới hạn timeout và retry, bổ sung xử lý lỗi cho lần đọc EC2 trong main. Khi SDK báo lỗi, chuyển kết quả EC2 sang unknown và ghi thông tin lỗi để các nguồn quan sát phía sau vẫn được thu thập.
 
-Trong scripts/cloud/cloud_watcher.py, thêm import sau cùng các import đầu file.
+Trong scripts/cloud/failover/cloud_watcher.py, thêm import sau cùng các import đầu file.
 
 ```python
 from botocore.exceptions import BotoCoreError, ClientError
@@ -3035,7 +3051,7 @@ Nếu exception của lời gọi này chưa được xử lý, chương trình 
 Chạy lại trên Git Bash laptop.
 
 ```bash
-.venv/Scripts/python.exe scripts/cloud/cloud_watcher.py
+.venv/Scripts/python.exe scripts/cloud/failover/cloud_watcher.py
 ```
 
 Khi API thành công và máy đang chạy, kết quả cần tiếp tục có aws_ec2_state=running. Khi lời gọi phát sinh lỗi SDK hoặc lỗi dịch vụ được bắt, chương trình ghi aws_ec2_error rồi aws_ec2_state=unknown và chuyển sang phần đọc Route 53. Checkpoint là nhánh lỗi EC2 đã có kết quả quan sát riêng. Bước tiếp theo xử lý tương ứng cho nguồn Route 53.
@@ -3044,7 +3060,7 @@ Khi API thành công và máy đang chạy, kết quả cần tiếp tục có a
 
 Bổ sung xử lý lỗi cho nguồn quan sát Route 53 trong main. Khi API phát sinh lỗi SDK hoặc lỗi dịch vụ, gán observations thành None, ghi trạng thái unknown và tiếp tục tới HTTP probe. Khi lời gọi thành công, duyệt các báo cáo như bước trước.
 
-Trong scripts/cloud/cloud_watcher.py, thay đoạn từ tạo client route53 đến hết vòng for in từng observation bằng đoạn sau.
+Trong scripts/cloud/failover/cloud_watcher.py, thay đoạn từ tạo client route53 đến hết vòng for in từng observation bằng đoạn sau.
 
 ```python
     route53 = session.client("route53", config=aws_client_config)
@@ -3073,7 +3089,7 @@ Tình huống cụ thể là origin AWS còn phục vụ ghi nhưng watcher gặ
 Chạy lại trên Git Bash laptop.
 
 ```bash
-.venv/Scripts/python.exe scripts/cloud/cloud_watcher.py
+.venv/Scripts/python.exe scripts/cloud/failover/cloud_watcher.py
 ```
 
 Khi API hoạt động, chương trình tiếp tục in các báo cáo region và status. Khi gặp lỗi được bắt, đầu ra có route53_error, route53_state=unknown rồi các dòng HTTP probe. Checkpoint là lỗi của nguồn Route 53 đã được xử lý để chương trình tiếp tục thu thập dữ liệu. Bước sau tổng hợp các báo cáo thành trạng thái, có xét trường hợp None, danh sách rỗng và thời điểm kiểm tra của từng báo cáo.
@@ -3082,7 +3098,7 @@ Khi API hoạt động, chương trình tiếp tục in các báo cáo region v�
 
 Mỗi StatusReport chứa Status và CheckedTime. Boto3 biểu diễn CheckedTime bằng datetime, với thời điểm kiểm tra UTC từ Route 53. Project chọn ngưỡng tuổi báo cáo 120 giây cho lượt thực hành này. Báo cáo quá ngưỡng, thiếu dữ liệu hoặc có thời điểm ở tương lai được phân loại unknown. [Boto3 Route 53 response](https://docs.aws.amazon.com/boto3/latest/reference/services/route53/client/get_health_check_status.html).
 
-Trong scripts/cloud/cloud_watcher.py, thêm import sau ở đầu file.
+Trong scripts/cloud/failover/cloud_watcher.py, thêm import sau ở đầu file.
 
 ```python
 from datetime import datetime, timezone
@@ -3134,7 +3150,7 @@ Ví dụ với now là 10:00:00 UTC, báo cáo Success: được kiểm tra lúc
 Chạy lại trên Git Bash laptop.
 
 ```bash
-.venv/Scripts/python.exe scripts/cloud/cloud_watcher.py
+.venv/Scripts/python.exe scripts/cloud/failover/cloud_watcher.py
 ```
 
 Khi các checker đang báo thành công với dữ liệu đủ mới, đầu ra có các dòng route53 region=... state=healthy. Checkpoint là từng báo cáo đã có trạng thái healthy, unhealthy hoặc unknown. Bước tiếp theo tổng hợp danh sách trạng thái thành kết quả quan sát chung cho watcher.
@@ -3143,7 +3159,7 @@ Khi các checker đang báo thành công với dữ liệu đủ mới, đầu r
 
 Sau khi mỗi báo cáo đã có trạng thái riêng, tổng hợp chúng thành một giá trị để bước quyết định có thể sử dụng. Project chọn quy tắc cho watcher trong lab là toàn bộ báo cáo đều healthy thì kết quả healthy, toàn bộ đều unhealthy thì kết quả unhealthy. Các trường hợp khác, bao gồm thiếu báo cáo hoặc có kết quả khác nhau, trả unknown.
 
-Trong scripts/cloud/cloud_watcher.py, thêm hàm sau sau classify_route53_report và trước main.
+Trong scripts/cloud/failover/cloud_watcher.py, thêm hàm sau sau classify_route53_report và trước main.
 
 ```python
 def classify_route53(observations, now):
@@ -3189,7 +3205,7 @@ Kết quả tổng hợp là giá trị do watcher tính theo quy tắc của pr
 Chạy trên Git Bash laptop.
 
 ```bash
-.venv/Scripts/python.exe scripts/cloud/cloud_watcher.py
+.venv/Scripts/python.exe scripts/cloud/failover/cloud_watcher.py
 ```
 
 Khi tất cả báo cáo đủ mới và đều thành công, đầu ra có route53_state=healthy, kèm các dòng checker tương ứng. Checkpoint là chương trình đã có route53_state để dùng trong bước kết hợp các nguồn quan sát.
@@ -3250,7 +3266,7 @@ AWS cần in_recovery f, read_only off. Azure cần in_recovery t, read_only on.
 
 Người vận hành đã xác nhận workload sau khi bật máy và vai trò AWS primary, Azure standby đạt kết quả mong đợi. Tiếp tục giữ kết quả HTTP probe của từng cloud trong một dict để tính điều kiện cho lượt quan sát.
 
-Trong scripts/cloud/cloud_watcher.py, ở cuối main, thay vòng for đang probe hai cloud bằng đoạn sau, gồm cả phần tính failover_candidate sau vòng lặp.
+Trong scripts/cloud/failover/cloud_watcher.py, ở cuối main, thay vòng for đang probe hai cloud bằng đoạn sau, gồm cả phần tính failover_candidate sau vòng lặp.
 
 ```python
     writer_states = {}
@@ -3289,7 +3305,7 @@ Giá trị True là đầu vào cho bộ đếm các lượt lỗi liên tiếp 
 Trên Git Bash laptop, chạy script để kiểm chứng với hệ thống vừa khôi phục.
 
 ```bash
-.venv/Scripts/python.exe scripts/cloud/cloud_watcher.py
+.venv/Scripts/python.exe scripts/cloud/failover/cloud_watcher.py
 ```
 
 Khi AWS phục vụ writer, Azure ở vai trò standby và các báo cáo Route 53 đủ mới đều thành công, đầu ra cần có aws state=writer, azure state=standby, route53_state=healthy và failover_candidate=False. Đối chiếu thêm replication_connected true trong body Azure để xác nhận kết nối replication sau khi bật máy.
@@ -3300,7 +3316,7 @@ Checkpoint là đã lưu riêng HTTP state của hai cloud và tính được đ
 
 Một lượt quan sát đã tính được failover_candidate từ các nguồn hiện có. Bổ sung vòng lặp để lấy lại dữ liệu và cập nhật bộ đếm sau mỗi lượt. failure_threshold trong JSON đặt ngưỡng lượt lỗi liên tiếp, còn interval_seconds đặt thời gian nghỉ sau một lượt đã hoàn tất.
 
-Trong scripts/cloud/cloud_watcher.py, thêm import sau ở đầu file.
+Trong scripts/cloud/failover/cloud_watcher.py, thêm import sau ở đầu file.
 
 ```python
 import time
@@ -3341,8 +3357,8 @@ time.sleep nghỉ theo interval_seconds rồi vòng lặp bắt đầu lượt q
 Trên Git Bash laptop, kiểm tra cú pháp sau khi chỉnh thụt đầu dòng rồi chạy chương trình.
 
 ```bash
-.venv/Scripts/python.exe -m py_compile scripts/cloud/cloud_watcher.py
-.venv/Scripts/python.exe scripts/cloud/cloud_watcher.py
+.venv/Scripts/python.exe -m py_compile scripts/cloud/failover/cloud_watcher.py
+.venv/Scripts/python.exe scripts/cloud/failover/cloud_watcher.py
 ```
 
 Khi topology AWS primary, Azure standby hoạt động bình thường, mỗi lượt cần có failover_candidate=False, consecutive_failures=0 và failover_threshold_reached=False. Sau vài lượt quan sát, dùng Ctrl+C để kết thúc chương trình trên laptop. Checkpoint là mỗi vòng đọc lại dữ liệu, bộ đếm giữ qua các vòng và ngắt chuỗi khi điều kiện của lượt quan sát False.
@@ -3360,14 +3376,14 @@ Trong terminal SSH Azure, chạy lần lượt
 ```bash
 sudo apt-get update
 sudo apt-get install -y python3-venv
-mkdir -p ~/mcf-watcher/scripts/cloud ~/mcf-watcher/deploy/watcher
+mkdir -p ~/mcf-watcher/scripts/cloud/failover ~/mcf-watcher/deploy/watcher
 python3 -m venv ~/mcf-watcher/.venv
 ~/mcf-watcher/.venv/bin/python --version
 ```
 
 apt-get update cập nhật danh mục package. apt-get install cài module venv của Python hệ thống trên Ubuntu. mkdir -p tạo cây thư mục runtime, bao gồm thư mục cha khi cần. python3 -m venv tạo môi trường thư viện riêng cho tiến trình watcher. Lệnh cuối dùng interpreter bên trong môi trường đó để đối chiếu phiên bản. [Ubuntu python3-venv](https://packages.ubuntu.com/noble/python3-venv), [Python venv](https://docs.python.org/3.12/library/venv.html).
 
-Với Ubuntu 24.04 của lab, phiên bản dự kiến là Python 3.12.x. Trên Linux, interpreter của virtual environment nằm dưới .venv/bin/python. Cây scripts/cloud và deploy/watcher được tạo để giữ đúng quan hệ đường dẫn mà PROJECT_ROOT trong cloud_watcher.py sử dụng. Khi chuyển code, script sẽ ở scripts/cloud và đọc JSON từ deploy/watcher trong cùng runtime root.
+Với Ubuntu 24.04 của lab, phiên bản dự kiến là Python 3.12.x. Trên Linux, interpreter của virtual environment nằm dưới .venv/bin/python. Cây scripts/cloud/failover và deploy/watcher được tạo để giữ đúng quan hệ đường dẫn mà PROJECT_ROOT trong cloud_watcher.py sử dụng. Khi chuyển code, script sẽ ở scripts/cloud/failover và đọc JSON từ deploy/watcher trong cùng runtime root.
 
 Checkpoint là môi trường Python trên host Azure đã được tạo và interpreter chạy được. Bước tiếp theo chuyển script, config cùng requirements từ laptop lên cây thư mục này, rồi cài dependency và cấu hình profile AWS cho tài khoản chạy watcher.
 
@@ -3381,8 +3397,8 @@ Trên Git Bash laptop tại thư mục gốc repository, chạy lần lượt
 cd /d/multi-cloud-failover
 
 scp -i ~/.ssh/mcf-lab \
-  scripts/cloud/cloud_watcher.py \
-  azureuser@4.145.30.250:/home/azureuser/mcf-watcher/scripts/cloud/
+  scripts/cloud/failover/cloud_watcher.py \
+  azureuser@4.145.30.250:/home/azureuser/mcf-watcher/scripts/cloud/failover/
 
 scp -i ~/.ssh/mcf-lab \
   deploy/watcher/config.json deploy/watcher/requirements.txt \
@@ -3404,7 +3420,7 @@ Kiểm tra phiên bản hai thư viện và cú pháp Python trên Azure.
 
 ```bash
 .venv/bin/python -c "import boto3; import httpx; print(boto3.__version__, httpx.__version__)"
-.venv/bin/python -m py_compile scripts/cloud/cloud_watcher.py
+.venv/bin/python -m py_compile scripts/cloud/failover/cloud_watcher.py
 ```
 
 Dòng đầu cần in 1.44.3 0.28.1 theo requirements đã chuẩn bị. py_compile cần kết thúc thành công. Checkpoint là ba file ở đúng cây thư mục, dependency đã cài và script qua kiểm tra cú pháp trên host Azure. Bước tiếp theo chuẩn bị profile mcf-watcher trong môi trường tài khoản azureuser rồi chạy quan sát từ Azure.
@@ -3445,7 +3461,7 @@ Mong đợi thư mục có mode 700, file có mode 600 và owner là azureuser. 
 
 ```bash
 cd ~/mcf-watcher
-.venv/bin/python scripts/cloud/cloud_watcher.py
+.venv/bin/python scripts/cloud/failover/cloud_watcher.py
 ```
 
 Đối chiếu dòng aws_identity là arn:aws:iam::925271162060:user/mcf-azure-watcher. Khi topology đang khỏe, chương trình cần in mode observe, EC2 running, route53_state healthy, AWS writer, Azure standby, consecutive_failures 0 và failover_threshold_reached False. Body Azure cần replication_connected true trong lượt kiểm tra sau khôi phục.
@@ -3489,7 +3505,7 @@ Checkpoint là tài khoản chạy watcher có thể gọi sudo -n, truy cập P
 
 Lệnh SQL trên Azure đã trả in_recovery true, read_only on, receive_lsn và replay_lsn cùng 0/70009B8 trong lượt đối chiếu. Chuyển đường đọc đã kiểm chứng thành hàm Python để phần preflight có thể sử dụng.
 
-Trên laptop, trong scripts/cloud/cloud_watcher.py, thêm import subprocess ở đầu file. Thêm hàm sau trước main.
+Trên laptop, trong scripts/cloud/failover/cloud_watcher.py, thêm import subprocess ở đầu file. Thêm hàm sau trước main.
 
 ```python
 def read_postgres_status(config):
@@ -3528,8 +3544,8 @@ Trên Git Bash laptop, chuyển bản script đã chỉnh sang Azure.
 
 ```bash
 scp -i ~/.ssh/mcf-lab \
-  scripts/cloud/cloud_watcher.py \
-  azureuser@4.145.30.250:/home/azureuser/mcf-watcher/scripts/cloud/
+  scripts/cloud/failover/cloud_watcher.py \
+  azureuser@4.145.30.250:/home/azureuser/mcf-watcher/scripts/cloud/failover/
 ```
 
 Trong terminal SSH Azure, gọi riêng hàm để đối chiếu đường đọc từ Python.
@@ -3538,7 +3554,7 @@ Trong terminal SSH Azure, gọi riêng hàm để đối chiếu đường đọ
 cd ~/mcf-watcher
 .venv/bin/python - <<'PY'
 import json
-from scripts.cloud.cloud_watcher import load_config, read_postgres_status
+from scripts.cloud.failover.cloud_watcher import load_config, read_postgres_status
 
 status = read_postgres_status(load_config())
 print(json.dumps(status))
@@ -3551,7 +3567,7 @@ Import module cung cấp các hàm, còn đoạn Python trên gọi load_config 
 
 Hàm read_postgres_status đã được người vận hành gọi thành công trên Azure, trả in_recovery true, read_only on và hai LSN cùng 0/70009B8. Tách nhóm thao tác PostgreSQL vào postgres_ops.py để các bước đọc trạng thái và promotion sau này có vị trí rõ ràng. cloud_watcher.py tiếp tục điều phối cấu hình, các nguồn quan sát cùng vòng quyết định. Nhóm HTTP probe và phân loại Route 53 sẽ được tổ chức tiếp theo trong checks.py.
 
-Trên laptop, tạo scripts/cloud/postgres_ops.py. Thêm hai import sau ở đầu file, rồi cắt toàn bộ hàm read_postgres_status từ cloud_watcher.py sang dưới hai import.
+Trên laptop, tạo scripts/cloud/failover/postgres_ops.py. Thêm hai import sau ở đầu file, rồi cắt toàn bộ hàm read_postgres_status từ cloud_watcher.py sang dưới hai import.
 
 ```python
 import json
@@ -3563,26 +3579,26 @@ Hàm được chuyển gồm dòng def read_postgres_status(config) đến hết
 Trong cloud_watcher.py, thêm import sys cùng các import đầu file. Xóa import subprocess sau khi chuyển hàm. Sửa khối PROJECT_ROOT và CONFIG_PATH thành đoạn sau.
 
 ```python
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
+PROJECT_ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from scripts.cloud.postgres_ops import read_postgres_status
+from scripts.cloud.failover.postgres_ops import read_postgres_status
 
 CONFIG_PATH = PROJECT_ROOT / "deploy" / "watcher" / "config.json"
 ```
 
-PROJECT_ROOT xác định thư mục gốc từ vị trí script. sys.path là danh sách thư mục Python dùng để tìm module. insert đưa root lên đầu danh sách để lệnh chạy trực tiếp scripts/cloud/cloud_watcher.py tìm được scripts.cloud.postgres_ops. Repo cũng sử dụng cách xác định root này trong các script local.
+PROJECT_ROOT xác định thư mục gốc từ vị trí script. sys.path là danh sách thư mục Python dùng để tìm module. insert đưa root lên đầu danh sách để lệnh chạy trực tiếp scripts/cloud/failover/cloud_watcher.py tìm được scripts.cloud.failover.postgres_ops. Repo cũng sử dụng cách xác định root này trong các script local.
 
-Import đưa tên read_postgres_status vào namespace của cloud_watcher. Các đoạn kiểm chứng trước đó import hàm từ scripts.cloud.cloud_watcher tiếp tục truy cập được tên hàm. Thân hàm được đặt trong postgres_ops.py, còn nơi gọi truyền config như bước trước.
+Import đưa tên read_postgres_status vào namespace của cloud_watcher. Các đoạn kiểm chứng trước đó import hàm từ scripts.cloud.failover.cloud_watcher tiếp tục truy cập được tên hàm. Thân hàm được đặt trong postgres_ops.py, còn nơi gọi truyền config như bước trước.
 
 Trên Git Bash laptop tại thư mục gốc repository, kiểm tra cú pháp và chuyển hai file sang Azure.
 
 ```bash
-.venv/Scripts/python.exe -m py_compile scripts/cloud/cloud_watcher.py scripts/cloud/postgres_ops.py
+.venv/Scripts/python.exe -m py_compile scripts/cloud/failover/cloud_watcher.py scripts/cloud/failover/postgres_ops.py
 
 scp -i ~/.ssh/mcf-lab \
-  scripts/cloud/cloud_watcher.py scripts/cloud/postgres_ops.py \
-  azureuser@4.145.30.250:/home/azureuser/mcf-watcher/scripts/cloud/
+  scripts/cloud/failover/cloud_watcher.py scripts/cloud/failover/postgres_ops.py \
+  azureuser@4.145.30.250:/home/azureuser/mcf-watcher/scripts/cloud/failover/
 ```
 
 Trong terminal SSH Azure, gọi lại đường kiểm chứng đã sử dụng ở bước trước.
@@ -3591,7 +3607,7 @@ Trong terminal SSH Azure, gọi lại đường kiểm chứng đã sử dụng 
 cd ~/mcf-watcher
 .venv/bin/python - <<'PY'
 import json
-from scripts.cloud.cloud_watcher import load_config, read_postgres_status
+from scripts.cloud.failover.cloud_watcher import load_config, read_postgres_status
 
 status = read_postgres_status(load_config())
 print(json.dumps(status))
@@ -3601,7 +3617,7 @@ PY
 Đối chiếu JSON của Azure standby. Sau đó có thể chạy điểm vào hiện tại để kiểm tra vòng quan sát.
 
 ```bash
-.venv/bin/python scripts/cloud/cloud_watcher.py
+.venv/bin/python scripts/cloud/failover/cloud_watcher.py
 ```
 
 Checkpoint là thao tác PostgreSQL đã nằm trong module riêng, điểm vào watcher cùng đường import kiểm chứng hoạt động sau khi tách. Bước tiếp theo tổ chức nhóm probe và phân loại thành checks.py, rồi dùng các module này trong preflight và điều phối failover.
@@ -3610,7 +3626,7 @@ Checkpoint là thao tác PostgreSQL đã nằm trong module riêng, điểm vào
 
 Tách nhóm quan sát thành module riêng để cloud_watcher.py tập trung vào cấu hình, khởi tạo client và vòng điều phối. checks.py chứa HTTP probe cùng các hàm phân loại kết quả. postgres_ops.py chứa đường truy cập PostgreSQL đã tách ở bước trước.
 
-Trên laptop, tạo scripts/cloud/checks.py và thêm các import sau.
+Trên laptop, tạo scripts/cloud/failover/checks.py và thêm các import sau.
 
 ```python
 from datetime import datetime
@@ -3640,16 +3656,16 @@ import boto3
 from botocore.config import Config
 from botocore.exceptions import BotoCoreError, ClientError
 
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
+PROJECT_ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from scripts.cloud.checks import (
+from scripts.cloud.failover.checks import (
     classify_probe,
     classify_route53,
     classify_route53_report,
     probe_writer,
 )
-from scripts.cloud.postgres_ops import read_postgres_status
+from scripts.cloud.failover.postgres_ops import read_postgres_status
 
 CONFIG_PATH = PROJECT_ROOT / "deploy" / "watcher" / "config.json"
 ```
@@ -3659,18 +3675,18 @@ cloud_watcher sử dụng json để đọc cấu hình và ghi log, datetime c�
 Trên Git Bash laptop tại repository, kiểm tra cú pháp và chuyển ba module sang Azure.
 
 ```bash
-.venv/Scripts/python.exe -m py_compile scripts/cloud/cloud_watcher.py scripts/cloud/checks.py scripts/cloud/postgres_ops.py
+.venv/Scripts/python.exe -m py_compile scripts/cloud/failover/cloud_watcher.py scripts/cloud/failover/checks.py scripts/cloud/failover/postgres_ops.py
 
 scp -i ~/.ssh/mcf-lab \
-  scripts/cloud/checks.py scripts/cloud/postgres_ops.py scripts/cloud/cloud_watcher.py \
-  azureuser@4.145.30.250:/home/azureuser/mcf-watcher/scripts/cloud/
+  scripts/cloud/failover/checks.py scripts/cloud/failover/postgres_ops.py scripts/cloud/failover/cloud_watcher.py \
+  azureuser@4.145.30.250:/home/azureuser/mcf-watcher/scripts/cloud/failover/
 ```
 
 Trong terminal SSH Azure, chạy lại điểm vào watcher.
 
 ```bash
 cd ~/mcf-watcher
-.venv/bin/python scripts/cloud/cloud_watcher.py
+.venv/bin/python scripts/cloud/failover/cloud_watcher.py
 ```
 
 Đối chiếu AWS writer, Azure standby, Route 53 healthy và bộ đếm 0 khi topology đang khỏe. Sau vài vòng, kết thúc bằng Ctrl+C. Checkpoint là ba module được import đúng và vòng quan sát hoạt động sau khi tách. Bước tiếp theo bổ sung điều kiện preflight từ dữ liệu PostgreSQL đã đọc được.
@@ -3679,7 +3695,7 @@ cd ~/mcf-watcher
 
 Sau khi tách module và đối chiếu vòng quan sát, bổ sung kiểm chứng vai trò PostgreSQL trong postgres_ops.py. Mã Python được nhóm theo trách nhiệm quan sát, PostgreSQL, thao tác AWS và điều phối. Terraform được nhóm theo network, compute, IAM và DNS trong các root module tương ứng. Mỗi phần mới được đặt cùng logic liên quan để giữ luồng phụ thuộc rõ ràng.
 
-Trên laptop, thêm hàm sau ở cuối scripts/cloud/postgres_ops.py, sau read_postgres_status.
+Trên laptop, thêm hàm sau ở cuối scripts/cloud/failover/postgres_ops.py, sau read_postgres_status.
 
 ```python
 def preflight_standby(config):
@@ -3699,8 +3715,8 @@ Trên Git Bash laptop tại repository, chuyển module đã bổ sung sang Azur
 
 ```bash
 scp -i ~/.ssh/mcf-lab \
-  scripts/cloud/postgres_ops.py \
-  azureuser@4.145.30.250:/home/azureuser/mcf-watcher/scripts/cloud/
+  scripts/cloud/failover/postgres_ops.py \
+  azureuser@4.145.30.250:/home/azureuser/mcf-watcher/scripts/cloud/failover/
 ```
 
 Trong terminal SSH Azure, gọi hàm kiểm chứng.
@@ -3709,8 +3725,8 @@ Trong terminal SSH Azure, gọi hàm kiểm chứng.
 cd ~/mcf-watcher
 .venv/bin/python - <<'PY'
 import json
-from scripts.cloud.cloud_watcher import load_config
-from scripts.cloud.postgres_ops import preflight_standby
+from scripts.cloud.failover.cloud_watcher import load_config
+from scripts.cloud.failover.postgres_ops import preflight_standby
 
 status = preflight_standby(load_config())
 print(json.dumps(status))
@@ -3725,7 +3741,7 @@ Checkpoint là hàm kiểm chứng standby chạy được từ host Azure và l
 
 Chuẩn bị module dành cho thao tác AWS trước khi bổ sung phần fencing. Chuyển cấu hình SDK, Session và việc tạo client vào aws_ops.py. cloud_watcher gọi hàm khởi tạo một lần rồi dùng các client trong vòng điều phối.
 
-Trên laptop, tạo scripts/cloud/aws_ops.py với nội dung sau.
+Trên laptop, tạo scripts/cloud/failover/aws_ops.py với nội dung sau.
 
 ```python
 import boto3
@@ -3753,7 +3769,7 @@ Hàm sử dụng các giá trị profile và region từ JSON cùng thiết lậ
 Trong cloud_watcher.py, thêm import sau cùng nhóm import module nội bộ, phía dưới phần xác định PROJECT_ROOT và sys.path.
 
 ```python
-from scripts.cloud.aws_ops import create_aws_clients
+from scripts.cloud.failover.aws_ops import create_aws_clients
 ```
 
 Xóa import boto3 và from botocore.config import Config khỏi cloud_watcher.py sau khi chuyển phần khởi tạo. Import BotoCoreError cùng ClientError tiếp tục phục vụ xử lý lỗi ở vòng điều phối.
@@ -3771,18 +3787,18 @@ Cú pháp gán ba tên bên trái nhận ba đối tượng trả về theo th�
 Trên Git Bash laptop tại repository, kiểm tra cú pháp và chuyển hai file sang Azure.
 
 ```bash
-.venv/Scripts/python.exe -m py_compile scripts/cloud/aws_ops.py scripts/cloud/cloud_watcher.py
+.venv/Scripts/python.exe -m py_compile scripts/cloud/failover/aws_ops.py scripts/cloud/failover/cloud_watcher.py
 
 scp -i ~/.ssh/mcf-lab \
-  scripts/cloud/aws_ops.py scripts/cloud/cloud_watcher.py \
-  azureuser@4.145.30.250:/home/azureuser/mcf-watcher/scripts/cloud/
+  scripts/cloud/failover/aws_ops.py scripts/cloud/failover/cloud_watcher.py \
+  azureuser@4.145.30.250:/home/azureuser/mcf-watcher/scripts/cloud/failover/
 ```
 
 Trong terminal SSH Azure, chạy điểm vào watcher.
 
 ```bash
 cd ~/mcf-watcher
-.venv/bin/python scripts/cloud/cloud_watcher.py
+.venv/bin/python scripts/cloud/failover/cloud_watcher.py
 ```
 
 Đối chiếu IAM user watcher, các trạng thái nguồn quan sát và bộ đếm trong topology đang khỏe. Sau vài vòng, dùng Ctrl+C để kết thúc. Checkpoint là các client đã được khởi tạo qua aws_ops.py và dùng lại trong vòng quan sát. Bước tiếp theo đưa việc đọc EC2 state vào module này để chuẩn bị thao tác fencing.
@@ -3791,7 +3807,7 @@ cd ~/mcf-watcher
 
 Hàm đọc trạng thái được dùng trong vòng quan sát và sẽ được dùng để đối chiếu fencing. Đặt thao tác AWS vào aws_ops.py giúp các điểm gọi dùng chung cách đọc phản hồi EC2.
 
-Thêm hàm sau vào cuối scripts/cloud/aws_ops.py.
+Thêm hàm sau vào cuối scripts/cloud/failover/aws_ops.py.
 
 ```python
 def read_instance_state(ec2, instance_id):
@@ -3809,7 +3825,7 @@ ec2 là client đã tạo ở bước trước. InstanceIds nhận một danh s�
 Trong cloud_watcher.py, cập nhật import hiện có.
 
 ```python
-from scripts.cloud.aws_ops import create_aws_clients, read_instance_state
+from scripts.cloud.failover.aws_ops import create_aws_clients, read_instance_state
 ```
 
 Trong while True, thay khối try/except đọc EC2 cùng dòng in aws_ec2_state bằng đoạn sau.
@@ -3828,18 +3844,18 @@ Vòng điều phối chuyển lỗi thành trạng thái unknown và ghi nguyên
 Trên Git Bash laptop tại thư mục repo, kiểm tra cú pháp rồi chuyển hai file sang Azure.
 
 ```bash
-.venv/Scripts/python.exe -m py_compile scripts/cloud/aws_ops.py scripts/cloud/cloud_watcher.py
+.venv/Scripts/python.exe -m py_compile scripts/cloud/failover/aws_ops.py scripts/cloud/failover/cloud_watcher.py
 
 scp -i ~/.ssh/mcf-lab \
-  scripts/cloud/aws_ops.py scripts/cloud/cloud_watcher.py \
-  azureuser@4.145.30.250:/home/azureuser/mcf-watcher/scripts/cloud/
+  scripts/cloud/failover/aws_ops.py scripts/cloud/failover/cloud_watcher.py \
+  azureuser@4.145.30.250:/home/azureuser/mcf-watcher/scripts/cloud/failover/
 ```
 
 Trong terminal SSH Azure, chạy watcher.
 
 ```bash
 cd ~/mcf-watcher
-.venv/bin/python scripts/cloud/cloud_watcher.py
+.venv/bin/python scripts/cloud/failover/cloud_watcher.py
 ```
 
 Trong topology đang khỏe, đối chiếu aws_ec2_state=running, AWS writer, Azure standby và bộ đếm lỗi bằng 0. Dừng bằng Ctrl+C sau vài vòng. Bước tiếp theo chuẩn bị quyền StopInstances giới hạn cho đúng EC2 của đồ án.
@@ -3932,7 +3948,7 @@ Checkpoint là policy đã apply và phép thử trả DryRunOperation. Bước 
 
 ### 4.100. Viết hàm fencing EC2 và kiểm tra cú pháp
 
-Phép thử DryRun đã xác nhận quyền StopInstances. Thêm hàm sau ở cuối scripts/cloud/aws_ops.py để đóng gói thao tác fencing.
+Phép thử DryRun đã xác nhận quyền StopInstances. Thêm hàm sau ở cuối scripts/cloud/failover/aws_ops.py để đóng gói thao tác fencing.
 
 ```python
 def fence_instance(ec2, instance_id):
@@ -3971,21 +3987,21 @@ Trên Git Bash laptop tại thư mục repo, kiểm tra cú pháp hai file.
 
 ```bash
 .venv/Scripts/python.exe -m py_compile \
-  scripts/cloud/aws_ops.py \
-  scripts/cloud/cloud_watcher.py
+  scripts/cloud/failover/aws_ops.py \
+  scripts/cloud/failover/cloud_watcher.py
 ```
 
 py_compile kiểm tra cú pháp và tạo bytecode. Điểm gọi fence_instance sẽ được bổ sung cùng preflight và xử lý lỗi trong luồng điều phối. Checkpoint của bước này là có hàm fencing và kiểm tra cú pháp thành công.
 
 ### 4.101. Gom preflight và fencing vào hàm điều phối riêng
 
-Tạo scripts/cloud/failover_ops.py để lưu thứ tự các bước chuyển writer. cloud_watcher phụ trách vòng quan sát và phát hiện điều kiện. aws_ops xử lý API AWS. postgres_ops xử lý thao tác PostgreSQL. failover_ops gọi các module theo thứ tự nghiệp vụ.
+Tạo scripts/cloud/failover/failover_ops.py để lưu thứ tự các bước chuyển writer. cloud_watcher phụ trách vòng quan sát và phát hiện điều kiện. aws_ops xử lý API AWS. postgres_ops xử lý thao tác PostgreSQL. failover_ops gọi các module theo thứ tự nghiệp vụ.
 
 Trong file mới, nhập nội dung sau.
 
 ```python
-from scripts.cloud.aws_ops import fence_instance
-from scripts.cloud.postgres_ops import preflight_standby
+from scripts.cloud.failover.aws_ops import fence_instance
+from scripts.cloud.failover.postgres_ops import preflight_standby
 
 
 def prepare_failover(config, ec2):
@@ -4009,9 +4025,9 @@ Khi được gọi bằng client AWS thật, hàm này thực hiện thao tác f
 
 ```bash
 .venv/Scripts/python.exe -m py_compile \
-  scripts/cloud/failover_ops.py \
-  scripts/cloud/aws_ops.py \
-  scripts/cloud/postgres_ops.py
+  scripts/cloud/failover/failover_ops.py \
+  scripts/cloud/failover/aws_ops.py \
+  scripts/cloud/failover/postgres_ops.py
 ```
 
 Checkpoint là có module failover_ops với hàm prepare_failover và kiểm tra cú pháp thành công. Những bước tiếp theo bổ sung xử lý WAL, promotion, xác minh writer và điểm kích hoạt có kiểm tra cờ enable_auto_failover trong watcher.
@@ -4020,7 +4036,7 @@ Checkpoint là có module failover_ops với hàm prepare_failover và kiểm tr
 
 Khi standby được promote, PostgreSQL phục hồi WAL đang sẵn có trong archive hoặc pg_wal trước khi chuyển sang hoạt động bình thường. Luồng tự động sẽ sử dụng cơ chế này sau khi fencing AWS được xác nhận. Với replication bất đồng bộ, các transaction chưa truyền tới Azure vẫn có thể bị mất khi AWS lỗi. receive_lsn và replay_lsn dùng để quan sát phần WAL bên nhận. [PostgreSQL standby operation](https://www.postgresql.org/docs/17/warm-standby.html#STANDBY-SERVER-OPERATION).
 
-Đọc trạng thái và promotion đều gọi SQL qua cùng đường sudo, kubectl exec và psql. Tách phần gọi lệnh có sẵn thành hàm dùng chung trong scripts/cloud/postgres_ops.py. Thêm hàm sau phía dưới import và phía trên read_postgres_status.
+Đọc trạng thái và promotion đều gọi SQL qua cùng đường sudo, kubectl exec và psql. Tách phần gọi lệnh có sẵn thành hàm dùng chung trong scripts/cloud/failover/postgres_ops.py. Thêm hàm sau phía dưới import và phía trên read_postgres_status.
 
 ```python
 def run_postgres_sql(config, sql, timeout=20):
@@ -4057,15 +4073,15 @@ Luồng đọc trạng thái trở thành read_postgres_status gọi run_postgre
 Trên Git Bash laptop tại thư mục repo, kiểm tra cú pháp.
 
 ```bash
-.venv/Scripts/python.exe -m py_compile scripts/cloud/postgres_ops.py
+.venv/Scripts/python.exe -m py_compile scripts/cloud/failover/postgres_ops.py
 ```
 
 Để kiểm chứng đường đọc SQL từ host Azure, chuyển file cập nhật.
 
 ```bash
 scp -i ~/.ssh/mcf-lab \
-  scripts/cloud/postgres_ops.py \
-  azureuser@4.145.30.250:/home/azureuser/mcf-watcher/scripts/cloud/
+  scripts/cloud/failover/postgres_ops.py \
+  azureuser@4.145.30.250:/home/azureuser/mcf-watcher/scripts/cloud/failover/
 ```
 
 Trong terminal SSH Azure, chạy phép đọc trạng thái.
@@ -4074,8 +4090,8 @@ Trong terminal SSH Azure, chạy phép đọc trạng thái.
 cd ~/mcf-watcher
 .venv/bin/python - <<'PY'
 import json
-from scripts.cloud.cloud_watcher import load_config
-from scripts.cloud.postgres_ops import preflight_standby
+from scripts.cloud.failover.cloud_watcher import load_config
+from scripts.cloud.failover.postgres_ops import preflight_standby
 
 print(json.dumps(preflight_standby(load_config())))
 PY
@@ -4085,7 +4101,7 @@ Trong topology AWS primary và Azure standby đang khỏe, đối chiếu in_rec
 
 ### 4.103. Viết hàm promote standby và xác minh vai trò
 
-Thêm hàm sau ở cuối scripts/cloud/postgres_ops.py. Hàm sử dụng run_postgres_sql để gọi promotion, rồi read_postgres_status mở lượt gọi SQL mới để xác minh vai trò.
+Thêm hàm sau ở cuối scripts/cloud/failover/postgres_ops.py. Hàm sử dụng run_postgres_sql để gọi promotion, rồi read_postgres_status mở lượt gọi SQL mới để xác minh vai trò.
 
 ```python
 def promote_standby(config):
@@ -4109,17 +4125,17 @@ Sau kết quả true, read_postgres_status gọi psql qua một tiến trình m�
 Hàm promotion sẽ được gọi sau prepare_failover trong luồng điều phối, khi fencing AWS đã được xác nhận. Trong bước hiện tại, tại Git Bash laptop từ thư mục repo, kiểm tra cú pháp.
 
 ```bash
-.venv/Scripts/python.exe -m py_compile scripts/cloud/postgres_ops.py
+.venv/Scripts/python.exe -m py_compile scripts/cloud/failover/postgres_ops.py
 ```
 
 Checkpoint là thêm promote_standby và kiểm tra cú pháp thành công. Bước tiếp theo ghép promotion sau fencing trong luồng điều phối.
 
 ### 4.104. Ghép fencing và promotion trong hàm điều phối
 
-Trong scripts/cloud/failover_ops.py, cập nhật dòng import từ postgres_ops.
+Trong scripts/cloud/failover/failover_ops.py, cập nhật dòng import từ postgres_ops.
 
 ```python
-from scripts.cloud.postgres_ops import preflight_standby, promote_standby
+from scripts.cloud.failover.postgres_ops import preflight_standby, promote_standby
 ```
 
 Thêm hàm sau bên dưới prepare_failover.
@@ -4153,16 +4169,16 @@ Hàm này thực hiện fencing và promotion khi được gọi bằng client c
 
 ```bash
 .venv/Scripts/python.exe -m py_compile \
-  scripts/cloud/failover_ops.py \
-  scripts/cloud/aws_ops.py \
-  scripts/cloud/postgres_ops.py
+  scripts/cloud/failover/failover_ops.py \
+  scripts/cloud/failover/aws_ops.py \
+  scripts/cloud/failover/postgres_ops.py
 ```
 
 Checkpoint là run_failover ghép đúng thứ tự preflight, fencing và promotion, cùng kiểm tra cú pháp thành công. Phần tiếp theo bổ sung xác minh writer qua HTTPS, rồi ghép điểm kích hoạt với enable_auto_failover và ngưỡng lỗi trong vòng watcher. promotion_confirmed phản ánh vai trò database đã được xác minh. Writer health sẽ kiểm chứng thêm đường ứng dụng và trạng thái ghi của ứng dụng.
 
 ### 4.105. Xác minh Azure writer qua HTTPS sau promotion
 
-Trong scripts/cloud/checks.py, thêm import time vào nhóm import đầu file. Thêm hàm sau phía dưới classify_probe.
+Trong scripts/cloud/failover/checks.py, thêm import time vào nhóm import đầu file. Thêm hàm sau phía dưới classify_probe.
 
 ```python
 def wait_for_writer(url, timeout, interval, max_attempts=12):
@@ -4187,10 +4203,10 @@ Hàm dùng lại probe_writer và classify_probe để xác minh cùng quy tắc
 
 Chọn 12 lượt thử cho lab để chờ đường HTTP sẵn sàng sau promotion. timeout áp dụng cho probe HTTP, interval là khoảng nghỉ giữa hai lượt thử. Thời gian thực tế phụ thuộc thời gian phản hồi của mỗi probe. Hàm trả JSON body ngay khi xác nhận writer. Nếu hết lượt thử, RuntimeError kèm kết quả cuối truyền lên bên điều phối. max_attempts phải là số nguyên dương.
 
-Trong scripts/cloud/failover_ops.py, thêm import cùng nhóm module nội bộ.
+Trong scripts/cloud/failover/failover_ops.py, thêm import cùng nhóm module nội bộ.
 
 ```python
-from scripts.cloud.checks import wait_for_writer
+from scripts.cloud.failover.checks import wait_for_writer
 ```
 
 Trong run_failover, ngay sau log promotion_confirmed và trước return status, thêm đoạn sau.
@@ -4213,14 +4229,14 @@ Trên Git Bash laptop tại thư mục repo, kiểm tra cú pháp.
 
 ```bash
 .venv/Scripts/python.exe -m py_compile \
-  scripts/cloud/checks.py \
-  scripts/cloud/failover_ops.py
+  scripts/cloud/failover/checks.py \
+  scripts/cloud/failover/failover_ops.py
 ```
 
 Tiếp theo kiểm tra Python nạp được module cùng các import.
 
 ```bash
-.venv/Scripts/python.exe -c "from scripts.cloud.failover_ops import run_failover; print('Import OK')"
+.venv/Scripts/python.exe -c "from scripts.cloud.failover.failover_ops import run_failover; print('Import OK')"
 ```
 
 py_compile kiểm tra cú pháp của từng file. Lệnh import ở trên nạp các module phụ thuộc để kiểm tra tên hàm được import. Nếu gặp ImportError với wait_for_writer, đối chiếu import time cùng định nghĩa wait_for_writer trong bản checks.py đã lưu trên đĩa. Kết quả mong đợi là Import OK.
@@ -4229,10 +4245,10 @@ Checkpoint là hàm xác minh writer được gọi sau promotion trong run_fail
 
 ### 4.106. Ghép điểm kích hoạt failover vào vòng watcher
 
-Trong scripts/cloud/cloud_watcher.py, thêm import cùng nhóm module nội bộ, dưới phần thiết lập PROJECT_ROOT và sys.path.
+Trong scripts/cloud/failover/cloud_watcher.py, thêm import cùng nhóm module nội bộ, dưới phần thiết lập PROJECT_ROOT và sys.path.
 
 ```python
-from scripts.cloud.failover_ops import run_failover
+from scripts.cloud.failover.failover_ops import run_failover
 ```
 
 Ở cuối vòng while True, thay đoạn in failover_threshold_reached cùng dòng time.sleep bằng đoạn sau.
@@ -4258,22 +4274,22 @@ Chọn kết thúc tiến trình watcher sau một lượt chuyển writer thàn
 Trên Git Bash laptop tại thư mục repo, kiểm tra cú pháp và khả năng nạp module.
 
 ```bash
-.venv/Scripts/python.exe -m py_compile scripts/cloud/cloud_watcher.py
+.venv/Scripts/python.exe -m py_compile scripts/cloud/failover/cloud_watcher.py
 
-.venv/Scripts/python.exe -c "from scripts.cloud.cloud_watcher import main; print('Import OK')"
+.venv/Scripts/python.exe -c "from scripts.cloud.failover.cloud_watcher import main; print('Import OK')"
 ```
 
 Đối chiếu cấu hình chế độ vận hành.
 
 ```bash
-.venv/Scripts/python.exe -c "from scripts.cloud.cloud_watcher import load_config; print('enable_auto_failover=' + str(load_config()['enable_auto_failover']))"
+.venv/Scripts/python.exe -c "from scripts.cloud.failover.cloud_watcher import load_config; print('enable_auto_failover=' + str(load_config()['enable_auto_failover']))"
 ```
 
 Checkpoint của bước ghép code là import thành công và cấu hình enable_auto_failover=False cho giai đoạn kiểm tra quan sát. Điểm thực thi tự động sẽ chạy trên host Azure khi cấu hình được bật trong lượt thực hành tự động. Bước tiếp theo bổ sung xử lý lỗi và chuẩn bị runtime trên Azure.
 
 ### 4.107. Ghi lỗi lượt failover và trả mã thoát
 
-Trong scripts/cloud/cloud_watcher.py, thêm import subprocess vào nhóm import đầu file để bắt lỗi tiến trình psql hoặc kubectl. Thay khối if kích hoạt failover đã viết ở bước trước bằng đoạn sau.
+Trong scripts/cloud/failover/cloud_watcher.py, thêm import subprocess vào nhóm import đầu file để bắt lỗi tiến trình psql hoặc kubectl. Thay khối if kích hoạt failover đã viết ở bước trước bằng đoạn sau.
 
 ```python
         if config["enable_auto_failover"] and threshold_reached:
@@ -4319,9 +4335,9 @@ Ví dụ writer health có thể thất bại sau khi Azure đã promote và AWS
 Trên Git Bash laptop tại thư mục repo, kiểm tra cú pháp và import.
 
 ```bash
-.venv/Scripts/python.exe -m py_compile scripts/cloud/cloud_watcher.py
+.venv/Scripts/python.exe -m py_compile scripts/cloud/failover/cloud_watcher.py
 
-.venv/Scripts/python.exe -c "from scripts.cloud.cloud_watcher import main; print('Import OK')"
+.venv/Scripts/python.exe -c "from scripts.cloud.failover.cloud_watcher import main; print('Import OK')"
 ```
 
 Checkpoint là khối kích hoạt trả 0 hoặc 1 theo kết quả và điểm vào dùng sys.exit(main()). Bước tiếp theo chuyển runtime sang Azure, xác nhận chế độ observe và cấu hình service watcher. Sau đó thực hành failover tự động, kiểm tra DNS cùng dữ liệu và phục hồi topology.
@@ -4330,16 +4346,22 @@ Checkpoint là khối kích hoạt trả 0 hoặc 1 theo kết quả và điểm
 
 Runtime Azure dùng virtual environment và profile mcf-watcher đã chuẩn bị ở các bước trước. Cập nhật đủ các module để điểm vào watcher nạp được luồng điều phối mới.
 
+Trong terminal SSH Azure, tạo thư mục đích của package failover.
+
+```bash
+mkdir -p ~/mcf-watcher/scripts/cloud/failover
+```
+
 Trên Git Bash laptop tại thư mục repo, chuyển năm file Python sang thư mục runtime Azure.
 
 ```bash
 scp -i ~/.ssh/mcf-lab \
-  scripts/cloud/cloud_watcher.py \
-  scripts/cloud/aws_ops.py \
-  scripts/cloud/checks.py \
-  scripts/cloud/postgres_ops.py \
-  scripts/cloud/failover_ops.py \
-  azureuser@4.145.30.250:/home/azureuser/mcf-watcher/scripts/cloud/
+  scripts/cloud/failover/cloud_watcher.py \
+  scripts/cloud/failover/aws_ops.py \
+  scripts/cloud/failover/checks.py \
+  scripts/cloud/failover/postgres_ops.py \
+  scripts/cloud/failover/failover_ops.py \
+  azureuser@4.145.30.250:/home/azureuser/mcf-watcher/scripts/cloud/failover/
 ```
 
 cloud_watcher là điểm vào, aws_ops chứa thao tác AWS, checks xử lý probe và phân loại, postgres_ops chứa thao tác SQL, failover_ops điều phối chuyển writer. Các import trong điểm vào cần đủ các module này trong runtime.
@@ -4356,7 +4378,7 @@ Trong terminal SSH Azure của azureuser, chạy watcher từ thư mục runtime
 
 ```bash
 cd ~/mcf-watcher
-.venv/bin/python -u scripts/cloud/cloud_watcher.py
+.venv/bin/python -u scripts/cloud/failover/cloud_watcher.py
 ```
 
 .venv/bin/python sử dụng môi trường có boto3 và httpx đã cài cho watcher. -u đẩy log stdout và stderr ra ngay. Điểm vào đọc cấu hình, đối chiếu danh tính AWS, rồi quan sát EC2, Route 53 và hai origin theo chu kỳ.
@@ -4380,7 +4402,7 @@ Type=exec
 User=azureuser
 WorkingDirectory=/home/azureuser/mcf-watcher
 Environment=HOME=/home/azureuser
-ExecStart=/home/azureuser/mcf-watcher/.venv/bin/python -u /home/azureuser/mcf-watcher/scripts/cloud/cloud_watcher.py
+ExecStart=/home/azureuser/mcf-watcher/.venv/bin/python -u /home/azureuser/mcf-watcher/scripts/cloud/failover/cloud_watcher.py
 Restart=no
 
 [Install]
@@ -4422,6 +4444,8 @@ sudo journalctl -u mcf-watcher.service -n 30 -f
 -u chọn service, -n 30 hiển thị 30 dòng gần nhất, -f theo dõi log mới. Đối chiếu mode observe cùng AWS writer và Azure standby. Ctrl+C kết thúc lượt xem journalctl, service tiếp tục chạy do systemd quản lý. [journalctl](https://www.freedesktop.org/software/systemd/man/latest/journalctl.html).
 
 Checkpoint là service active running và ghi đúng trạng thái observe trong journal. Bước tiếp theo chuẩn bị lượt thực hành failover tự động từ topology AWS primary và Azure standby đã xác nhận.
+
+Khi cập nhật một runtime đã có service theo cấu trúc thư mục mới, thực hiện lại bước chép code ở mục 4.108 cùng bước install unit và daemon-reload ở mục này trước lượt chạy service tiếp theo. ExecStart cần trỏ tới scripts/cloud/failover/cloud_watcher.py trong runtime.
 
 ### 4.110. Bật chế độ tự động trên runtime Azure
 
@@ -4572,6 +4596,1212 @@ Lượt nghiệm thu ngày 2026-11-15 xác nhận app.mcf.todicode.tech trỏ CN
 
 Checkpoint là DNS chọn Azure và API hostname chung ghi, đọc được dữ liệu trước cùng sau chuyển writer. Sau lượt này, topology vận hành là Azure primary và EC2 AWS stopped. Bước tiếp theo đưa watcher về observe và chuẩn bị phục hồi AWS theo quy trình rejoin.
 
+### 4.114. Tiếp tục phục hồi sau khi bật lại hai host
+
+Lượt failover tự động gần nhất kết thúc với PostgreSQL Azure primary và AWS stopped. Khi tạm nghỉ, VM Azure đã deallocate và watcher đã được disable. Dữ liệu primary nằm trên PVC Azure. Lượt tiếp tục ngày 2026-11-17 đã khởi động hai host, xác nhận EC2 running với SystemStatus và InstanceStatus ok, cùng Azure VM running. AWS dùng Elastic IP 175.41.152.242 và Azure dùng Static Public IP 4.145.30.250.
+
+Phục hồi workload Azure trước để primary cung cấp dữ liệu cho AWS rejoin. Trong Git Bash laptop, SSH vào Azure.
+
+```bash
+ssh -i ~/.ssh/mcf-lab azureuser@4.145.30.250
+```
+
+Trong terminal SSH Azure, khởi động WireGuard, phê duyệt K3s cho boot hiện tại rồi chờ PostgreSQL.
+
+```bash
+sudo systemctl start wg-quick@wg0
+sudo touch /run/issues-k3s-start-approved
+sudo systemctl reset-failed k3s
+sudo systemctl start k3s
+
+sudo k3s kubectl -n issues rollout status statefulset/postgres --timeout=180s
+```
+
+WireGuard cung cấp địa chỉ wg0 mà cấu hình PostgreSQL sử dụng. Marker trong /run được tạo lại cho boot hiện tại sau khi đối chiếu Azure đang giữ dữ liệu primary của lượt failover. reset-failed xóa trạng thái lỗi của các lần K3s bị guard chặn. start chạy K3s theo workload đang lưu trên host. rollout status chờ StatefulSet PostgreSQL sẵn sàng.
+
+Đối chiếu vai trò và cờ ghi ứng dụng trên Azure.
+
+```bash
+sudo k3s kubectl -n issues exec postgres-0 -- \
+  psql -X -v ON_ERROR_STOP=1 -U taskflow -d taskflow -P pager=off -c \
+  "SELECT pg_is_in_recovery() AS in_recovery,
+          current_setting('transaction_read_only') AS read_only,
+          writes_enabled
+   FROM app_control
+   WHERE singleton = TRUE;"
+```
+
+Kết quả mong đợi là in_recovery f, read_only off và writes_enabled t. Các trường này xác nhận PostgreSQL Azure tiếp tục primary và ứng dụng được phép ghi. AWS được chuẩn bị ở chế độ control-plane agentless trong quy trình rejoin để cập nhật workload và clone vào PVC mới.
+
+Checkpoint là PostgreSQL Azure sẵn sàng ở vai trò primary. Các bước tiếp theo đồng bộ runtime theo cấu trúc scripts/cloud/failover và chuẩn bị AWS rejoin từ Azure bằng dữ liệu của lượt failover vừa nghiệm thu.
+
+### 4.115. Đồng bộ cấu trúc failover và chạy observe khi phục hồi
+
+Trước khi bắt đầu AWS rejoin, cập nhật runtime Azure theo cấu trúc scripts/cloud/failover. Cấu hình trong repository dùng enable_auto_failover false cho lượt quan sát phục hồi.
+
+Trong terminal SSH Azure, dừng service trước khi cập nhật runtime và tạo thư mục package.
+
+```bash
+sudo systemctl stop mcf-watcher.service
+mkdir -p ~/mcf-watcher/scripts/cloud/failover
+```
+
+Trên Git Bash laptop tại thư mục repo, chuyển các file Python và cấu hình triển khai.
+
+```bash
+scp -i ~/.ssh/mcf-lab \
+  scripts/cloud/failover/*.py \
+  azureuser@4.145.30.250:/home/azureuser/mcf-watcher/scripts/cloud/failover/
+
+scp -i ~/.ssh/mcf-lab \
+  deploy/watcher/config.json \
+  deploy/watcher/mcf-watcher.service \
+  azureuser@4.145.30.250:/home/azureuser/mcf-watcher/deploy/watcher/
+```
+
+*.py chọn các module cùng file khởi tạo package trong thư mục failover. config.json chọn chế độ observe và các định danh của lượt triển khai. Unit file mới đặt ExecStart tới scripts/cloud/failover/cloud_watcher.py.
+
+Trở lại terminal SSH Azure, cài unit rồi bật service với cấu hình vừa chuyển.
+
+```bash
+sudo install -m 644 -o root -g root \
+  /home/azureuser/mcf-watcher/deploy/watcher/mcf-watcher.service \
+  /etc/systemd/system/mcf-watcher.service
+
+sudo systemctl daemon-reload
+sudo systemctl enable --now mcf-watcher.service
+sudo journalctl -u mcf-watcher.service -n 20 -f
+```
+
+install cập nhật unit của hệ thống, daemon-reload nạp đường chạy mới. enable cấu hình service cho các lượt khởi động host và --now chạy tiến trình mới ngay. Watcher sử dụng cấu hình observe vừa sao chép từ repository. Journal hiển thị tiến trình hiện tại cùng lịch sử gần nhất.
+
+Trong topology phục hồi sau failover, đối chiếu mode observe, Azure state writer và AWS chưa sẵn sàng phục vụ trước rejoin. Kết quả probe AWS có thể là unavailable hoặc unknown tùy phản hồi mạng trong khi guard đang chặn K3s. Azure writer làm failover_candidate False và bộ đếm giữ ở 0.
+
+Checkpoint là service chạy từ package mới và log mode observe cùng Azure writer. Bước tiếp theo chuẩn bị AWS ở chế độ control-plane agentless và PVC mới để rejoin từ Azure primary.
+
+### 4.116. Dọn các module cũ ở runtime Azure
+
+Sau khi runtime mới chạy observe thành công, đối chiếu đường chạy service trên terminal SSH Azure.
+
+```bash
+sudo systemctl show mcf-watcher.service -p ExecStart --no-pager
+```
+
+ExecStart cần trỏ tới /home/azureuser/mcf-watcher/scripts/cloud/failover/cloud_watcher.py. Đây là điểm vào đã cập nhật theo package mới.
+
+Gỡ năm file Python cũ đặt trực tiếp dưới scripts/cloud trong runtime Azure.
+
+```bash
+rm -f -- \
+  ~/mcf-watcher/scripts/cloud/cloud_watcher.py \
+  ~/mcf-watcher/scripts/cloud/aws_ops.py \
+  ~/mcf-watcher/scripts/cloud/checks.py \
+  ~/mcf-watcher/scripts/cloud/postgres_ops.py \
+  ~/mcf-watcher/scripts/cloud/failover_ops.py
+```
+
+Lệnh rm nhận danh sách đường dẫn cụ thể của năm module trước khi chuyển thư mục. -f cho phép chạy lại khi một file đã được gỡ, -- kết thúc danh sách tùy chọn. Code runtime hiện tại nằm trong scripts/cloud/failover và các import dùng namespace scripts.cloud.failover.
+
+Checkpoint là runtime dùng package failover và các module cũ ở cấp scripts/cloud đã được gỡ. Tiếp theo chuẩn bị AWS rejoin từ Azure primary.
+
+### 4.117. Chuẩn bị control plane AWS cho lượt rejoin sau failover tự động
+
+Azure đang phục vụ writer sau lượt failover tự động. AWS đã được bật và cần nhận bản clone mới từ Azure. Dùng lại cấu hình deploy/k3s/rejoin-control-plane.yaml với disable-agent true để truy cập API Kubernetes trong khi phần thực thi Pod trên AWS được tạm dừng. K3s đánh dấu agentless là experimental, được dùng tạm trong lượt bảo trì này. [K3s agentless servers](https://docs.k3s.io/advanced#running-agentless-servers-experimental).
+
+Trong Git Bash laptop tại thư mục repo, chuyển file cấu hình có sẵn rồi SSH vào AWS.
+
+```bash
+scp -i ~/.ssh/mcf-lab \
+  deploy/k3s/rejoin-control-plane.yaml \
+  ubuntu@175.41.152.242:/home/ubuntu/rejoin-control-plane.yaml
+
+ssh -i ~/.ssh/mcf-lab ubuntu@175.41.152.242
+```
+
+Trong terminal SSH AWS, dừng K3s và cài cấu hình agentless trước khi tạo marker phê duyệt boot.
+
+```bash
+sudo systemctl stop k3s
+sudo systemctl start wg-quick@wg0
+
+sudo install -d -m 700 -o root -g root /etc/rancher/k3s/config.yaml.d
+sudo install -m 600 -o root -g root \
+  /home/ubuntu/rejoin-control-plane.yaml \
+  /etc/rancher/k3s/config.yaml.d/99-rejoin.yaml
+
+sudo touch /run/issues-k3s-start-approved
+sudo systemctl reset-failed k3s
+sudo systemctl start k3s
+```
+
+WireGuard cung cấp kết nối tới nguồn Azure. Drop-in 99-rejoin.yaml đặt disable-agent true trước lượt start K3s. Marker cho phép startup guard vượt qua ExecStartPre trong boot hiện tại với cấu hình agentless đã cài. API và controller chạy để cập nhật StatefulSet, Deployment và PVC. Agent thực thi Pod sẽ được bật lại sau khi desired state cùng volume rejoin được chuẩn bị.
+
+Đối chiếu API và cổng database thực tế trên AWS.
+
+```bash
+sudo k3s kubectl get --raw=/readyz
+sudo ss -ltnp 'sport = :5432'
+```
+
+Kết quả mong đợi là API trả ok và bảng TCP 5432 có tiêu đề với danh sách listener rỗng. API sẵn sàng cho thao tác quản trị và database cũ tiếp tục ở trạng thái dừng. Các Pod object trong datastore có thể còn thông tin của lượt trước, nên bước rejoin đối chiếu trạng thái thực thi trên host cùng desired state trong API.
+
+Checkpoint là AWS chạy control plane agentless và PostgreSQL cũ đã dừng. Tiếp theo đặt replicas PostgreSQL cùng ứng dụng AWS về 0 rồi chuẩn bị PVC mới cho bản clone từ Azure. PVC postgres-data-rejoin-aws-01 thuộc lượt phục hồi trước, vì vậy lượt rejoin mới sẽ sử dụng một PVC khác.
+
+### 4.118. Đặt workload AWS về 0 và tạo PVC cho lượt rejoin mới
+
+AWS đã chạy control plane agentless, API trả ready và PostgreSQL cũ đang dừng. Trong terminal SSH AWS, đặt desired replicas của hai workload về 0.
+
+```bash
+sudo k3s kubectl -n issues scale statefulset/postgres --replicas=0
+sudo k3s kubectl -n issues scale deployment/issues-app --replicas=0
+
+sudo k3s kubectl -n issues get statefulset/postgres deployment/issues-app \
+  -o 'custom-columns=KIND:.kind,NAME:.metadata.name,DESIRED:.spec.replicas'
+```
+
+DESIRED cần bằng 0 cho cả postgres và issues-app. Giá trị được lưu trong API và chi phối workload khi agent được bật lại. Đây là trạng thái chuẩn bị cho việc chuyển PostgreSQL sang PVC mới và chạy clone từ Azure.
+
+Trên laptop, trong deploy/kubernetes/database/postgres-pvc-rejoin-aws.yaml, đổi metadata.name từ postgres-data-rejoin-aws-01 thành postgres-data-rejoin-aws-02.
+
+```yaml
+metadata:
+  name: postgres-data-rejoin-aws-02
+  namespace: issues
+```
+
+Các thông số StorageClass local-path-retain, ReadWriteOnce và yêu cầu 5Gi thuộc cấu hình PVC hiện có. Tên 02 nhận diện volume của lượt rejoin sau bài thử tự động. PVC 01 thuộc lượt phục hồi trước và còn phục vụ đối chiếu dữ liệu AWS cũ.
+
+Trong Git Bash laptop tại thư mục repo, chuyển manifest cập nhật sang AWS.
+
+```bash
+scp -i ~/.ssh/mcf-lab \
+  deploy/kubernetes/database/postgres-pvc-rejoin-aws.yaml \
+  ubuntu@175.41.152.242:/home/ubuntu/postgres-pvc-rejoin-aws.yaml
+```
+
+Trong terminal SSH AWS, tạo PVC mới.
+
+```bash
+sudo k3s kubectl apply -f /home/ubuntu/postgres-pvc-rejoin-aws.yaml
+
+sudo k3s kubectl -n issues get pvc \
+  postgres-data-rejoin-aws-01 postgres-data-rejoin-aws-02
+```
+
+Kết quả mong đợi là PVC 01 Bound và PVC 02 Pending. StorageClass dùng WaitForFirstConsumer, nên volume của PVC mới được cấp khi Pod tiêu thụ volume được lên lịch. Job clone sẽ sử dụng PVC 02 ở bước tiếp theo.
+
+Checkpoint là hai workload có desired replicas 0 và PVC mới đã được tạo. Tiếp theo cập nhật StatefulSet cùng Job clone để cùng tham chiếu postgres-data-rejoin-aws-02 trước khi bật agent và chạy clone.
+
+### 4.119. Cùng trỏ StatefulSet và Job clone tới PVC rejoin AWS mới
+
+Trên laptop, trong deploy/kubernetes/database/postgres-aws.yaml, đặt spec.replicas về 0 và claimName của volume data thành postgres-data-rejoin-aws-02.
+
+```yaml
+  replicas: 0
+```
+
+```yaml
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: postgres-data-rejoin-aws-02
+```
+
+replicas 0 thể hiện trạng thái chuẩn bị ngay trong manifest được apply. Volume data xác định nơi PostgreSQL đọc dữ liệu khi được bật sau bước clone. Các mục config và mount khác thuộc cấu hình đang dùng của StatefulSet.
+
+Trong deploy/kubernetes/database/postgres-clone-rejoin-aws.yaml, đổi metadata.name thành postgres-clone-rejoin-aws-02 và claimName của volume data thành postgres-data-rejoin-aws-02.
+
+```yaml
+metadata:
+  name: postgres-clone-rejoin-aws-02
+  namespace: issues
+```
+
+```yaml
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: postgres-data-rejoin-aws-02
+```
+
+Tên Job 02 nhận diện lượt clone mới. Job và StatefulSet cùng sử dụng PVC 02 để PostgreSQL khởi động từ đúng bản sao vừa tạo. SOURCE_DB_HOST trong Job dùng 10.200.29.2, là PostgreSQL primary Azure qua WireGuard. PGAPPNAME mcf-aws-standby giúp nhận diện kết nối replication ở phía nguồn.
+
+Trong Git Bash laptop tại thư mục repo, chuyển hai manifest cập nhật sang AWS.
+
+```bash
+scp -i ~/.ssh/mcf-lab \
+  deploy/kubernetes/database/postgres-aws.yaml \
+  deploy/kubernetes/database/postgres-clone-rejoin-aws.yaml \
+  ubuntu@175.41.152.242:/home/ubuntu/
+```
+
+Trong terminal SSH AWS, apply StatefulSet ở trạng thái replicas 0 và đọc lại cấu hình đã lưu trong API.
+
+```bash
+sudo k3s kubectl apply -f /home/ubuntu/postgres-aws.yaml
+
+sudo k3s kubectl -n issues get statefulset postgres \
+  -o jsonpath='{.spec.replicas}{"\t"}{.spec.template.spec.volumes[?(@.name=="data")].persistentVolumeClaim.claimName}{"\n"}'
+```
+
+Output cần lần lượt là 0 và postgres-data-rejoin-aws-02. Job clone đã được chuẩn bị trên host, sẽ được apply sau khi agent và node AWS sẵn sàng chạy Pod.
+
+Checkpoint là StatefulSet đã lưu replicas 0 và PVC 02 trong Kubernetes API, cùng manifest Job 02 dùng đúng PVC đích. Bước tiếp theo dọn Pod object cũ khi đã xác nhận tiến trình database dừng, rồi bật lại agent để thực thi Job clone.
+
+### 4.120. Dọn Pod object cũ và bật lại agent AWS
+
+Trong terminal SSH AWS, đối chiếu desired state và tiến trình database trước khi dọn Pod object.
+
+```bash
+sudo k3s kubectl -n issues get statefulset/postgres deployment/issues-app \
+  -o 'custom-columns=KIND:.kind,NAME:.metadata.name,DESIRED:.spec.replicas'
+
+sudo pgrep -a -x postgres
+```
+
+Cả hai workload cần DESIRED 0 và pgrep có danh sách tiến trình postgres rỗng. pgrep trả exit code 1 khi tìm thấy 0 tiến trình. K3s đang chạy agentless và PostgreSQL cũ đã được đối chiếu dừng trong bước trước.
+
+Khi các điều kiện trên đạt, xóa Pod object cũ của hai workload theo label.
+
+```bash
+sudo k3s kubectl -n issues delete pod \
+  -l 'app in (postgres,issues-app)' \
+  --force --grace-period=0
+```
+
+Label chọn Pod của PostgreSQL và ứng dụng trong namespace issues. Trong chế độ agentless, kubelet đang tắt nên Pod object có thể còn Terminating từ lượt scale về 0. Force delete dùng để gỡ object khỏi API sau khi đã xác nhận tiến trình thực tế dừng. Kubernetes yêu cầu bảo đảm instance StatefulSet cũ đã dừng trước khi force delete để giữ tính duy nhất của Pod. [Force delete StatefulSet Pods](https://kubernetes.io/docs/tasks/run-application/force-delete-stateful-set-pod/).
+
+Khôi phục agent bằng cách gỡ cấu hình tạm của lượt bảo trì rồi khởi động lại K3s.
+
+```bash
+sudo systemctl stop k3s &&
+sudo rm -- /etc/rancher/k3s/config.yaml.d/99-rejoin.yaml &&
+sudo systemctl start k3s
+
+sudo k3s kubectl wait --for=condition=Ready \
+  node/mcf-aws-primary --timeout=180s
+
+sudo k3s kubectl -n issues get pods \
+  -l 'app in (postgres,issues-app)' -o wide
+```
+
+99-rejoin.yaml chứa disable-agent true của bước chuẩn bị. Khi gỡ file này, lần khởi động K3s tiếp theo khôi phục kubelet và container runtime theo cấu hình server thông thường. Dấu && yêu cầu thao tác trước thành công rồi mới chuyển sang thao tác kế tiếp. Marker phê duyệt boot trong /run tiếp tục được startup guard kiểm tra ở cùng boot này.
+
+Node cần Ready và danh sách Pod của hai workload cần rỗng vì desired replicas đang bằng 0. Node sẵn sàng cung cấp môi trường thực thi cho Job clone.
+
+Checkpoint là agent AWS hoạt động, node Ready và hai workload phục vụ đang replicas 0. Trước khi chạy Job clone, đối chiếu manifest theo mục 4.119 để Job có tên postgres-clone-rejoin-aws-02 và volume data tham chiếu postgres-data-rejoin-aws-02.
+
+### 4.121. Chạy Job clone AWS lượt 02 từ primary Azure
+
+Sau mục 4.120, node AWS cần Ready và StatefulSet postgres cùng Deployment issues-app có replicas 0. Azure đang giữ vai trò primary của lượt vận hành.
+
+Trên laptop, mở deploy/kubernetes/database/postgres-clone-rejoin-aws.yaml. Đổi metadata.name thành postgres-clone-rejoin-aws-02 và claimName của volume data thành postgres-data-rejoin-aws-02.
+
+```yaml
+metadata:
+  name: postgres-clone-rejoin-aws-02
+  namespace: issues
+```
+
+```yaml
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: postgres-data-rejoin-aws-02
+```
+
+Tên Job mới tạo một lượt thực thi riêng. PVC 02 phải trùng PVC mà StatefulSet đã chọn. PVC 01 chứa dữ liệu của lượt trước và có thể đã có marker .clone-complete. Script thấy PG_VERSION cùng marker sẽ trả Existing completed clone found, vì vậy chọn nhầm PVC 01 có thể kết thúc Job với dữ liệu cũ trong khi StatefulSet đang trỏ PVC 02.
+
+Trong Git Bash trên laptop, chuyển file đã lưu lên AWS.
+
+```bash
+scp -i ~/.ssh/mcf-lab \
+  deploy/kubernetes/database/postgres-clone-rejoin-aws.yaml \
+  ubuntu@175.41.152.242:/home/ubuntu/postgres-clone-rejoin-aws.yaml
+```
+
+Trong SSH AWS, tạo Job và chờ kết quả.
+
+```bash
+sudo k3s kubectl apply -f /home/ubuntu/postgres-clone-rejoin-aws.yaml
+
+sudo k3s kubectl -n issues wait --for=condition=Complete \
+  job/postgres-clone-rejoin-aws-02 --timeout=600s
+
+sudo k3s kubectl -n issues logs job/postgres-clone-rejoin-aws-02
+
+sudo k3s kubectl -n issues get pvc postgres-data-rejoin-aws-02
+```
+
+Job dùng ConfigMap postgres-clone-script và Secret postgres-replication đã có trên AWS. SOURCE_DB_HOST 10.200.29.2 là địa chỉ WireGuard của PostgreSQL Azure. pg_basebackup kết nối TCP 5432 qua tunnel, ghi bản sao vật lý vào PVC 02. Tùy chọn -R tạo standby.signal và cấu hình kết nối replication, -X stream nhận WAL cần cho tính nhất quán của bản backup. [PostgreSQL pg_basebackup](https://www.postgresql.org/docs/17/app-pgbasebackup.html).
+
+Pod Job là consumer đầu tiên của PVC 02 nên StorageClass WaitForFirstConsumer có thể bắt đầu provision volume trên node AWS. Kết quả cần có Job Complete, log Base backup completed và PVC Bound. Khi lệnh wait báo lỗi hoặc timeout, đọc log cùng trạng thái Job để xác định kết quả thực tế trước khi chuyển sang khởi động database.
+
+Checkpoint là PVC 02 đã nhận bản backup từ primary Azure. Bước tiếp theo khởi động PostgreSQL AWS từ PVC này và đối chiếu trạng thái standby streaming.
+
+### 4.122. Bắt đầu Python automation rejoin AWS bằng kiểm tra primary nguồn
+
+Vòng rejoin và failback thủ công đã hoàn thành. Tiếp tục xây dựng chương trình Python để người vận hành khởi chạy một lượt rejoin AWS, rồi chương trình thực hiện các bước chuẩn bị, clone, khởi động standby và xác minh kết quả.
+
+Chọn chạy chương trình rejoin trên host AWS, nơi cần điều khiển K3s, cấu hình agentless và các manifest. Chương trình được gọi chủ động trong phiên phục hồi. Watcher failover tiếp tục có nhiệm vụ chuyển writer sang Azure khi đủ điều kiện phát hiện sự cố.
+
+Các module được bổ sung dần theo trách nhiệm.
+
+```text
+scripts/cloud/rejoin/
+├── __init__.py
+├── preflight.py        # Kiểm tra primary nguồn
+├── host_ops.py         # Điều khiển dịch vụ và cấu hình K3s
+├── kubernetes_ops.py   # Workload, PVC và Job clone
+└── rejoin_aws.py        # Điều phối một lượt rejoin AWS
+```
+
+Trong bước này, trên laptop tạo scripts/cloud/rejoin/preflight.py và nhập hàm sau.
+
+```python
+from scripts.cloud.failover.checks import classify_probe, probe_writer
+
+
+def require_source_writer(source_url, timeout=5):
+    result = probe_writer(source_url, timeout)
+    state = classify_probe(result)
+    if state != "writer":
+        raise RuntimeError(
+            f"Rejoin source writer was not confirmed: {result}"
+        )
+    return result["body"]
+```
+
+probe_writer và classify_probe là logic đã dùng trong failover. Hàm require_source_writer tái sử dụng chúng để yêu cầu HTTP 200 cùng connected true, role primary, writable true và writes_paused false. source_url nhận URL origin Azure https://azure.mcf.todicode.tech/health/database từ hàm điều phối ở bước sau. timeout giới hạn mỗi pha chờ của request theo cơ chế HTTPX hiện có.
+
+Nếu primary nguồn chưa được xác nhận, RuntimeError truyền về hàm điều phối để dừng lượt rejoin trước các bước thay đổi tài nguyên. Kết quả kiểm tra phản ánh thời điểm request, các thao tác clone và xác minh replication phía sau tiếp tục phải kiểm tra kết quả thực tế.
+
+return result["body"] cung cấp thông tin primary cho hàm điều phối ghi log. Import từ package failover tái sử dụng phần probe hiện có. Khi cần dùng chung thêm giữa các quy trình, có thể chuyển module đó sang package dùng chung trong một bước refactor riêng.
+
+Checkpoint của bước này là module preflight.py đã được nhập trên laptop. Phần tiếp theo bổ sung thao tác host AWS trong host_ops.py. Việc chạy luồng rejoin thực tế được thực hiện khi các bước điều phối cần thiết đã được ghép đầy đủ.
+
+### 4.123. Điều khiển host AWS và khởi động control plane agentless bằng Python
+
+Trên laptop, tạo scripts/cloud/rejoin/host_ops.py. Module này thực hiện lệnh trên host AWS khi chương trình rejoin được khởi chạy tại đó.
+
+```python
+import subprocess
+from pathlib import Path
+
+
+def run_host_command(*arguments, timeout=60):
+    result = subprocess.run(
+        ["sudo", "-n", *arguments],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+    )
+    return result.stdout.strip()
+
+
+def start_agentless_control_plane(project_root):
+    config_source = Path(project_root) / "deploy/k3s/rejoin-control-plane.yaml"
+    if not config_source.is_file():
+        raise FileNotFoundError(config_source)
+
+    config_directory = "/etc/rancher/k3s/config.yaml.d"
+    run_host_command("systemctl", "stop", "k3s", timeout=120)
+    run_host_command("install", "-d", "-m", "700", config_directory)
+    run_host_command(
+        "install", "-m", "600", str(config_source),
+        f"{config_directory}/99-rejoin.yaml",
+    )
+    run_host_command("touch", "/run/issues-k3s-start-approved")
+    run_host_command("systemctl", "reset-failed", "k3s")
+    run_host_command("systemctl", "start", "k3s", timeout=120)
+```
+
+run_host_command dùng chung cho các thao tác host của luồng rejoin. arguments nhận từng đối số lệnh, subprocess truyền chúng trực tiếp vào chương trình. sudo -n yêu cầu quyền sudo có sẵn và trả lỗi ngay nếu cần nhập mật khẩu. check=True làm lệnh có exit code khác 0 phát sinh CalledProcessError, dừng chuỗi thao tác tại điểm lỗi. capture_output giữ stdout cùng stderr cho phần điều phối báo lỗi. text=True trả chuỗi và timeout giới hạn thời gian chờ một lệnh. [Python subprocess.run](https://docs.python.org/3/library/subprocess.html#subprocess.run).
+
+start_agentless_control_plane nhận đường dẫn gốc project trên AWS. Trước khi thay đổi dịch vụ, hàm kiểm tra file cấu hình nguồn đã được chuyển lên host. Các thao tác sau tương ứng với quy trình thủ công đã nghiệm thu.
+
+1. Dừng dịch vụ K3s để chuẩn bị lần khởi động với cấu hình mới.
+2. Tạo thư mục cấu hình với quyền 700 và cài file disable-agent true với quyền 600.
+3. Tạo marker phê duyệt của boot hiện tại để startup guard cho phép khởi động.
+4. Xóa trạng thái lỗi trước đó và khởi động K3s ở chế độ agentless.
+
+K3s agentless duy trì control plane và tắt embedded agent, gồm kubelet, container runtime cùng CNI của agent. Chế độ này được K3s đánh dấu experimental và dùng tạm trong quy trình rejoin đã chọn. [K3s agentless servers](https://docs.k3s.io/advanced#running-agentless-servers-experimental).
+
+Điều kiện đầu vào của bước bảo trì là PostgreSQL cũ trên AWS đã dừng. systemctl stop k3s có thể để lại container đang chạy, vì vậy hàm điều phối cần xác nhận tiến trình PostgreSQL đã dừng trước khi gọi bước này và trước khi phê duyệt boot. Phần kiểm tra trạng thái đó được ghép ở bước điều phối.
+
+Checkpoint là hai hàm đã được nhập trên laptop. Bước tiếp theo bổ sung module kubernetes_ops.py để Python cập nhật replicas và quản lý PVC cùng Job clone.
+
+### 4.124. Dọn các bản sao file dùng cho thao tác thủ công
+
+Các file được scp trực tiếp vào home để chạy lệnh thủ công có thể dọn sau khi nội dung đã có trong repository và được lưu ở Kubernetes API hoặc đường dẫn cấu hình hệ thống. Chương trình rejoin đang được xây dựng sẽ đọc manifest và cấu hình từ cây project trên AWS.
+
+Trong SSH AWS, dọn bốn bản sao đầu vào của lượt hướng dẫn thủ công vừa rồi.
+
+```bash
+rm -f -- \
+  /home/ubuntu/rejoin-control-plane.yaml \
+  /home/ubuntu/postgres-pvc-rejoin-aws.yaml \
+  /home/ubuntu/postgres-clone-rejoin-aws.yaml \
+  /home/ubuntu/postgres-aws.yaml
+```
+
+kubectl apply đã lưu resource vào API. File cấu hình agentless đã được install sang /etc/rancher/k3s/config.yaml.d/99-rejoin.yaml trong bước chuẩn bị. Xóa bản sao đầu vào ở home chỉ dọn file cho thao tác thủ công. PVC 02 cùng replicas 0 là trạng thái chuẩn bị sẽ được chương trình rejoin sử dụng. Các tài nguyên này tiếp tục được quản lý theo tiến độ phục hồi.
+
+Trong SSH Azure, bản sao unit file từng được đặt trực tiếp ở home cũng có thể dọn.
+
+```bash
+rm -f -- /home/azureuser/mcf-watcher.service
+```
+
+Service hiện dùng unit tại /etc/systemd/system/mcf-watcher.service và runtime tại /home/azureuser/mcf-watcher. Mục 4.116 đã hướng dẫn dọn năm module Python cũ sau khi chuyển sang package failover.
+
+Các lệnh trên chọn từng file cụ thể. File có thể đã được dọn trong lượt trước, khi đó rm -f kết thúc thành công. Bước dọn này giữ cơ sở dữ liệu và cấu hình vận hành cần thiết cho lần rejoin đang xây dựng.
+
+### 4.125. Điều khiển resource Kubernetes trong automation rejoin
+
+Sau lần nghỉ, bật lại EC2 AWS và VM Azure bằng API cloud. Startup guard yêu cầu phê duyệt K3s theo vai trò database của lượt phục hồi. Azure tiếp tục giữ dữ liệu primary sau failover. Watcher đã disable trong lần nghỉ để người vận hành tiếp tục phục hồi.
+
+Lượt tiếp tục ngày 2026-11-17 đã đối chiếu EC2 running cùng SystemStatus ok và InstanceStatus ok, VM Azure PowerState/running cùng VM Agent Ready. WireGuard và K3s Azure đã được khởi động lại cho primary hiện tại. Endpoint writer Azure trả HTTP 200 với connected true, role primary, writable true và writes_paused false.
+
+Trên laptop, tạo scripts/cloud/rejoin/kubernetes_ops.py và nhập các hàm sau.
+
+```python
+from scripts.cloud.rejoin.host_ops import run_host_command
+
+
+def run_kubectl(namespace, *arguments, timeout=60):
+    return run_host_command(
+        "k3s", "kubectl", "-n", namespace,
+        *arguments,
+        timeout=timeout,
+    )
+
+
+def scale_workloads_to_zero(namespace):
+    return run_kubectl(
+        namespace,
+        "scale", "statefulset/postgres", "deployment/issues-app",
+        "--replicas=0",
+    )
+
+
+def apply_manifest(namespace, manifest_path):
+    return run_kubectl(
+        namespace,
+        "apply", "-f", str(manifest_path),
+    )
+```
+
+run_kubectl ghép tiền tố sudo -n k3s kubectl -n cùng namespace và các đối số thao tác. run_host_command cung cấp xử lý exit code, stdout, stderr và timeout đã có ở module host_ops. Các lệnh Kubernetes của lượt rejoin cùng đi qua đường gọi này.
+
+scale_workloads_to_zero cập nhật desired replicas của StatefulSet postgres và Deployment issues-app về 0 trong một lệnh kubectl scale. Controller dựa vào các giá trị này khi agent thực thi workload. Trong giai đoạn agentless, việc cập nhật desired state và việc tiến trình container thực sự dừng cần được đối chiếu riêng ở luồng điều phối. [kubectl scale](https://kubernetes.io/docs/reference/kubectl/generated/kubectl_scale/).
+
+apply_manifest áp dụng một file manifest đã chuẩn bị. Hàm này sẽ được dùng cho PVC rejoin, StatefulSet đã trỏ đúng PVC và Job clone. manifest_path là đường dẫn file trên host AWS, nơi chương trình rejoin thực thi. Resource cần cùng namespace với tham số truyền vào.
+
+Các lời gọi minh họa trong hàm điều phối sau này là scale_workloads_to_zero("issues") và apply_manifest("issues", project_root / "deploy/kubernetes/database/postgres-pvc-rejoin-aws.yaml"). Bước này nhập các hàm vào module trên laptop. Bước tiếp theo bổ sung chờ Kubernetes API sẵn sàng để nối chính xác thao tác khởi động control plane với thao tác chỉnh resource.
+
+### 4.126. Chờ Kubernetes API sẵn sàng trước khi cập nhật workload
+
+Trong scripts/cloud/rejoin/kubernetes_ops.py trên laptop, thêm hai import ở đầu file, phía trên import run_host_command.
+
+```python
+import subprocess
+import time
+```
+
+Thêm hàm sau vào cuối file.
+
+```python
+def wait_for_api(namespace, timeout=120):
+    deadline = time.monotonic() + timeout
+    last_error = None
+
+    while time.monotonic() < deadline:
+        try:
+            run_kubectl(
+                namespace,
+                "get", "--raw=/readyz", "--request-timeout=5s",
+                timeout=10,
+            )
+            return
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as error:
+            last_error = error
+            time.sleep(2)
+
+    raise RuntimeError("Kubernetes API did not become ready.") from last_error
+```
+
+Sau khi systemctl start k3s, hàm điều phối sẽ gọi wait_for_api("issues") rồi scale_workloads_to_zero("issues"). Hàm chờ này đưa việc kiểm tra API sẵn sàng vào luồng automation.
+
+GET /readyz kiểm tra API server đã sẵn sàng phục vụ request. kubectl trả exit code thành công khi nhận phản hồi HTTP thành công. Endpoint này cung cấp điều kiện cho thao tác quản trị resource, còn Node Ready và database streaming được chờ ở các bước sau. [Kubernetes API health endpoints](https://kubernetes.io/docs/reference/using-api/health-checks/).
+
+time.monotonic đo thời gian trôi qua để xác định mốc kết thúc, phù hợp cho thời gian chờ khi đồng hồ hệ thống được điều chỉnh. Mỗi request có request-timeout 5s, còn timeout 10 của subprocess giới hạn thời gian chờ tiến trình kubectl. Nếu API chưa sẵn sàng hoặc tiến trình hết thời gian, hàm đợi 2 giây rồi thử lại trong khoảng chờ. Vòng cuối có thể kết thúc sau mốc deadline do request và thời gian nghỉ đang thực hiện.
+
+CalledProcessError là exception từ check=True trong run_host_command khi kubectl trả mã lỗi. TimeoutExpired là exception khi tiến trình vượt thời gian chờ. Các lỗi khác truyền về hàm điều phối. Khi hết khoảng chờ, RuntimeError dừng luồng rejoin và from last_error giữ nguyên nguyên nhân lần thất bại gần nhất.
+
+Checkpoint là module kubernetes_ops.py có các hàm gọi kubectl, chờ API, scale workload và apply manifest. Bước tiếp theo chuẩn bị việc chọn PVC cùng Job clone của một lượt rejoin trước khi ghép luồng thực thi.
+
+### 4.127. Đọc template Kubernetes từ Python
+
+Trong scripts/cloud/rejoin/kubernetes_ops.py trên laptop, thêm import json ở đầu file và hàm sau ở cuối file.
+
+```python
+def read_manifest(namespace, manifest_path):
+    output = run_kubectl(
+        namespace,
+        "create", "--dry-run=client", "--validate=false",
+        "-f", str(manifest_path), "-o", "json",
+    )
+    return json.loads(output)
+```
+
+kubectl đọc manifest YAML và xuất object JSON với dry-run client. Python dùng json có sẵn để đọc các trường cấu hình. Tham số validate false bỏ bước xác thực schema khi đọc, các bước apply phía sau tiếp tục được API server xác thực. Lệnh này có thể cần truy cập API discovery, nên chạy sau wait_for_api. [kubectl create](https://kubernetes.io/docs/reference/kubectl/generated/kubectl_create/).
+
+Worker sẽ dùng read_manifest để đọc các template YAML trước khi sinh bộ manifest của lượt rejoin. PVC có thể ở trạng thái Pending do StorageClass WaitForFirstConsumer cho đến khi Job clone dùng volume đó.
+
+### 4.128. Tự động toàn bộ vòng phục hồi và sinh manifest theo lượt
+
+Mục tiêu mới là sau khi controller được cấu hình và chạy, toàn bộ chuỗi phát hiện sự cố, fencing, promote Azure, đưa AWS trở lại standby, failback về AWS và đưa Azure trở lại standby được thực hiện tự động. Người vận hành chủ động gây sự cố cho bài demo, sau đó quan sát log và kết quả API. Cấu hình bảo trì cần cho phép tạm dừng controller trước khi dừng hai host để nghỉ.
+
+Bộ điều phối chạy bằng systemd trên VM Azure, ngoài K3s. Nó lưu tiến độ trên đĩa Azure, cấp một operation_id cho từng lượt rejoin và gọi worker AWS qua SSH. Khi Azure đã nhận ghi qua tên miền chung, bộ điều phối bắt đầu tính thời gian quan sát và có thể gọi AWS API để bật lại EC2. Startup guard giữ PostgreSQL AWS cũ ở trạng thái dừng trong lúc worker chuẩn bị bản clone.
+
+Watcher Azure hiện kết thúc sau một lượt failover thành công. Khi ghép controller toàn vòng, quyền thực thi failover cần được chuyển sang một đầu điều phối duy nhất. Những hàm kiểm tra, fencing, promotion và rejoin hiện có được tái sử dụng trong chuỗi này.
+
+Cho bài demo, cấu hình tối thiểu 300 giây kể từ khi Azure ghi thành công qua tên miền chung. Failback bắt đầu khi đã hết khoảng quan sát, các kiểm tra đọc ghi trên Azure đạt và AWS đã chạy ổn định ở vai trò standby nhận WAL từ Azure. Bộ điều phối đóng ghi bằng advisory lock, đợi AWS replay tới mốc WAL cuối, scale StatefulSet PostgreSQL Azure về 0 và xác nhận Pod đã dừng cùng cổng 5432 đã đóng. VM Azure giữ bộ điều phối hoạt động để promote AWS, kiểm tra writer mới và dựng lại Azure standby. Đây là thiết kế đang xây dựng. [PostgreSQL failover](https://www.postgresql.org/docs/17/warm-standby-failover.html).
+
+Bước code hiện tại tự sinh tên PVC và Job theo operation_id để mỗi lượt rejoin có volume đích tương ứng. Tạo scripts/cloud/rejoin/manifest_ops.py trên laptop.
+
+```python
+import json
+from pathlib import Path
+
+from scripts.cloud.rejoin.kubernetes_ops import read_manifest
+
+
+def render_manifests(namespace, project_root, output_directory, operation_id):
+    templates = Path(project_root) / "deploy/kubernetes/database"
+    pvc = read_manifest(namespace, templates / "postgres-pvc-rejoin-aws.yaml")
+    postgres = read_manifest(namespace, templates / "postgres-aws.yaml")
+    clone = read_manifest(namespace, templates / "postgres-clone-rejoin-aws.yaml")
+
+    pvc_name = f"postgres-data-rejoin-aws-{operation_id}"
+    pvc["metadata"]["name"] = pvc_name
+    postgres["spec"]["replicas"] = 0
+    clone["metadata"]["name"] = f"postgres-clone-rejoin-aws-{operation_id}"
+
+    for workload in (postgres, clone):
+        volumes = workload["spec"]["template"]["spec"]["volumes"]
+        data_volume = next(volume for volume in volumes if volume["name"] == "data")
+        data_volume["persistentVolumeClaim"]["claimName"] = pvc_name
+
+    output_directory = Path(output_directory)
+    output_directory.mkdir(parents=True, exist_ok=True)
+    paths = {}
+    for name, manifest in (("pvc", pvc), ("postgres", postgres), ("clone", clone)):
+        path = output_directory / f"{name}.json"
+        path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+        paths[name] = path
+    return paths, pvc_name
+```
+
+read_manifest sử dụng parser kubectl để đọc ba template. Hàm cập nhật tên PVC, tên Job, replicas và cả hai claimName trong các object Python. File JSON sinh ra được kubectl apply hỗ trợ. [kubectl apply](https://kubernetes.io/docs/reference/kubectl/generated/kubectl_apply/).
+
+operation_id dự kiến là uuid.uuid4().hex được cấp một lần rồi lưu vào trạng thái controller trước khi chạy lượt rejoin. Ví dụ operation_id 4d7525a85683454787cc7c6831ab77ed tạo PVC postgres-data-rejoin-aws-4d7525a85683454787cc7c6831ab77ed. Khi thử lại cùng lượt, controller đọc lại operation_id đã lưu. Lượt rejoin mới nhận operation_id mới.
+
+Hàm trả đường dẫn ba file và tên PVC vừa gán. Worker apply PVC trước, StatefulSet sau và dùng paths["clone"] cho Job clone. Các template có tên đuôi 01 hoặc 02 được cập nhật theo operation_id của lượt chạy. Tên PVC trả về được lưu theo lượt để đối chiếu Job và StatefulSet thực tế.
+
+Checkpoint là render_manifests đã được nhập trên laptop. Các bước controller, lưu trạng thái, remote execution, chính sách ổn định trước failback và vòng phục hồi tự động còn đang được xây dựng. Nghiệm thu cuối phải bao gồm một lượt đầy đủ từ gây sự cố đến khôi phục AWS primary cùng Azure standby mà người vận hành quan sát toàn bộ quá trình.
+
+### 4.129. Chạy Job clone của lượt rejoin và chờ hoàn tất
+
+Tạo scripts/cloud/rejoin/clone_ops.py trên laptop. Hàm nhận file JSON của Job và tên PVC do render_manifests trả về.
+
+```python
+import json
+import time
+from pathlib import Path
+
+from scripts.cloud.rejoin.kubernetes_ops import apply_manifest, run_kubectl
+
+
+class CloneJobFailed(RuntimeError):
+    """Kubernetes reported a terminal failure for the clone Job."""
+
+
+def run_clone(namespace, job_path, pvc_name, timeout=630):
+    job = json.loads(Path(job_path).read_text(encoding="utf-8"))
+    job_name = job["metadata"]["name"]
+    volumes = job["spec"]["template"]["spec"]["volumes"]
+    data_volume = next(volume for volume in volumes if volume["name"] == "data")
+    if data_volume["persistentVolumeClaim"]["claimName"] != pvc_name:
+        raise ValueError("Clone Job must reference the rejoin PVC.")
+
+    apply_manifest(namespace, job_path)
+    deadline = time.monotonic() + timeout
+    while True:
+        current = json.loads(run_kubectl(
+            namespace,
+            "get", f"job/{job_name}", "-o", "json", "--request-timeout=10s",
+            timeout=15,
+        ))
+        for condition in current.get("status", {}).get("conditions", []):
+            if condition.get("status") != "True":
+                continue
+            if condition.get("type") == "Complete":
+                return job_name
+            if condition.get("type") == "Failed":
+                reason = condition.get("reason") or "unknown reason"
+                raise CloneJobFailed(f"Clone Job {job_name} failed: {reason}")
+
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError(f"Timed out waiting for clone Job {job_name}.")
+        time.sleep(min(2, remaining))
+```
+
+Điều kiện trước khi gọi là AWS đã khôi phục agent, node Ready, hai workload phục vụ replicas 0 và PVC cùng StatefulSet đã được chuẩn bị. Việc khôi phục agent và xác minh tiến trình PostgreSQL cũ dừng sẽ được nối vào luồng điều phối trước bước chạy Job.
+
+Hàm đọc tên Job từ manifest được sinh theo operation_id, rồi tìm volume data để đối chiếu PVC đích. Nếu claimName khác tên PVC của lượt đang chạy, ValueError dừng bước clone trước khi apply. Khi đúng, apply tạo hoặc đối chiếu Job theo manifest.
+
+Worker đọc status.conditions của Job từ Kubernetes. Complete=True trả tên Job để lưu tiến độ. Failed=True đưa ngay CloneJobFailed kèm lý do về controller. TimeoutError cho biết worker hết thời gian chờ và Job có thể vẫn đang chạy. Mốc chờ mặc định 630 giây dành thêm thời gian cho manifest đặt activeDeadlineSeconds 600. Kết quả dựa trên trạng thái Job. Log phục vụ chẩn đoán riêng. [Kubernetes Job conditions](https://kubernetes.io/docs/concepts/workloads/controllers/job/#terminal-job-conditions).
+
+Chuỗi gọi trong hàm điều phối sẽ dùng các kết quả đã chuẩn bị.
+
+```python
+# Khôi phục agent và chờ node Ready ở bước điều phối.
+job_name = run_clone(namespace, paths["clone"], pvc_name)
+```
+
+Checkpoint là run_clone đã được nhập trên laptop. Bước tiếp theo bổ sung thao tác khôi phục agent AWS, rồi khởi động PostgreSQL từ PVC clone và kiểm tra standby streaming. Trạng thái Job Complete xác nhận phần backup đã kết thúc, việc xác nhận replication liên tục thuộc bước khởi động standby sau đó.
+
+### 4.130. Khôi phục agent và chờ AWS node sẵn sàng chạy clone
+
+Trong scripts/cloud/rejoin/host_ops.py trên laptop, thêm hai hàm sau. subprocess đã được import ở đầu file.
+
+```python
+def require_postgres_stopped():
+    result = subprocess.run(
+        ["pgrep", "-a", "-x", "postgres"],
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    if result.returncode == 1:
+        return
+    result.check_returncode()
+    raise RuntimeError(f"PostgreSQL is still running: {result.stdout.strip()}")
+
+
+def restore_agent():
+    run_host_command("systemctl", "stop", "k3s", timeout=120)
+    run_host_command("rm", "-f", "--", "/etc/rancher/k3s/config.yaml.d/99-rejoin.yaml")
+    run_host_command("systemctl", "start", "k3s", timeout=120)
+```
+
+pgrep tìm tiến trình có tên chính xác postgres trên host Ubuntu của lab. Mã 1 biểu thị không có tiến trình khớp, hàm kết thúc thành công. Mã 0 biểu thị có tiến trình, hàm báo RuntimeError kèm danh sách. Mã lỗi khác đi qua check_returncode để phát sinh CalledProcessError. Lệnh pgrep đọc danh sách tiến trình bằng user đang chạy worker trên cấu hình Ubuntu hiện tại.
+
+restore_agent dừng dịch vụ K3s, gỡ file cấu hình agentless tạm rồi khởi động lại. rm -f cho phép thử lại bước gỡ khi file đã được gỡ ở lần trước. Startup marker trong /run do start_agentless_control_plane tạo vẫn tồn tại trong cùng boot.
+
+Trong scripts/cloud/rejoin/kubernetes_ops.py, đổi dòng import run_host_command thành khối sau.
+
+```python
+from scripts.cloud.rejoin.host_ops import (
+    require_postgres_stopped,
+    restore_agent,
+    run_host_command,
+)
+```
+
+Thêm hàm sau vào cuối kubernetes_ops.py.
+
+```python
+def restore_node_for_clone(namespace, node_name):
+    resources = json.loads(run_kubectl(
+        namespace,
+        "get", "statefulset/postgres", "deployment/issues-app", "-o", "json",
+    ))
+    for resource in resources["items"]:
+        if resource["spec"].get("replicas", 1) != 0:
+            raise RuntimeError("Workload replicas must be 0 before agent restore.")
+
+    require_postgres_stopped()
+    run_kubectl(
+        namespace,
+        "delete", "pod", "-l", "app in (postgres,issues-app)",
+        "--force", "--grace-period=0", "--ignore-not-found=true",
+    )
+    restore_agent()
+    wait_for_api(namespace)
+    return run_kubectl(
+        namespace,
+        "wait", "--for=condition=Ready", f"node/{node_name}",
+        "--timeout=180s",
+        timeout=210,
+    )
+```
+
+Hàm điều phối bước agent chỉ tiếp tục khi StatefulSet postgres và Deployment issues-app đã có replicas 0, cùng tiến trình PostgreSQL cũ đã dừng. Sau đó dọn Pod object cũ theo label, khôi phục agent, chờ API rồi chờ Node Ready. Xác nhận tiến trình cũ đã dừng trước force delete là điều kiện giữ tính duy nhất của Pod StatefulSet trong lượt phục hồi. [Force delete StatefulSet Pods](https://kubernetes.io/docs/tasks/run-application/force-delete-stateful-set-pod/).
+
+Mọi exception từ các thao tác truyền về worker rejoin. Controller cần đọc trạng thái thực tế khi thử lại, đồng thời giữ operation_id của lượt đang phục hồi. Hàm restore_node_for_clone chạy sau khi apply PVC và StatefulSet, trước Job clone.
+
+```python
+apply_manifest(namespace, paths["pvc"])
+apply_manifest(namespace, paths["postgres"])
+restore_node_for_clone(namespace, "mcf-aws-primary")
+job_name = run_clone(namespace, paths["clone"], pvc_name)
+```
+
+Checkpoint là các hàm khôi phục agent đã được nhập trên laptop. Bước tiếp theo khởi động PostgreSQL sau khi Job clone Complete, rồi xác nhận nó là standby đang nhận WAL từ Azure. Controller toàn vòng còn đang được ghép từ các thao tác này.
+
+### 4.131. Khởi động PostgreSQL AWS từ PVC clone
+
+Tạo scripts/cloud/rejoin/postgres_ops.py trên laptop. Hàm start_standby đối chiếu PVC đã gắn và chờ StatefulSet PostgreSQL sẵn sàng.
+
+```python
+import json
+
+from scripts.cloud.rejoin.kubernetes_ops import run_kubectl
+
+
+def start_standby(config, pvc_name):
+    namespace = config["kubernetes_namespace"]
+    postgres = json.loads(run_kubectl(
+        namespace,
+        "get", "statefulset/postgres", "-o", "json",
+    ))
+    volumes = postgres["spec"]["template"]["spec"]["volumes"]
+    data_volume = next(volume for volume in volumes if volume["name"] == "data")
+    if data_volume["persistentVolumeClaim"]["claimName"] != pvc_name:
+        raise RuntimeError("PostgreSQL must use the completed clone PVC.")
+
+    run_kubectl(namespace, "scale", "statefulset/postgres", "--replicas=1")
+    run_kubectl(
+        namespace,
+        "rollout", "status", "statefulset/postgres", "--timeout=300s",
+        timeout=330,
+    )
+```
+
+Hàm được gọi sau khi run_clone đã xác nhận Job Complete. config cung cấp kubernetes_namespace issues. pvc_name là PVC của operation_id hiện tại, được render_manifests trả về.
+
+Đầu tiên, hàm đọc StatefulSet thực tế từ Kubernetes API để đối chiếu volume data với PVC chứa clone của lượt hiện tại. Khi khớp, scale replicas 1 tạo Pod PostgreSQL. Container mount PVC clone, kiểm tra .clone-complete và PG_VERSION rồi khởi động PostgreSQL. standby.signal cùng cấu hình do pg_basebackup -R sinh ra đưa database vào standby và kết nối tới Azure.
+
+rollout status chờ StatefulSet hoàn tất lượt triển khai và Pod sẵn sàng theo probe đã cấu hình. timeout kubectl 300 giây giới hạn khoảng chờ rollout, timeout subprocess 330 giây giới hạn tiến trình. [kubectl rollout status](https://kubernetes.io/docs/reference/kubectl/generated/kubectl_rollout/kubectl_rollout_status/).
+
+Sau rollout, wait_for_streaming ở mục 4.132 kiểm tra vai trò standby và nguồn WAL cùng lúc.
+
+Phần điều phối sau Job clone sẽ gọi như sau.
+
+```python
+job_name = run_clone(namespace, paths["clone"], pvc_name)
+start_standby(config, pvc_name)
+```
+
+Checkpoint là start_standby đã được nhập trên laptop. Controller sẽ chỉ đánh dấu rejoin hoàn tất sau bước chờ WAL receiver streaming từ primary Azure và khôi phục ứng dụng AWS.
+
+### 4.132. Chờ PostgreSQL AWS streaming từ đúng primary Azure
+
+Trong scripts/cloud/rejoin/postgres_ops.py trên laptop, thêm import time và bổ sung run_postgres_sql vào import từ package failover.
+
+```python
+import json
+import time
+
+from scripts.cloud.failover.postgres_ops import preflight_standby, run_postgres_sql
+from scripts.cloud.rejoin.kubernetes_ops import run_kubectl
+```
+
+Thêm hàm sau ở cuối file.
+
+```python
+def wait_for_streaming(config, source_host, timeout=120):
+    sql = """SELECT COALESCE(
+        (SELECT json_build_object(
+            'status', status,
+            'sender_host', sender_host,
+            'sender_port', sender_port
+        ) FROM pg_stat_wal_receiver),
+        '{}'::json
+    );"""
+    deadline = time.monotonic() + timeout
+
+    while time.monotonic() < deadline:
+        status = preflight_standby(config)
+        receiver = json.loads(run_postgres_sql(config, sql))
+        if (
+            receiver.get("status") == "streaming"
+            and receiver.get("sender_host") == source_host
+            and receiver.get("sender_port") == 5432
+        ):
+            return {**status, "receiver": receiver}
+        time.sleep(2)
+
+    raise RuntimeError(f"Standby did not start streaming from {source_host}.")
+```
+
+Luồng gọi sau bước clone là start_standby(config, pvc_name), rồi wait_for_streaming(config, "10.200.29.2"). Hàm chạy SQL trong PostgreSQL AWS vì worker rejoin thực thi trên host AWS. source_host là địa chỉ WireGuard của primary Azure.
+
+Mỗi vòng gọi preflight_standby để đối chiếu in_recovery true cùng transaction_read_only on và đọc các LSN quan sát. Sau đó truy vấn pg_stat_wal_receiver lấy trạng thái receiver, host nguồn và cổng nguồn. Hàm chỉ trả thành công khi receiver streaming từ source_host trên cổng 5432. [PostgreSQL pg_stat_wal_receiver](https://www.postgresql.org/docs/17/monitoring-stats.html#MONITORING-PG-STAT-WAL-RECEIVER-VIEW).
+
+Khi receiver đang kết nối và view có 0 dòng, SELECT bên trong trả NULL, COALESCE trả object JSON rỗng. Python dùng get để đọc các trường và tiếp tục chờ. Mỗi vòng chưa đạt điều kiện đợi 2 giây. Khoảng chờ mặc định 120 giây được đo bằng monotonic, vòng SQL cuối có thể kết thúc sau mốc này. Lỗi thực thi SQL hoặc vai trò database không đạt yêu cầu truyền ngay về worker để controller xử lý trạng thái thực tế.
+
+Kết quả trả về gộp trạng thái standby, receive_lsn, replay_lsn và object receiver. Ví dụ dạng kết quả mong đợi dưới đây chỉ minh họa cấu trúc.
+
+```json
+{
+  "in_recovery": true,
+  "read_only": "on",
+  "receive_lsn": "0/9000060",
+  "replay_lsn": "0/9000060",
+  "receiver": {
+    "status": "streaming",
+    "sender_host": "10.200.29.2",
+    "sender_port": 5432
+  }
+}
+```
+
+Điều kiện streaming xác nhận AWS có vai trò standby và kết nối tới nguồn mong muốn tại thời điểm đọc. Trước failback, controller còn cần lấy target_lsn sau commit cờ tạm dừng ghi trên Azure và chờ replay_lsn của AWS đạt mốc đó. Các giá trị LSN quan sát trong bước rejoin phục vụ ghi trạng thái, phép kiểm tra mốc chuyển writer được thực hiện tại bước failback.
+
+Checkpoint là wait_for_streaming đã được nhập trên laptop. Bước tiếp theo khôi phục Deployment ứng dụng AWS và đối chiếu health của origin standby, rồi ghép worker rejoin để controller gọi từ xa.
+
+### 4.133. Khôi phục ứng dụng AWS và xác nhận origin standby
+
+Tạo scripts/cloud/rejoin/app_ops.py trên laptop. Hàm được gọi sau khi PostgreSQL AWS đã qua kiểm tra standby streaming từ Azure.
+
+```python
+import time
+
+from scripts.cloud.failover.checks import classify_probe, probe_writer
+from scripts.cloud.rejoin.kubernetes_ops import run_kubectl
+
+
+def restore_application(namespace, writer_url, timeout=120):
+    run_kubectl(namespace, "scale", "deployment/issues-app", "--replicas=1")
+    run_kubectl(
+        namespace,
+        "rollout", "status", "deployment/issues-app", "--timeout=180s",
+        timeout=210,
+    )
+    deadline = time.monotonic() + timeout
+    result = None
+
+    while time.monotonic() < deadline:
+        result = probe_writer(writer_url, timeout=5)
+        if (
+            classify_probe(result) == "standby"
+            and result["body"].get("replication_connected") is True
+        ):
+            return result["body"]
+        time.sleep(2)
+
+    raise RuntimeError(f"Application standby health was not confirmed: {result}")
+```
+
+Scale replicas 1 khôi phục Deployment issues-app đã có cấu hình và image từ lượt triển khai trước. rollout status chờ Deployment có replica sẵn sàng, với readinessProbe /api/database/status đã cấu hình trong manifest. [kubectl rollout status](https://kubernetes.io/docs/reference/kubectl/generated/kubectl_rollout/kubectl_rollout_status/).
+
+Sau rollout, hàm probe origin writer_url để đối chiếu đường HTTPS qua Ingress và ứng dụng. Lượt AWS rejoin truyền https://aws.mcf.todicode.tech/health/database. classify_probe yêu cầu HTTP 503, connected true, role standby và writable false để phân loại standby. Điều kiện bổ sung replication_connected true yêu cầu ứng dụng đọc được receiver đang streaming.
+
+Endpoint /api/database/status trả 200 khi ứng dụng truy vấn được PostgreSQL standby, nên readinessProbe cho phép Pod nhận traffic. Endpoint /health/database trả 503 trong vai trò standby, phù hợp với policy DNS ưu tiên writer. Các phản hồi này được đối chiếu trực tiếp với database/role.py của project.
+
+Khoảng timeout 120 giây áp dụng cho vòng probe sau rollout. Mỗi probe có HTTPX timeout 5 giây cho từng pha chờ, giữa hai vòng đợi 2 giây. Vòng cuối có thể kết thúc sau mốc deadline. Khi hết khoảng chờ, exception mang kết quả probe cuối cùng về phần điều phối để ghi nhận nguyên nhân chưa đạt.
+
+Phần điều phối sau bước kiểm tra replication sẽ dùng như sau.
+
+```python
+replication_status = wait_for_streaming(config, source_host="10.200.29.2")
+application_status = restore_application(
+    config["kubernetes_namespace"],
+    "https://aws.mcf.todicode.tech/health/database",
+)
+```
+
+Checkpoint là restore_application đã được nhập trên laptop. Các thao tác của AWS rejoin đã có phần chuẩn bị host, manifest theo operation_id, storage, agent, clone, standby streaming và ứng dụng. Bước tiếp theo bổ sung lưu tiến độ của worker để controller có thể tiếp tục lượt phục hồi khi tiến trình hoặc kết nối bị gián đoạn, rồi ghép các thao tác theo thứ tự.
+
+### 4.134. Lưu và đọc tiến độ của worker rejoin
+
+Tạo scripts/cloud/rejoin/state_ops.py trên laptop. File state được lưu trên disk của host chạy worker. Controller truyền operation_id đã lưu của lượt phục hồi vào worker để cùng một lượt có thể tiếp tục dùng đúng PVC và Job đã tạo.
+
+```python
+import json
+import os
+from pathlib import Path
+from tempfile import NamedTemporaryFile
+
+
+def load_state(state_path, operation_id):
+    state_path = Path(state_path)
+    try:
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {"operation_id": operation_id, "phase": "pending"}
+
+    if not isinstance(state, dict) or state.get("operation_id") != operation_id:
+        raise ValueError("Rejoin state does not match the operation ID.")
+    if not isinstance(state.get("phase"), str):
+        raise ValueError("Rejoin state must include a phase.")
+    return state
+
+
+def save_state(state_path, state):
+    state_path = Path(state_path)
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = NamedTemporaryFile(
+        mode="w", encoding="utf-8",
+        dir=state_path.parent, prefix=".state-", delete=False,
+    )
+    temporary_path = Path(temporary.name)
+    try:
+        with temporary:
+            json.dump(state, temporary, indent=2)
+            temporary.flush()
+            os.fsync(temporary.fileno())
+        os.replace(temporary_path, state_path)
+    finally:
+        temporary_path.unlink(missing_ok=True)
+```
+
+load_state trả phase pending khi file của operation_id hiện tại chưa tồn tại. Khi file đã có, hàm đối chiếu operation_id và cấu trúc phase. File JSON lỗi hoặc state không phù hợp phát sinh exception để worker báo trạng thái về controller. Worker cần lưu state pending trước thao tác thay đổi tài nguyên đầu tiên.
+
+save_state ghi JSON vào một file tạm nằm cùng thư mục với state đích, flush dữ liệu và gọi fsync, sau đó thay thế state bằng os.replace. File tạm và file đích ở cùng filesystem để rename có tính atomic khi thành công. finally dọn file tạm nếu nó còn tồn tại sau lỗi. Reader sẽ thấy phiên bản state cũ hoặc phiên bản mới hoàn chỉnh khi tiến trình bị gián đoạn trong quá trình ghi. [Python os.replace](https://docs.python.org/3/library/os.html#os.replace).
+
+Ví dụ cấu trúc state sau khi Job clone đã hoàn tất dưới đây dùng phase clone_complete. Các định danh ví dụ chỉ minh họa cấu trúc, worker sẽ lưu định danh thực tế của lượt đang chạy.
+
+```json
+{
+  "operation_id": "4d7525a85683454787cc7c6831ab77ed",
+  "phase": "clone_complete",
+  "pvc_name": "postgres-data-rejoin-aws-4d7525a85683454787cc7c6831ab77ed",
+  "job_name": "postgres-clone-rejoin-aws-4d7525a85683454787cc7c6831ab77ed"
+}
+```
+
+Worker cập nhật phase sau khi hành động cùng kiểm tra kết quả của bước đó thành công. Ví dụ Job clone Complete thì lưu clone_complete cùng tên Job và PVC. Khi worker được gọi lại, phần điều phối cần đọc state và đối chiếu resource thực tế để quyết định tiếp tục, kể cả trường hợp thao tác đã xong nhưng tiến trình bị ngắt trước lúc lưu phase. Việc ghi atomic bảo vệ file JSON, còn logic đối chiếu trạng thái và thứ tự bước được ghép vào worker ở phần sau.
+
+State của worker ghi tiến độ các thao tác rejoin trên host. State của controller trên VM Azure ghi tiến độ toàn vòng chuyển writer. Cả hai cùng dùng operation_id của lượt phục hồi để đối chiếu. Bước tiếp theo bổ sung khóa thực thi trên host để các lần gọi SSH chồng nhau không cùng sửa workload, sau đó ghép worker theo các phase.
+
+### 4.135. Khóa một worker rejoin trên mỗi host
+
+Tạo scripts/cloud/rejoin/lock_ops.py trên laptop. Khóa được sử dụng khi worker chạy trên host Ubuntu.
+
+```python
+from contextlib import contextmanager
+from pathlib import Path
+
+
+class RejoinBusy(RuntimeError):
+    """Another worker is already running on this host."""
+
+
+@contextmanager
+def rejoin_lock():
+    import fcntl
+
+    state_directory = Path.home() / ".local" / "state" / "mcf-rejoin"
+    state_directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+
+    with (state_directory / "worker.lock").open("a") as lock_file:
+        try:
+            fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as error:
+            raise RejoinBusy("A rejoin worker is already running.") from error
+        yield
+```
+
+Tất cả lượt rejoin trên mỗi host dùng cùng worker.lock dưới tài khoản chạy worker. PVC của từng lượt có tên riêng theo operation_id. Các thao tác trên StatefulSet postgres và dịch vụ K3s cùng tác động vào resource chung, nên chúng dùng một khóa chung trên host.
+
+LOCK_EX cấp khóa độc quyền. LOCK_NB trả lỗi ngay nếu khóa đang được giữ. RejoinBusy giúp controller nhận biết một lượt đang chạy và xử lý riêng với lỗi phục hồi. Khi thoát khối with, file descriptor đóng và hệ điều hành nhả khóa. Giữ nguyên file worker.lock trên đĩa để các tiến trình mở cùng một file. [Python fcntl.flock](https://docs.python.org/3.12/library/fcntl.html#fcntl.flock).
+
+Worker sẽ đặt load_state, bước đối chiếu resource, các thao tác thay đổi và save_state bên trong with rejoin_lock(). File state ghi tiến độ giữa các lần chạy. Khóa bảo vệ các lần gọi worker chồng nhau dưới cùng tài khoản thực thi.
+
+### 4.136. Ghép bước chuẩn bị AWS vào worker rejoin
+
+Tạo scripts/cloud/rejoin/rejoin_aws.py trên laptop. Hàm run_aws_rejoin là điểm gọi của worker, thực thi trên Ubuntu AWS khi controller Azure gửi operation_id. Bước này nối các hàm từ lúc kiểm tra nguồn đến khi AWS sẵn sàng chạy clone.
+
+```python
+from pathlib import Path
+from uuid import UUID
+
+from scripts.cloud.rejoin.host_ops import (
+    require_postgres_stopped,
+    run_host_command,
+    start_agentless_control_plane,
+)
+from scripts.cloud.rejoin.kubernetes_ops import (
+    apply_manifest,
+    restore_node_for_clone,
+    scale_workloads_to_zero,
+    wait_for_api,
+)
+from scripts.cloud.rejoin.lock_ops import rejoin_lock
+from scripts.cloud.rejoin.manifest_ops import render_manifests
+from scripts.cloud.rejoin.preflight import require_source_writer
+from scripts.cloud.rejoin.state_ops import load_state, save_state
+
+PROJECT_ROOT = Path(__file__).resolve().parents[3]
+NAMESPACE = "issues"
+AWS_NODE = "mcf-aws-primary"
+AZURE_WRITER_URL = "https://azure.mcf.todicode.tech/health/database"
+
+
+def prepare_aws(operation_id, operation_directory):
+    require_source_writer(AZURE_WRITER_URL)
+    run_host_command("systemctl", "start", "wg-quick@wg0")
+    addresses = run_host_command("ip", "-4", "-o", "addr", "show", "dev", "wg0")
+    if "10.200.29.1/32" not in addresses.split():
+        raise RuntimeError("Expected the AWS WireGuard address on this host.")
+
+    require_postgres_stopped()
+    start_agentless_control_plane(PROJECT_ROOT)
+    wait_for_api(NAMESPACE)
+    scale_workloads_to_zero(NAMESPACE)
+    paths, pvc_name = render_manifests(NAMESPACE, PROJECT_ROOT, operation_directory, operation_id)
+    apply_manifest(NAMESPACE, paths["pvc"])
+    apply_manifest(NAMESPACE, paths["postgres"])
+    restore_node_for_clone(NAMESPACE, AWS_NODE)
+    return pvc_name
+
+
+def run_aws_rejoin(operation_id):
+    operation_id = UUID(operation_id).hex
+    operation_directory = Path.home() / ".local" / "state" / "mcf-rejoin" / operation_id
+    state_path = operation_directory / "state.json"
+
+    with rejoin_lock():
+        state = load_state(state_path, operation_id)
+        if state["phase"] == "pending":
+            save_state(state_path, state)
+            pvc_name = prepare_aws(operation_id, operation_directory)
+            state.update(phase="prepared", pvc_name=pvc_name)
+            save_state(state_path, state)
+        elif state["phase"] != "prepared":
+            raise ValueError(f"Unknown rejoin phase: {state['phase']}")
+        return state
+```
+
+UUID chuẩn hóa ID controller gửi thành 32 ký tự hex để làm tên thư mục và hậu tố cho PVC cùng Job. Thư mục của lượt chứa state.json và ba manifest JSON. Lượt gọi lại với cùng ID sẽ mở đúng thư mục. rejoin_lock giữ khóa xuyên suốt lúc đọc tiến độ, sửa cluster và ghi lại tiến độ.
+
+prepare_aws xác nhận Azure đang nhận ghi và kiểm tra WireGuard trên host có địa chỉ AWS. Sau khi xác nhận PostgreSQL cũ đã dừng, hàm khởi động K3s agentless, đặt workload về 0, sinh manifest cùng PVC đích và khôi phục agent. Bước prepared được lưu khi node AWS đã Ready cho Job clone.
+
+State pending được ghi trước khi bắt đầu thay đổi host. Lỗi giữa lúc chuẩn bị giữ lại ID của lượt đang chạy. Khi thử lại, cùng ID sinh cùng tên resource. State prepared ghi nhận bước chuẩn bị đã xong ở lần trước. Bước chạy clone sẽ đối chiếu trạng thái node và PVC thực tế, vì một lần reboot có thể làm K3s dừng lại theo startup guard.
+
+Phần tiếp theo nối run_clone, start_standby, wait_for_streaming và restore_application vào worker dưới cùng khóa. Sau đó controller Azure sẽ gọi worker qua SSH trong luồng phục hồi.
+
+### 4.137. Nối clone và xác nhận WAL streaming vào worker AWS
+
+Trong scripts/cloud/rejoin/rejoin_aws.py, import thêm run_clone từ clone_ops, run_kubectl vào nhóm import kubernetes_ops và start_standby, wait_for_streaming từ postgres_ops.
+
+```python
+from scripts.cloud.rejoin.clone_ops import run_clone
+from scripts.cloud.rejoin.postgres_ops import start_standby, wait_for_streaming
+```
+
+Thêm các hằng số sau bên dưới AZURE_WRITER_URL. Xóa lời gọi require_source_writer ở đầu prepare_aws vì run_aws_rejoin sẽ gọi trước khi thực hiện hoặc tiếp tục lượt phục hồi.
+
+```python
+AZURE_WAL_HOST = "10.200.29.2"
+K3S_START_MARKER = Path("/run/issues-k3s-start-approved")
+POSTGRES_CONFIG = {"kubernetes_namespace": NAMESPACE, "postgres_pod": "postgres-0"}
+```
+
+Thay hàm run_aws_rejoin bằng phiên bản dưới đây.
+
+```python
+def run_aws_rejoin(operation_id):
+    operation_id = UUID(operation_id).hex
+    operation_directory = Path.home() / ".local" / "state" / "mcf-rejoin" / operation_id
+    state_path = operation_directory / "state.json"
+
+    with rejoin_lock():
+        state = load_state(state_path, operation_id)
+        phase = state["phase"]
+        if phase == "standby_streaming":
+            return state
+        if phase not in ("pending", "prepared", "clone_complete"):
+            raise ValueError(f"Unknown rejoin phase: {phase}")
+
+        require_source_writer(AZURE_WRITER_URL)
+        if phase == "pending":
+            save_state(state_path, state)
+            pvc_name = prepare_aws(operation_id, operation_directory)
+            state.update(phase="prepared", pvc_name=pvc_name)
+            save_state(state_path, state)
+        elif not K3S_START_MARKER.is_file():
+            pvc_name = prepare_aws(operation_id, operation_directory)
+            if pvc_name != state["pvc_name"]:
+                raise RuntimeError("Rejoin PVC changed while resuming the operation.")
+        else:
+            wait_for_api(NAMESPACE)
+            run_kubectl(
+                NAMESPACE, "wait", "--for=condition=Ready", f"node/{AWS_NODE}",
+                "--timeout=180s", timeout=210,
+            )
+
+        pvc_name = state["pvc_name"]
+        if state["phase"] == "prepared":
+            run_kubectl(NAMESPACE, "get", f"pvc/{pvc_name}", "-o", "name")
+            job_name = run_clone(NAMESPACE, operation_directory / "clone.json", pvc_name)
+            state.update(phase="clone_complete", job_name=job_name)
+            save_state(state_path, state)
+
+        start_standby(POSTGRES_CONFIG, pvc_name)
+        replication = wait_for_streaming(POSTGRES_CONFIG, AZURE_WAL_HOST)
+        state.update(phase="standby_streaming", replication=replication)
+        save_state(state_path, state)
+        return state
+```
+
+State prepared giữ tên PVC sau khi node đã sẵn sàng. Nếu kết nối gián đoạn trước khi lưu clone_complete, lần gọi lại với cùng operation_id dùng lại manifest và tên Job. run_clone kiểm tra trạng thái Job hiện có. Nếu clone_complete đã được lưu, worker tiếp tục từ bước khởi động PostgreSQL.
+
+Khi tiếp tục một lượt dang dở, startup marker cho biết boot hiện tại đã được phê duyệt. Nếu marker mất sau reboot, chuẩn bị lại với cùng PVC và operation_id. Nếu marker còn, chờ API cùng node Ready rồi tiếp tục. Hàm save_state chỉ cập nhật standby_streaming sau khi PostgreSQL là standby và receiver nối đúng 10.200.29.2:5432. Đây là kết quả của bước rejoin database tại thời điểm kiểm tra, còn failback cần xác minh trực tiếp WAL replay trước khi chuyển writer.
+
+Bước tiếp theo nối restore_application và kết quả worker cho controller Azure. Code trong mục này tiếp tục được nhập trên laptop để triển khai cùng worker hoàn chỉnh.
+
+### 4.138. Khôi phục web AWS và lưu kết quả rejoin
+
+Trong scripts/cloud/rejoin/rejoin_aws.py, thêm import và URL origin AWS cùng nhóm import và hằng số hiện có.
+
+```python
+from scripts.cloud.rejoin.app_ops import restore_application
+```
+
+```python
+AWS_WRITER_URL = "https://aws.mcf.todicode.tech/health/database"
+```
+
+Trong prepare_aws, gỡ dòng require_source_writer(AZURE_WRITER_URL) nếu còn. run_aws_rejoin đã gọi hàm đó trước khi chuẩn bị hoặc tiếp tục lượt phục hồi.
+
+Trong run_aws_rejoin, cập nhật đoạn kiểm tra phase ngay sau load_state.
+
+```python
+        phase = state["phase"]
+        if phase == "complete":
+            return state
+        if phase not in ("pending", "prepared", "clone_complete", "standby_streaming"):
+            raise ValueError(f"Unknown rejoin phase: {phase}")
+```
+
+Thay khối cuối hàm, bắt đầu từ start_standby, bằng đoạn sau. Giữ đoạn bên trong with rejoin_lock().
+
+```python
+        start_standby(POSTGRES_CONFIG, pvc_name)
+        replication = wait_for_streaming(POSTGRES_CONFIG, AZURE_WAL_HOST)
+        state.update(phase="standby_streaming", replication=replication)
+        save_state(state_path, state)
+
+        application = restore_application(NAMESPACE, AWS_WRITER_URL)
+        state.update(phase="complete", application=application)
+        save_state(state_path, state)
+        return state
+```
+
+restore_application scale Deployment issues-app lên 1 replica, chờ rollout và gọi HTTPS vào origin AWS. Hàm yêu cầu HTTP 503 kèm role standby, connected true, writable false và replication_connected true. HTTP 503 ở endpoint này cho Route 53 biết AWS chưa phải writer. AWS vẫn phục vụ đọc khi ứng dụng kết nối được database.
+
+Nếu web chưa sẵn sàng, worker giữ phase standby_streaming. Lần gọi lại cùng operation_id bỏ qua Job clone, đối chiếu PostgreSQL đang streaming rồi thử khôi phục web. Phase complete xác nhận bước rejoin đã thành công tại thời điểm ghi state. Controller Azure sẽ đọc lại trạng thái thực tế và kiểm tra WAL trước khi quyết định failback.
+
+Bước tiếp theo là thêm điểm vào cho controller Azure gọi worker qua SSH và nhận kết quả dạng JSON.
+
 ## 5. Theo dõi tiến độ
 
 - [x] Nghiệm thu giai đoạn 6 và xác định phạm vi giai đoạn 7.
@@ -4707,6 +5937,14 @@ Checkpoint là DNS chọn Azure và API hostname chung ghi, đọc được dữ
 - [x] Ghi bản ghi seq 1 trước sự cố và đọc được qua origin Azure standby.
 - [x] Mô phỏng mất khả dụng EC2 AWS và đối chiếu watcher tự xác nhận fencing, promote Azure, xác minh writer.
 - [x] Đối chiếu DNS chọn Azure, ghi seq 2 và đọc seq 1/2 qua hostname chung sau failover tự động.
+- [x] Bật lại hai host sau lần nghỉ, xác nhận AWS running và hai status checks ok, Azure running.
+- [x] Khôi phục K3s Azure sau boot và đối chiếu PostgreSQL primary, cờ ghi ứng dụng.
+- [x] Đồng bộ runtime scripts/cloud/failover lên Azure, cài unit mới và chạy observe khi phục hồi.
+- [x] Dọn năm module Python cũ ở cấp scripts/cloud trong runtime Azure sau khi đối chiếu ExecStart mới.
+- [x] Khởi động K3s AWS agentless sau failover tự động, đối chiếu API ready và PostgreSQL cũ dừng trước rejoin.
+- [x] Đặt workload AWS replicas 0 và tạo postgres-data-rejoin-aws-02 cho lượt rejoin sau failover tự động.
+- [ ] Cập nhật StatefulSet AWS replicas 0 và Job clone 02 cùng tham chiếu postgres-data-rejoin-aws-02.
+- [ ] Dọn Pod object cũ sau khi xác nhận replicas 0 và PostgreSQL dừng, khôi phục agent AWS và node Ready.
 
 ## 6. Tài liệu kỹ thuật
 

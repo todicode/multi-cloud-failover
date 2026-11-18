@@ -108,7 +108,7 @@ The [accepted CI run](https://github.com/todicode/multi-cloud-failover/actions/r
 ## Scripts
 
 - [scripts/local/](scripts/local/) contains the Docker Compose recovery lab, local watcher, lifecycle checks, and PowerShell helpers.
-- [scripts/cloud/](scripts/cloud/) is the location for cloud watcher scripts developed through the Stage 7 guide.
+- [scripts/cloud/](scripts/cloud/) groups recovery workflows into [failover/](scripts/cloud/failover/), [rejoin/](scripts/cloud/rejoin/), and [failback/](scripts/cloud/failback/). The failover package contains the deployed watcher. Rejoin and failback packages are prepared for the next implementation steps.
 - [probe_failover.py](scripts/probe_failover.py), [seed_demo.py](scripts/seed_demo.py), and [watcher_core.py](scripts/watcher_core.py) provide shared HTTP tools and watcher decision logic.
 
 ## Documentation

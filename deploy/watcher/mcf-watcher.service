@@ -8,7 +8,7 @@ Type=exec
 User=azureuser
 WorkingDirectory=/home/azureuser/mcf-watcher
 Environment=HOME=/home/azureuser
-ExecStart=/home/azureuser/mcf-watcher/.venv/bin/python -u /home/azureuser/mcf-watcher/scripts/cloud/cloud_watcher.py
+ExecStart=/home/azureuser/mcf-watcher/.venv/bin/python -u /home/azureuser/mcf-watcher/scripts/cloud/failover/cloud_watcher.py
 Restart=no
 
 [Install]

@@ -1,6 +1,6 @@
-from scripts.cloud.aws_ops import fence_instance
-from scripts.cloud.postgres_ops import preflight_standby, promote_standby
-from scripts.cloud.checks import wait_for_writer
+from scripts.cloud.failover.aws_ops import fence_instance
+from scripts.cloud.failover.postgres_ops import preflight_standby, promote_standby
+from scripts.cloud.failover.checks import wait_for_writer
 
 def prepare_failover(config, ec2):
     print("failover_step=preflight_standby")

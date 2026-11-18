@@ -5,7 +5,7 @@ metadata:
   namespace: issues
 spec:
   serviceName: postgres-headless
-  replicas: 1
+  replicas: 0
   selector:
     matchLabels:
       app: postgres
@@ -62,7 +62,7 @@ spec:
       volumes:
         - name: data
           persistentVolumeClaim:
-            claimName: postgres-data-rejoin-aws-01
+            claimName: postgres-data-rejoin-aws-02
         - name: config
           configMap:
             name: postgres-config

@@ -6,18 +6,18 @@ from pathlib import Path
 from botocore.exceptions import BotoCoreError, ClientError
 import subprocess
 
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
+PROJECT_ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(PROJECT_ROOT))
-from scripts.cloud.aws_ops import create_aws_clients, read_instance_state
-from scripts.cloud.failover_ops import run_failover
+from scripts.cloud.failover.aws_ops import create_aws_clients, read_instance_state
+from scripts.cloud.failover.failover_ops import run_failover
 
-from scripts.cloud.checks import (
+from scripts.cloud.failover.checks import (
     classify_probe,
     classify_route53,
     classify_route53_report,
     probe_writer,
 )
-from scripts.cloud.postgres_ops import read_postgres_status
+from scripts.cloud.failover.postgres_ops import read_postgres_status
 
 CONFIG_PATH = PROJECT_ROOT / "deploy" / "watcher" / "config.json"
 

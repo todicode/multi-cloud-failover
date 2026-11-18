@@ -67,6 +67,7 @@ The Azure-hosted systemd watcher completed an automatic failover exercise on 202
 | Observability | Monitoring outside the application environments | Origin/writer availability, latency, and replication signals |
 | Cloud recovery | Manual failover, rejoin, and controlled failback | A single writer throughout; verified data after both transitions |
 | Automatic failover | Azure-hosted systemd watcher | EC2-loss exercise passed with confirmed stopped state, Azure promotion, DNS selection, and pre/post-failover API data |
+| Automatic recovery cycle | Azure-hosted controller for failover, rejoin, failback, and standby restoration | In progress. Target acceptance covers automatic EC2 startup, a configurable observation period, WAL replay, Azure database fencing, and restoration to AWS writer with Azure standby |
 | Evaluation | Repeated failure exercises and operational analysis | Raw measurements for downtime, latency, errors, data loss, and cost |
 
 ## Evaluation goals
