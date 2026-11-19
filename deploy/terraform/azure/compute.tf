@@ -2,7 +2,7 @@ resource "azurerm_linux_virtual_machine" "standby" {
   name                            = "mcf-azure-standby"
   location                        = azurerm_resource_group.standby.location
   resource_group_name             = azurerm_resource_group.standby.name
-  size                            = "Standard_B2als_v2"
+  size                            = "Standard_B2ls_v2"
   zone                            = "1"
   admin_username                  = "azureuser"
   disable_password_authentication = true
