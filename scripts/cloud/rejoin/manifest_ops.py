@@ -4,16 +4,16 @@ from pathlib import Path
 from scripts.cloud.rejoin.kubernetes_ops import read_manifest
 
 
-def render_manifests(namespace, project_root, output_directory, operation_id):
+def render_manifests(namespace, project_root, output_directory, operation_id, cloud="aws"):
     templates = Path(project_root) / "deploy/kubernetes/database"
-    pvc = read_manifest(namespace, templates / "postgres-pvc-rejoin-aws.yaml")
-    postgres = read_manifest(namespace, templates / "postgres-aws.yaml")
-    clone = read_manifest(namespace, templates / "postgres-clone-rejoin-aws.yaml")
+    pvc = read_manifest(namespace, templates / f"postgres-pvc-rejoin-{cloud}.yaml")
+    postgres = read_manifest(namespace, templates / f"postgres-{cloud}.yaml")
+    clone = read_manifest(namespace, templates / f"postgres-clone-rejoin-{cloud}.yaml")
 
-    pvc_name = f"postgres-data-rejoin-aws-{operation_id}"
+    pvc_name = f"postgres-data-rejoin-{cloud}-{operation_id}"
     pvc["metadata"]["name"] = pvc_name
     postgres["spec"]["replicas"] = 0
-    clone["metadata"]["name"] = f"postgres-clone-rejoin-aws-{operation_id}"
+    clone["metadata"]["name"] = f"postgres-clone-rejoin-{cloud}-{operation_id}"
 
     for workload in (postgres, clone):
         volumes = workload["spec"]["template"]["spec"]["volumes"]

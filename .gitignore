@@ -42,6 +42,7 @@ coverage/
 .local-replication/
 # Local deployment notes
 docs/*.local.md
+deploy/watcher/config.local.json
 tmp/
 
 # Experiment output: retain a documented sample only when intentionally committed.

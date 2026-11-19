@@ -8,7 +8,7 @@ def run_postgres_sql(config, sql, timeout=20):
         "exec", config["postgres_pod"], "--",
         "psql", "-X", "-v", "ON_ERROR_STOP=1",
         "-U", "taskflow", "-d", "taskflow",
-        "-At", "-c", sql,
+        "-qAt", "-c", sql,
     ]
     result = subprocess.run(
         command,
@@ -24,7 +24,10 @@ def read_postgres_status(config):
         'in_recovery', pg_is_in_recovery(),
         'read_only', current_setting('transaction_read_only'),
         'receive_lsn', pg_last_wal_receive_lsn()::text,
-        'replay_lsn', pg_last_wal_replay_lsn()::text
+        'replay_lsn', pg_last_wal_replay_lsn()::text,
+        'writes_enabled', (SELECT writes_enabled FROM app_control WHERE singleton),
+        'sender_host', (SELECT sender_host FROM pg_stat_wal_receiver WHERE status = 'streaming'),
+        'sender_port', (SELECT sender_port FROM pg_stat_wal_receiver WHERE status = 'streaming')
     );"""
     status = json.loads(run_postgres_sql(config, sql))
     if not isinstance(status, dict):

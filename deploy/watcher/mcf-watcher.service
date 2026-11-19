@@ -9,7 +9,10 @@ User=azureuser
 WorkingDirectory=/home/azureuser/mcf-watcher
 Environment=HOME=/home/azureuser
 ExecStart=/home/azureuser/mcf-watcher/.venv/bin/python -u /home/azureuser/mcf-watcher/scripts/cloud/failover/cloud_watcher.py
-Restart=no
+Environment=MCF_WATCHER_CONFIG=/home/azureuser/mcf-watcher/deploy/watcher/config.local.json
+Restart=on-failure
+RestartSec=10s
+RestartPreventExitStatus=78
 
 [Install]
 WantedBy=multi-user.target

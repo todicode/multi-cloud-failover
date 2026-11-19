@@ -47,3 +47,18 @@ def fence_instance(ec2, instance_id):
         WaiterConfig={"Delay": 5, "MaxAttempts": 60},
     )
     return "stopped"
+
+
+def start_instance(ec2, instance_id):
+    state = read_instance_state(ec2, instance_id)
+    if state == "stopped":
+        ec2.start_instances(InstanceIds=[instance_id])
+    elif state == "running":
+        return
+    elif state != "pending":
+        raise RuntimeError(f"Cannot start EC2 instance in state {state}.")
+
+    ec2.get_waiter("instance_running").wait(
+        InstanceIds=[instance_id],
+        WaiterConfig={"Delay": 5, "MaxAttempts": 60},
+    )

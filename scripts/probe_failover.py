@@ -71,7 +71,9 @@ def summarize(rows, base, run_id):
     summary["served_by"] = sorted({r["served_by"] for r in rows if r["served_by"]})
     acked = {r["seq"] for r in rows if r["write_status"] == 200}
     try:
-        stored = {p["seq"] for p in httpx.get(f"{base}/api/ping/{run_id}", timeout=5).json()["pings"]}
+        response = httpx.get(f"{base}/api/ping/{run_id}", timeout=5, trust_env=False)
+        response.raise_for_status()
+        stored = {p["seq"] for p in response.json()["pings"]}
         lost = sorted(acked - stored)
         summary["lost_writes"] = {"acknowledged": len(acked), "missing_after_run": len(lost), "seqs": lost}
     except (httpx.HTTPError, KeyError, ValueError) as error:
@@ -85,14 +87,22 @@ def main():
     parser.add_argument("--interval", type=float, default=1.0, help="seconds between ticks")
     parser.add_argument("--duration", type=float, default=120, help="total seconds; Ctrl+C ends early")
     parser.add_argument("--timeout", type=float, default=3.0, help="per-request timeout in seconds")
+    parser.add_argument(
+        "--fresh-connections", action="store_true",
+        help="open a new connection for each request to observe DNS failover",
+    )
     parser.add_argument("--run-id", default="run-" + uuid4().hex[:8])
     parser.add_argument("--out", default="probe.csv")
     args = parser.parse_args()
     base = args.url.rstrip("/")
     rows, seq, end = [], 0, time.monotonic() + args.duration
-    print(f"run_id={args.run_id} url={base}; Ctrl+C to stop early")
+    connection_mode = "fresh" if args.fresh_connections else "pooled"
+    print(f"run_id={args.run_id} url={base} connection_mode={connection_mode}; Ctrl+C to stop early")
+    client_options = {"timeout": args.timeout, "trust_env": False}
+    if args.fresh_connections:
+        client_options["limits"] = httpx.Limits(max_keepalive_connections=0)
     try:
-        with httpx.Client(timeout=args.timeout, trust_env=False) as client:
+        with httpx.Client(**client_options) as client:
             while time.monotonic() < end:
                 started = time.monotonic()
                 rows.append(tick(client, base, args.run_id, seq))
@@ -109,6 +119,7 @@ def main():
         writer.writeheader()
         writer.writerows(rows)
     summary = summarize(rows, base, args.run_id)
+    summary["connection_mode"] = connection_mode
     Path(args.out).with_suffix(".summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
     print(json.dumps(summary, indent=2))
 

@@ -2,6 +2,11 @@ import json
 import os
 from pathlib import Path
 from tempfile import NamedTemporaryFile
+from uuid import UUID
+
+
+def rejoin_directory(operation_id):
+    return Path.home() / ".local" / "state" / "mcf-rejoin" / UUID(operation_id).hex
 
 
 def load_state(state_path, operation_id):
@@ -32,5 +37,11 @@ def save_state(state_path, state):
             temporary.flush()
             os.fsync(temporary.fileno())
         os.replace(temporary_path, state_path)
+        if hasattr(os, "O_DIRECTORY"):
+            directory_fd = os.open(state_path.parent, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
     finally:
         temporary_path.unlink(missing_ok=True)

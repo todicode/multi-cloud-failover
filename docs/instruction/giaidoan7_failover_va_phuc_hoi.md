@@ -5802,7 +5802,328 @@ Nếu web chưa sẵn sàng, worker giữ phase standby_streaming. Lần gọi l
 
 Bước tiếp theo là thêm điểm vào cho controller Azure gọi worker qua SSH và nhận kết quả dạng JSON.
 
+### 4.139. Tạo điểm vào cho controller gọi worker AWS
+
+Tạo scripts/cloud/rejoin/worker_cli.py trên laptop. Khi gọi module này trên Ubuntu AWS, controller truyền operation_id và đọc một dòng JSON trên stdout. Hàm run_aws_rejoin vẫn chịu trách nhiệm thực hiện và lưu tiến độ phục hồi.
+
+```python
+import argparse
+import json
+import subprocess
+
+from scripts.cloud.rejoin.clone_ops import CloneJobFailed
+from scripts.cloud.rejoin.lock_ops import RejoinBusy
+from scripts.cloud.rejoin.rejoin_aws import run_aws_rejoin
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Rejoin AWS as a PostgreSQL standby.")
+    parser.add_argument("operation_id")
+    args = parser.parse_args()
+
+    try:
+        state = run_aws_rejoin(args.operation_id)
+    except RejoinBusy as error:
+        print(json.dumps({"status": "busy", "error": str(error)}))
+        return 75
+    except CloneJobFailed as error:
+        print(json.dumps({"status": "clone_failed", "error": str(error)}))
+        return 3
+    except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as error:
+        print(json.dumps({"status": "error", "error": str(error)}))
+        return 1
+
+    print(json.dumps({"status": "ok", "state": state}))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+```
+
+Controller sẽ gọi python -m scripts.cloud.rejoin.worker_cli với operation_id đã lưu. Khi nhận ok, controller đối chiếu operation_id và phase complete trong state. Khi nhận busy, controller chờ rồi có thể gọi lại cùng ID. clone_failed xác nhận Kubernetes đã đánh dấu Job thất bại, giúp controller tránh gọi lặp cùng Job. error báo một lỗi thực thi cần đối chiếu theo trạng thái hiện tại. Lỗi kết nối SSH được xử lý ở phía controller vì có thể xảy ra trước hoặc sau khi worker bắt đầu chạy.
+
+Các mã 0, 75, 3 và 1 tương ứng với bốn trạng thái trên. Dòng JSON là kết quả để controller xử lý, còn lỗi phân tích đối số của argparse được đưa ra stderr. Bước tiếp theo xây dựng phần gọi SSH trên Azure và đối chiếu kết quả này.
+
+### 4.140. Controller Azure gọi worker AWS qua SSH
+
+Tạo scripts/cloud/rejoin/ssh_client.py trên laptop. Module này sẽ chạy trong controller trên Azure. Alias SSH mcf-aws-rejoin sẽ trỏ tới ubuntu tại địa chỉ WireGuard AWS 10.200.29.1. Bước cấu hình tiếp theo sẽ cấp key riêng cho controller và giới hạn key đó ở lệnh gọi worker. Đối số gửi qua SSH là operation_id ở dạng UUID hex.
+
+```python
+import json
+import subprocess
+from uuid import UUID
+
+
+class RejoinTransportError(RuntimeError):
+    """SSH did not provide a confirmed worker result."""
+
+
+def call_aws_rejoin(operation_id, timeout=2400):
+    operation_id = UUID(operation_id).hex
+    command = [
+        "ssh", "-T",
+        "-o", "BatchMode=yes",
+        "-o", "StrictHostKeyChecking=yes",
+        "-o", "ConnectTimeout=10",
+        "-o", "ServerAliveInterval=15",
+        "-o", "ServerAliveCountMax=3",
+        "mcf-aws-rejoin", operation_id,
+    ]
+    try:
+        process = subprocess.run(
+            command,
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired as error:
+        raise RejoinTransportError("SSH timed out while waiting for the AWS worker.") from error
+
+    if process.returncode == 255:
+        raise RejoinTransportError(f"SSH failed: {process.stderr.strip()}")
+
+    try:
+        result = json.loads(process.stdout)
+    except json.JSONDecodeError as error:
+        raise RuntimeError("AWS worker did not return valid JSON.") from error
+
+    expected_status = {0: "ok", 75: "busy", 3: "clone_failed", 1: "error"}.get(process.returncode)
+    if expected_status is None or not isinstance(result, dict) or result.get("status") != expected_status:
+        raise RuntimeError(f"Unexpected AWS worker response for exit code {process.returncode}.")
+    if expected_status == "ok":
+        state = result.get("state")
+        if not isinstance(state, dict) or state.get("operation_id") != operation_id or state.get("phase") != "complete":
+            raise RuntimeError("AWS worker did not complete the requested rejoin operation.")
+    return result
+```
+
+BatchMode và -T cho phép chạy dưới systemd trong chế độ không tương tác. StrictHostKeyChecking yêu cầu host key AWS đã được xác minh và lưu trước khi kết nối. ConnectTimeout giới hạn thời gian thiết lập kết nối, còn timeout của subprocess giới hạn tổng thời gian chờ một lần gọi worker. [OpenSSH client options](https://man.openbsd.org/ssh_config).
+
+SSH có thể mất kết nối lúc worker đã bắt đầu làm việc. RejoinTransportError báo kết quả chưa xác định để controller đánh giá và thử lại bằng đúng operation_id đã lưu. OpenSSH dùng mã 255 cho lỗi SSH. Các mã còn lại được đối chiếu với JSON của worker. Controller chỉ chấp nhận ok khi phase complete và ID cùng lượt. [OpenSSH exit status](https://man.openbsd.org/ssh#EXIT_STATUS).
+
+Bước tiếp theo cấu hình alias trên Azure, key và lệnh cố định trên AWS. Khi nối vào controller, hàm này sẽ được gọi sau khi EC2 đã được khởi động và sẵn sàng qua WireGuard.
+
+### 4.141. Cấu hình kết nối SSH cho controller Azure
+
+Nếu dòng cuối scripts/cloud/rejoin/ssh_client.py có ba dấu backtick từ khối Markdown, xóa dòng đó. Dòng cuối của module là return result.
+
+Các bước sau là cấu hình một lần khi hai VM có thể truy cập. Trong lượt failover thực tế, controller tự sử dụng cấu hình này để gọi worker.
+
+Trên Azure, chạy bằng tài khoản azureuser mà systemd dùng cho controller. Tạo key SSH riêng cho kết nối này và lấy public key.
+
+```bash
+install -d -m 700 ~/.ssh
+if [ ! -e ~/.ssh/id_mcf_aws_rejoin ]; then
+    ssh-keygen -t ed25519 -N '' -f ~/.ssh/id_mcf_aws_rejoin -C mcf-azure-rejoin
+fi
+cat ~/.ssh/id_mcf_aws_rejoin.pub
+```
+
+Private key nằm trong home của tài khoản controller trên Azure. Chép public key vào một dòng mới trong ~/.ssh/authorized_keys của ubuntu trên AWS theo mẫu dưới đây. Thay AZURE_KEY_BASE64 bằng trường thứ hai của public key vừa in, giữ nguyên các tùy chọn và dấu escape trong dòng.
+
+```text
+restrict,from="10.200.29.2",command="cd /home/ubuntu/mcf-rejoin && exec .venv/bin/python -m scripts.cloud.rejoin.worker_cli -- \"$SSH_ORIGINAL_COMMAND\"" ssh-ed25519 AZURE_KEY_BASE64 mcf-azure-rejoin
+```
+
+Đường dẫn /home/ubuntu/mcf-rejoin là thư mục sẽ dùng để triển khai worker và virtual environment .venv trên AWS. from giới hạn nguồn ở IP WireGuard của Azure. restrict vô hiệu hóa PTY, forwarding và user RC cho key này. command cố định chương trình được phép chạy. SSH_ORIGINAL_COMMAND được truyền vào Python như một đối số duy nhất sau dấu --. worker_cli nhận đối số này, rồi run_aws_rejoin xác thực và chuẩn hóa UUID. [OpenSSH authorized_keys](https://man.openbsd.org/sshd#AUTHORIZED_KEYS_FILE_FORMAT).
+
+Trên Azure, thêm khối sau vào ~/.ssh/config của azureuser.
+
+```sshconfig
+Host mcf-aws-rejoin
+    HostName 10.200.29.1
+    User ubuntu
+    IdentityFile ~/.ssh/id_mcf_aws_rejoin
+    IdentitiesOnly yes
+    UserKnownHostsFile ~/.ssh/known_hosts_mcf_aws_rejoin
+```
+
+Từ phiên SSH quản trị đã xác thực trên AWS, lấy hai trường loại key và nội dung public host key trong /etc/ssh/ssh_host_ed25519_key.pub. Dùng hai trường đó để tạo một dòng trong ~/.ssh/known_hosts_mcf_aws_rejoin trên Azure. Đặt quyền 600 cho file config và file known_hosts của controller.
+
+```text
+10.200.29.1 ssh-ed25519 AWS_HOST_KEY_BASE64
+```
+
+Hai public key có mục đích riêng. authorized_keys trên AWS xác thực controller Azure. known_hosts trên Azure xác thực máy AWS mà controller kết nối. Lệnh cố định chuyển nguyên request vào worker, nơi UUID, tên thao tác và LSN được kiểm tra. Worker nhận UUID để rejoin, `status UUID` để đọc trạng thái và `promote UUID LSN` để thực hiện promote của lượt failback.
+
+<a id="stage7-automatic-acceptance"></a>
+
+### 4.142. Cài đặt controller và worker cho luồng tự động hoàn chỉnh
+
+- [Toàn bộ vòng chuyển đổi tự động](../../images/failover-automation/01-toan-bo-vong-chuyen-doi.png)
+- [Failover tự động từ AWS sang Azure](../../images/failover-automation/01b-failover-aws-sang-azure.png)
+- [Worker tự động rejoin AWS](../../images/failover-automation/02-rejoin-aws.png)
+- [Failback tự động và cờ ghi](../../images/failover-automation/03-failback-va-co-ghi.png)
+
+| Checkpoint | Việc controller tự thực hiện |
+|---|---|
+| `failover_pending → azure_ready` | Phát hiện lỗi qua HTTPS và Route 53, xác nhận EC2 đã dừng, promote Azure và kiểm tra Azure nhận ghi. |
+| `rejoin_aws → wait_failback` | Ghi một probe qua tên miền chung trên Azure, bật EC2 và clone dữ liệu Azure vào PVC mới trên AWS. AWS trở thành standby. |
+| `drain_azure → fence_azure` | Đợi đủ 300 giây từ lần ghi đã được xác nhận qua tên miền chung và xác minh AWS vẫn stream. Khóa và dừng ghi ứng dụng trên Azure, lấy LSN đã flush và đợi AWS replay qua mốc đó. |
+| `promote_aws → aws_ready` | Giữ VM và K3s Azure chạy, đợi PostgreSQL Azure về 0 replica và xác minh process cùng cổng 5432 đã dừng. Promote AWS trên đúng PVC đã rejoin, mở ghi rồi xác nhận tên miền chung chuyển về AWS. |
+| `rejoin_azure → complete` | Clone từ AWS vào PVC mới ở Azure, xác nhận Azure stream và đọc được cả probe ghi trên Azure lẫn probe ghi trên AWS. Watcher quay lại quan sát. |
+
+**Từ máy Windows, ở Git Bash trong repo.** Soát Terraform plan cho quyền mới. Trong hạ tầng đã đồng bộ, thay đổi dự kiến là thêm policy `watcher_start` giới hạn đúng EC2 của đồ án. Kiểm tra plan trước khi apply.
+
+```bash
+terraform -chdir=deploy/terraform/aws plan -out=stage7-controller.tfplan
+terraform -chdir=deploy/terraform/aws apply stage7-controller.tfplan
+```
+
+Tạo gói từ working tree để hai host dùng cùng mã. Gói này chỉ lấy các thư mục recovery, manifests và cấu hình mẫu cần thiết.
+
+```bash
+mkdir -p tmp
+tar --exclude=__pycache__ -czf tmp/mcf-stage7.tar.gz \
+  scripts/cloud deploy/k3s/rejoin-control-plane.yaml deploy/kubernetes/database \
+  deploy/watcher/config.json deploy/watcher/requirements.txt deploy/watcher/mcf-watcher.service
+```
+
+Nếu hai máy đang tắt, bật Azure trước và chạy `sudo systemctl stop mcf-watcher` qua SSH. Sau đó bật EC2 để cài worker. Trong topology Azure primary, giữ startup guard trên AWS và xác nhận PostgreSQL trên AWS vẫn dừng. Dùng `sudo ss -H -ltn 'sport = :5432'` trên AWS để kiểm tra. Bật lại ứng dụng Azure theo mục 4.114 khi AWS đã được giữ fenced. Nếu hệ thống đã khởi động ở topology AWS primary, giữ vai trò đang chạy.
+
+```bash
+AZURE_VM_ID=$(terraform -chdir=deploy/terraform/azure output -raw azure_vm_id)
+MSYS_NO_PATHCONV=1 az vm start --ids "$AZURE_VM_ID"
+```
+
+Chạy phần sau sau khi đã dừng watcher cũ trên Azure.
+
+```bash
+AWS_INSTANCE_ID=$(terraform -chdir=deploy/terraform/aws output -raw aws_instance_id)
+aws ec2 start-instances --profile default --region ap-southeast-1 --instance-ids "$AWS_INSTANCE_ID"
+aws ec2 wait instance-running --profile default --region ap-southeast-1 --instance-ids "$AWS_INSTANCE_ID"
+AWS_IP=$(terraform -chdir=deploy/terraform/aws output -raw aws_public_ip)
+AZURE_IP=$(terraform -chdir=deploy/terraform/azure output -raw azure_public_ip)
+scp -i ~/.ssh/mcf-lab tmp/mcf-stage7.tar.gz "ubuntu@$AWS_IP:/home/ubuntu/"
+scp -i ~/.ssh/mcf-lab tmp/mcf-stage7.tar.gz "azureuser@$AZURE_IP:/home/azureuser/"
+```
+
+**Trên AWS, bằng user `ubuntu`.** Dùng đúng đường dẫn đã khai báo trong forced command ở 4.141.
+
+```bash
+mkdir -p ~/mcf-rejoin
+tar -xzf ~/mcf-stage7.tar.gz -C ~/mcf-rejoin
+cd ~/mcf-rejoin
+python3 -m venv .venv
+.venv/bin/pip install -r deploy/watcher/requirements.txt
+sudo systemctl cat k3s | grep -F /run/issues-k3s-start-approved
+sudo systemctl is-enabled wg-quick@wg0
+sudo -n k3s kubectl version --client
+```
+
+Kiểm tra dòng `ExecStartPre` thực sự yêu cầu marker trên AWS và WireGuard tự khởi động. Worker cần SSH qua WireGuard trước khi được phép mở K3s. Nếu chưa có module `venv`, cài `python3-venv` trên host rồi chạy lại phần cài gói.
+
+**Trên Azure, bằng user `azureuser`.** Cài cùng mã và bật hai cờ trong file cấu hình riêng của service. Kiểm tra các giá trị instance ID, health check ID, hostname và AWS profile nếu môi trường vừa được tạo lại.
+
+```bash
+sudo systemctl stop mcf-watcher
+mkdir -p ~/mcf-watcher
+tar -xzf ~/mcf-stage7.tar.gz -C ~/mcf-watcher
+cd ~/mcf-watcher
+python3 -m venv .venv
+.venv/bin/pip install -r deploy/watcher/requirements.txt
+
+.venv/bin/python - <<'PY'
+import json
+from pathlib import Path
+
+source = Path("deploy/watcher/config.json")
+config = json.loads(source.read_text())
+config.update(enable_auto_failover=True, enable_auto_recovery=True)
+source.with_name("config.local.json").write_text(json.dumps(config, indent=2) + "\n")
+PY
+
+sudo install -m 644 deploy/watcher/mcf-watcher.service /etc/systemd/system/mcf-watcher.service
+sudo systemctl daemon-reload
+ssh -T -o BatchMode=yes -o StrictHostKeyChecking=yes mcf-aws-rejoin \
+  'status 00000000000000000000000000000000'
+```
+
+Lệnh SSH cuối phải trả JSON `status=error` với thông báo chưa có PVC rejoin hoàn tất cho ID đó. Exit code 1 ở đây là dự kiến. Nó xác minh kết nối, forced command và bản worker mới bằng một yêu cầu chỉ đọc. Nếu SSH trả 255, kiểm tra key, host key và WireGuard theo 4.141.
+
+### 4.143. Phục hồi topology hiện tại trước khi diễn tập
+
+Nếu hệ thống đã có AWS primary và Azure standby stream từ AWS, khởi động service và đi thẳng sang 4.144. Nếu đang ở cuối lượt failover cũ với **Azure là writer**, dừng EC2 và chờ AWS báo `stopped` sau khi cài worker. Trên Azure chạy bước nhập trạng thái một lần. Lệnh yêu cầu EC2 đã dừng, PostgreSQL Azure là primary đang mở ghi và origin Azure trả writer health thành công.
+
+```bash
+# Git Bash trên Windows, sau khi đã kiểm tra kết nối worker.
+AWS_INSTANCE_ID=$(terraform -chdir=deploy/terraform/aws output -raw aws_instance_id)
+aws ec2 stop-instances --profile default --region ap-southeast-1 --instance-ids "$AWS_INSTANCE_ID"
+aws ec2 wait instance-stopped --profile default --region ap-southeast-1 --instance-ids "$AWS_INSTANCE_ID"
+```
+
+```bash
+cd ~/mcf-watcher
+.venv/bin/python -m scripts.cloud.failover.cloud_watcher \
+  --config deploy/watcher/config.local.json --adopt-azure-primary
+sudo systemctl enable --now mcf-watcher
+sudo journalctl -fu mcf-watcher
+```
+
+Chờ `recovery_phase=complete`. Từ Azure writer hiện có, controller sẽ tự rejoin AWS, failback và rejoin Azure. Lượt này chuẩn bị lại topology ban đầu cho bài nghiệm thu đầy đủ. Nếu journal đã có một lượt đang chạy, khởi động service để tiếp tục checkpoint đó. File trạng thái của Azure nằm ở `~/.local/state/mcf-controller/state.json`.
+
+### 4.144. Nghiệm thu từ failover tới failback trên hai cloud
+
+1. Bắt đầu khi shared HTTPS trả về AWS, AWS writer health là HTTP 200 và Azure writer health là HTTP 503 với `role=standby`, `replication_connected=true`. Trên Azure chạy `sudo systemctl is-active mcf-watcher` và mở `sudo journalctl -fu mcf-watcher` ở một terminal riêng.
+2. Ở máy Windows, chạy probe qua shared hostname. Chờ có một dòng ghi HTTP 200 với `by=aws` trước khi tạo lỗi.
+
+```bash
+mkdir -p experiments/runs
+.venv/Scripts/python.exe -u scripts/probe_failover.py \
+  --url https://app.mcf.todicode.tech --interval 2 --duration 1800 \
+  --fresh-connections \
+  --out "experiments/runs/stage7-$(date -u +%Y%m%dT%H%M%SZ).csv"
+```
+
+Chế độ `--fresh-connections` mở kết nối mới cho mỗi request để probe có thể nhận kết quả DNS mới theo bộ nhớ đệm và TTL hiện hành. Kết nối giữ lâu có thể tiếp tục tới Azure sau failback. Khi đó đọc vẫn qua được, còn Azure standby trả HTTP 409 khi ghi. Khi so sánh latency giữa các lượt, dùng cùng chế độ kết nối vì mở kết nối mới tính cả thời gian bắt tay TCP/TLS.
+
+3. Ở terminal Windows thứ hai, lấy EC2 ID từ cấu hình của lượt thực hành, sau đó thực hiện fault injection duy nhất.
+
+```bash
+AWS_INSTANCE_ID=$(terraform -chdir=deploy/terraform/aws output -raw aws_instance_id)
+aws ec2 stop-instances --profile default --region ap-southeast-1 \
+  --instance-ids "$AWS_INSTANCE_ID" --query 'StoppingInstances[].CurrentState.Name' --output text
+```
+
+4. Theo dõi thứ tự trong journal. Sau `fence_confirmed` và Azure lên writer, probe ngoài phải ghi được qua Azure. Sau đó EC2 tự bật và journal đến `wait_failback` với một PVC AWS mới. Ở đoạn này, Azure phục vụ ghi và AWS chỉ đọc.
+5. Đợi `aws_replay_confirmed` với `replay_lsn >= target_lsn`, rồi `azure_postgres_fenced`, rồi `aws_ready`. Probe ngoài sẽ ghi lại thành công qua AWS. Chờ `recovery_phase=complete` với cùng `operation_id`. Dừng probe ngoài bằng Ctrl+C sau một vài lần ghi AWS thành công để nó lưu CSV và summary.
+6. Lấy `operation_id` và hai PVC từ bản ghi cuối trên Azure.
+
+```bash
+cat ~/.local/state/mcf-controller/state.json
+sudo journalctl -u mcf-watcher --since "45 minutes ago" --no-pager
+```
+
+7. Từ máy Windows chạy các kiểm tra cuối. Thay `OPERATION_ID` bằng ID trong bản ghi. Hai endpoint probe phải trả cùng dữ liệu với `seq=1` trên Azure và `seq=2` trên AWS. Azure trả HTTP 503 cho writer health vì nó đã trở thành standby.
+
+```bash
+RUN_ID=stage7-OPERATION_ID
+curl -fsS https://app.mcf.todicode.tech/version
+curl -fsS https://aws.mcf.todicode.tech/health/database
+curl -sS -w '\nHTTP %{http_code}\n' https://azure.mcf.todicode.tech/health/database
+curl -fsS "https://app.mcf.todicode.tech/api/ping/$RUN_ID"
+curl -fsS "https://azure.mcf.todicode.tech/api/ping/$RUN_ID"
+```
+
+**Điều kiện đạt.** Journal đi từ `failover_pending` đến `complete` cho cùng ID. CSV có ghi thành công theo thứ tự AWS → Azure → AWS. AWS kết thúc ở primary mở ghi, Azure ở standby đang stream và cả hai đọc được hai probe hoàn tất. Lưu journal, CSV và summary làm bằng chứng. Ghi riêng số lần ghi đã báo thành công nhưng thiếu theo summary vì failover bất ngờ dùng WAL bất đồng bộ.
+
+**Nếu một bước bị gián đoạn.** Controller giữ ID và checkpoint, tự thử lại những lỗi tạm thời. Nếu AWS chưa replay đủ trước khi lưu ý định fence, controller có thể mở ghi lại ở Azure và thử tiếp. Sau khi đã lưu ý định fence, nó chỉ tiếp tục cutover theo checkpoint. Clone Job báo Failed sẽ dừng service và giữ PVC cùng log để chẩn đoán. Dùng `sudo k3s kubectl -n issues describe job TÊN_JOB` và `sudo k3s kubectl -n issues logs job/TÊN_JOB` trên cloud nhận clone trước khi can thiệp. Nếu chính host Azure bị reboot, kiểm tra vai trò database, startup guard và trạng thái của cả hai host theo runbook trước khi cho phép K3s Azure khởi động. Bài nghiệm thu mô phỏng lỗi EC2 trong lúc host controller Azure vẫn chạy.
+
 ## 5. Theo dõi tiến độ
+
+- [x] Hoàn thiện mã controller cho tự bật EC2, rejoin AWS, failback và rejoin Azure.
+- [x] Controller hoàn tất một vòng tự động trên hai cloud. Journal ghi `recovery_phase=complete` lúc 2026-11-19 17:06:13 UTC cho operation `3406be803a4c476ab50fae9823b9d700`. Tên miền chung về AWS writer, Azure nhận WAL và đọc được hai bản ghi kiểm chứng của controller.
+- [x] Nghiệm thu từ laptop với `--fresh-connections`. Lượt `run-d5eea699` ghi thành công theo thứ tự AWS → Azure → AWS. Journal ghi `recovery_phase=complete` lúc 2026-11-19 17:27:59 UTC (00:27:59 ngày 20/11 giờ Việt Nam) cho operation `761e33263363471aa9f97864872ab5b1`. Azure trở lại standby và đọc được hai bản ghi kiểm chứng của controller. Đối chiếu CSV với AWS primary xác nhận đủ 225/225 bản ghi đã được báo ghi thành công.
+
+| Khoảng gián đoạn quan sát từ laptop | Đọc `/version` | Ghi `/api/ping` |
+|---|---:|---:|
+| Failover AWS → Azure | 254,8 giây | 252,5 giây |
+| Failback Azure → AWS | 88,1 giây | 102,1 giây |
+
+Probe tính khoảng gián đoạn từ mẫu thành công cuối trước lỗi đến mẫu thành công đầu sau lỗi. Đây là số đo của lượt nghiệm thu `stage7-fresh-20261119T171545Z` với 317 mẫu. Phần đo lặp và so sánh với baseline thuộc giai đoạn đánh giá.
 
 - [x] Nghiệm thu giai đoạn 6 và xác định phạm vi giai đoạn 7.
 - [x] Đối chiếu AWS account và EC2 của lượt thực hành.
@@ -6084,10 +6405,10 @@ Azure sau khi đã deallocate được đưa trở lại bằng cùng quy trình
 
 Các số LSN biểu diễn vị trí trong WAL, dạng hai phần hexadecimal. Trong cùng luồng replication của lượt kiểm chứng, việc so sánh replay_lsn với mốc sau commit giúp xác định bên nhận đã áp dụng tới mốc cần thiết. Một phép đọc probe thành công cung cấp bằng chứng cho bản ghi đó. Đánh giá số write bị mất và các chỉ số RPO cần bài đo có workload cùng kết quả ACK được lưu để đối chiếu.
 
-### 7.7. Phần thủ công hiện tại và cloud watcher tiếp theo
+### 7.7. Luồng thủ công trước khi triển khai cloud watcher
 
 Trong lượt giai đoạn 7 đã thực hành, người vận hành gửi lệnh fencing, promotion, kiểm tra rồi mở ghi khi cần. PostgreSQL tự stream WAL khi primary và standby được cấu hình đúng. Route 53 tự đánh giá health và chọn DNS theo policy.
 
-Cloud watcher dự kiến chạy trên host Azure để thực hiện các bước điều khiển failover khi phát hiện AWS lỗi. Luồng cần triển khai là phát hiện lỗi theo ngưỡng, kiểm tra standby, xác nhận fencing AWS, promote Azure và kiểm tra writer. Khi Azure sẵn sàng nhận ghi, writer health hỗ trợ Route 53 chọn Azure. Controller cloud tiếp tục được xây dựng theo từng phần sau khi người vận hành đã hiểu vòng thủ công.
+Ở bản tự động đã nghiệm thu, cloud watcher chạy trên host Azure và điều phối cả failover lẫn failback. Xem [mục 4.142](#stage7-automatic-acceptance) để đối chiếu checkpoint và các sơ đồ của luồng này.
 
 Ba hình là sơ đồ giải thích được tạo bằng ImageGen từ trạng thái và cấu hình của lượt thực hành. Hình tổng quan rút gọn lớp Ingress, Service và Pod để tập trung vào sự thay đổi vai trò giữa hai cloud.
