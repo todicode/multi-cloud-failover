@@ -9,3 +9,18 @@ modules:
       fail_if_not_ssl: true
       preferred_ip_protocol: ip4
       ip_protocol_fallback: false
+
+  https_standby_streaming:
+    prober: http
+    timeout: 5s
+    http:
+      method: GET
+      valid_status_codes: [200]
+      follow_redirects: false
+      fail_if_not_ssl: true
+      preferred_ip_protocol: ip4
+      ip_protocol_fallback: false
+      fail_if_body_json_not_matches_cel: >-
+        body.connected == true &&
+        body.role == "standby" &&
+        body.replication_connected == true

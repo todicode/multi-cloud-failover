@@ -30,3 +30,20 @@ scrape_configs:
         target_label: instance
       - target_label: __address__
         replacement: blackbox:9115
+
+  - job_name: blackbox_replication
+    metrics_path: /probe
+    params:
+      module: [https_standby_streaming]
+    static_configs:
+      - targets: ["https://aws.mcf.todicode.tech/api/database/status"]
+        labels: {site: aws, check: replication}
+      - targets: ["https://azure.mcf.todicode.tech/api/database/status"]
+        labels: {site: azure, check: replication}
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: __param_target
+      - source_labels: [__param_target]
+        target_label: instance
+      - target_label: __address__
+        replacement: blackbox:9115

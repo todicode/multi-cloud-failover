@@ -181,3 +181,74 @@ Kết quả ghi nhận từ giao diện Prometheus có đủ 5 chuỗi cho mỗi
 | `azure` | `writer` | 1 | 0 |
 
 `up=1` cho biết Prometheus đã thu được các metric từ exporter. `probe_success` là kết luận kiểm tra URL đích. Trong lần quan sát này, ba endpoint liveness đều đạt, AWS nhận ghi và Azure đang là standby.
+
+## Bước 3 — Giám sát kết nối replication
+
+Kiểm tra trạng thái PostgreSQL trên cả AWS và Azure để theo dõi standby ngay cả khi hai cloud đổi vai trò. API `/api/database/status` cho biết vai trò của database và đặt `replication_connected=true` khi WAL receiver đang ở trạng thái `streaming`.
+
+Thêm module sau vào `observability/blackbox.yml` dưới `modules:`, cùng cấp với `https_200`.
+
+```yaml
+  https_standby_streaming:
+    prober: http
+    timeout: 5s
+    http:
+      method: GET
+      valid_status_codes: [200]
+      follow_redirects: false
+      fail_if_not_ssl: true
+      preferred_ip_protocol: ip4
+      ip_protocol_fallback: false
+      fail_if_body_json_not_matches_cel: >-
+        body.connected == true &&
+        body.role == "standby" &&
+        body.replication_connected == true
+```
+
+Probe yêu cầu HTTP 200 qua TLS và kiểm tra ba trường trong JSON trả về. Hai LSN `receive_lsn` và `replay_lsn` có thể dùng để xem tiến độ xử lý WAL trên standby. Tín hiệu ở đây chỉ đo trạng thái kết nối.
+
+Thêm job sau vào `observability/prometheus.yml` dưới `scrape_configs:`, cùng cấp với `blackbox_https`.
+
+```yaml
+  - job_name: blackbox_replication
+    metrics_path: /probe
+    params:
+      module: [https_standby_streaming]
+    static_configs:
+      - targets: ["https://aws.mcf.todicode.tech/api/database/status"]
+        labels: {site: aws, check: replication}
+      - targets: ["https://azure.mcf.todicode.tech/api/database/status"]
+        labels: {site: azure, check: replication}
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: __param_target
+      - source_labels: [__param_target]
+        target_label: instance
+      - target_label: __address__
+        replacement: blackbox:9115
+```
+
+Tạo lại hai container để nạp cấu hình. Volume Prometheus giữ dữ liệu đã thu thập.
+
+```bash
+docker compose -f observability/compose.yaml up -d --force-recreate blackbox prometheus
+```
+
+Chờ ít nhất một chu kỳ scrape rồi chạy riêng hai truy vấn trong Prometheus.
+
+```promql
+up{job="blackbox_replication"}
+```
+
+```promql
+probe_success{job="blackbox_replication"}
+```
+
+Kết quả quan sát được khi AWS là primary và Azure là standby.
+
+| `site` | `up` | `probe_success` | Ý nghĩa |
+|---|---:|---:|---|
+| `aws` | 1 | 0 | Prometheus nhận được kết quả và AWS đang là primary |
+| `azure` | 1 | 1 | Prometheus nhận được kết quả và Azure đang là standby có WAL receiver streaming |
+
+Đọc kết quả cạnh tín hiệu `writer` để phân biệt primary đang nhận ghi, standby đang nhận WAL và trường hợp mất kết nối replication.
