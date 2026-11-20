@@ -1,0 +1,32 @@
+global:
+  scrape_interval: 10s
+  scrape_timeout: 8s
+
+storage:
+  tsdb:
+    retention:
+      time: 7d
+
+scrape_configs:
+  - job_name: blackbox_https
+    metrics_path: /probe
+    params:
+      module: [https_200]
+    static_configs:
+      - targets: ["https://app.mcf.todicode.tech/health/live"]
+        labels: {site: shared, check: liveness}
+      - targets: ["https://aws.mcf.todicode.tech/health/live"]
+        labels: {site: aws, check: liveness}
+      - targets: ["https://azure.mcf.todicode.tech/health/live"]
+        labels: {site: azure, check: liveness}
+      - targets: ["https://aws.mcf.todicode.tech/health/database"]
+        labels: {site: aws, check: writer}
+      - targets: ["https://azure.mcf.todicode.tech/health/database"]
+        labels: {site: azure, check: writer}
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: __param_target
+      - source_labels: [__param_target]
+        target_label: instance
+      - target_label: __address__
+        replacement: blackbox:9115
