@@ -27,6 +27,8 @@ services:
       - "127.0.0.1:13000:3000"
     volumes:
       - ./grafana/datasources:/etc/grafana/provisioning/datasources:ro
+      - ./grafana/providers:/etc/grafana/provisioning/dashboards:ro
+      - ./grafana/dashboards:/opt/mcf/dashboards:ro
       - grafana_data:/var/lib/grafana
 volumes:
   prometheus_data:

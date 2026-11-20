@@ -252,3 +252,103 @@ Kết quả quan sát được khi AWS là primary và Azure là standby.
 | `azure` | 1 | 1 | Prometheus nhận được kết quả và Azure đang là standby có WAL receiver streaming |
 
 Đọc kết quả cạnh tín hiệu `writer` để phân biệt primary đang nhận ghi, standby đang nhận WAL và trường hợp mất kết nối replication.
+
+## Bước 4 — Nối Grafana với Prometheus và xem độ trễ HTTPS
+
+Grafana truy vấn các mẫu Prometheus đã lưu và hiển thị chúng theo thời gian. Tạo file `observability/grafana/datasources/prometheus.yml` để Grafana nạp nguồn dữ liệu khi khởi động.
+
+```yaml
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    uid: mcf-prometheus
+    type: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+```
+
+`access: proxy` cho Grafana gửi truy vấn từ container. Địa chỉ `prometheus:9090` dùng tên service và cổng nội bộ trên mạng Compose.
+
+Trong `observability/compose.yaml`, thêm `grafana` vào `services` và khai báo `grafana_data` trong khối `volumes` cuối file.
+
+```yaml
+  grafana:
+    image: grafana/grafana:13.3.1
+    ports:
+      - "127.0.0.1:13000:3000"
+    volumes:
+      - ./grafana/datasources:/etc/grafana/provisioning/datasources:ro
+      - grafana_data:/var/lib/grafana
+
+volumes:
+  prometheus_data:
+  grafana_data:
+```
+
+Cổng `13000` mở giao diện Grafana trên laptop. Volume `grafana_data` lưu tài khoản và dashboard qua các lần tạo lại container.
+
+```bash
+docker compose -f observability/compose.yaml up -d
+docker compose -f observability/compose.yaml ps
+```
+
+Mở `http://127.0.0.1:13000`, dùng `admin` cho tên và mật khẩu lần đầu, rồi đổi mật khẩu. Vào **Explore**, chọn **Prometheus** và chế độ **Code**, chọn khoảng thời gian **Last 15 minutes**, sau đó chạy truy vấn sau.
+
+```promql
+1000 * probe_duration_seconds{job="blackbox_https", check="liveness"}
+```
+
+Phép nhân đổi thời gian thực hiện toàn bộ lượt probe từ giây sang mili giây. Khi **Type** là **Both**, phần **Graph** hiển thị lịch sử theo thời gian và phần **Raw** hiển thị giá trị Instant tại cuối khoảng thời gian đã chọn.
+
+Kết quả ghi nhận trong Grafana Explore có ba chuỗi. Đây là các giá trị Instant tại thời điểm chụp.
+
+| `site` | Thời gian probe |
+|---|---:|
+| `aws` | 80,62 ms |
+| `azure` | 92,70 ms |
+| `shared` | 136,81 ms |
+
+Khi thấy độ trễ tăng, đối chiếu với `probe_success` của cùng `site` và `check` tại thời điểm đó để biết probe có đạt hay không.
+
+## Bước 5 — Tạo dashboard giám sát failover
+
+Trong Grafana, tạo dashboard `Multi-Cloud Failover` và thêm ba panel dùng nguồn Prometheus. Mỗi truy vấn chạy ở chế độ **Code** và **Type → Range** để hiển thị các mẫu theo thời gian.
+
+### Liveness
+
+Chọn **State timeline**, đặt tên `Liveness` và dùng `{{site}}` làm chú giải tùy chỉnh.
+
+```promql
+probe_success{job="blackbox_https", check="liveness"}
+```
+
+Panel có ba hàng `shared`, `aws` và `azure`. Khi test failover, hàng `shared` cho biết probe qua tên miền chung đạt hay thất bại.
+
+### Writer và WAL streaming
+
+Chọn **State timeline**, đặt tên `Database — Writer and WAL Streaming` và dùng `{{site}} · {{check}}` làm chú giải tùy chỉnh.
+
+```promql
+probe_success{job="blackbox_https", check="writer"}
+or
+probe_success{job="blackbox_replication", check="replication"}
+```
+
+Truy vấn hợp hai nhóm probe để hiển thị khả năng ghi và kết nối WAL của từng bên. Trong **Standard options**, chọn **Color scheme → From thresholds**. Đặt **Thresholds** ở chế độ **Absolute**, màu xám cho **Base** và màu xanh lá từ mốc `1`. Màu xám thể hiện điều kiện của hàng hiện chưa thỏa. Ví dụ, standby có giá trị `writer=0` trong lúc hoạt động đúng.
+
+### Độ trễ HTTPS
+
+Chọn **Time series**, đặt tên `HTTPS Probe Duration`, dùng chú giải `{{site}}` và chọn đơn vị **milliseconds (ms)**.
+
+```promql
+1000 * probe_duration_seconds{job="blackbox_https", check="liveness"}
+```
+
+Chọn **Last 15 minutes** rồi lưu dashboard. Trong ảnh nghiệm thu, cả ba hàng liveness đều giữ `1` trong khoảng hiển thị và biểu đồ độ trễ có đủ ba đường. Panel database hiển thị các giá trị sau.
+
+| Cloud | `writer` | `replication` |
+|---|---:|---:|
+| AWS | 1 | 0 |
+| Azure | 0 | 1 |
