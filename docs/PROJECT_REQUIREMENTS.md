@@ -130,8 +130,8 @@ Tham khảo kỹ thuật: [K3s single-node cluster](https://docs.k3s.io/quick-st
 - Hạ tầng AWS và Azure đã được triển khai và nghiệm thu độc lập qua status/agent checks, post-apply plan No changes và SSH/Ubuntu. Sau lượt dọn lab, hai môi trường đã được tạo lại để thực hành giai đoạn 5.
 - AWS và Azure đã cài K3s v1.35.1+k3s1, nghiệm thu node Ready, các Pod hệ thống và StorageClass. WireGuard, PostgreSQL primary/standby, WAL streaming và cùng application image digest trên hai cloud đã được kiểm tra. HTTP xác nhận đúng môi trường, phiên bản và vai trò database.
 - S1 đã có bằng chứng triển khai cùng ứng dụng trên hai môi trường độc lập. Danh sách issue, chi tiết, bình luận và lịch sử tạo/đóng/mở lại khớp nhau qua API AWS/Azure; người thực hành xác nhận Azure standby từ chối ghi bằng HTTP 409. Đầu ra giai đoạn 5 đã đạt, giai đoạn 6 bắt đầu DNS/HTTPS.
-- Traffic failover cloud và tình huống mất hoàn toàn một môi trường được thực hiện trong giai đoạn phục hồi tiếp theo để nghiệm thu S2/S3.
-- Chưa nghiệm thu baseline cloud, bộ số đo cloud lặp lại được, biểu đồ và phân tích kết quả. Bảng giá/công thức hiện có là chuẩn bị cost proxy.
+- Kịch bản dừng EC2 đã xác nhận luồng tự động chuyển ghi từ AWS sang Azure, đưa AWS trở lại làm standby và chuyển ghi về AWS. Kết quả được đối chiếu từ nhật ký watcher và probe qua tên miền chung. [Kết quả thí nghiệm](instruction/giaidoan9_do_va_so_sanh_failover.md#tổng-hợp-a01a03-và-b01b03)
+- Đã đo ba cặp AWS-only và AWS + Azure standby. Kết quả gồm thời gian phục hồi ghi, gián đoạn đọc/ghi, độ trễ, số bản ghi đã xác nhận còn sau thử nghiệm, cost proxy và biểu đồ so sánh. [Giai đoạn 9](instruction/giaidoan9_do_va_so_sanh_failover.md)
 - Báo cáo cuối kỳ và demo tổng thể chưa hoàn thành.
 
 Trước khi kết thúc một giai đoạn, đối chiếu đầu ra với S1-S5, G1-G7 và rubric; ghi bằng chứng đã có và phần còn thiếu. Xem [lộ trình triển khai](ROADMAP.md) và [hướng dẫn theo giai đoạn](instruction/).

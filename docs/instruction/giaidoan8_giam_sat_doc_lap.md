@@ -352,3 +352,44 @@ Chọn **Last 15 minutes** rồi lưu dashboard. Trong ảnh nghiệm thu, cả 
 |---|---:|---:|
 | AWS | 1 | 0 |
 | Azure | 0 | 1 |
+
+## Bước 6 — Tự nạp dashboard từ repo
+
+Trong dashboard `Multi-Cloud Failover`, lưu các thay đổi rồi chọn **Export → Export as code**. Chọn **V2 Resource** và định dạng **JSON**. Giữ công tắc **Share dashboard with another instance** ở trạng thái tắt để giữ tham chiếu tới nguồn `mcf-prometheus`. Lưu file tại `observability/grafana/dashboards/multi-cloud-failover.json`.
+
+File `observability/grafana/providers/dashboards.yml` chỉ định đường dẫn Grafana đọc trong container.
+
+```yaml
+apiVersion: 1
+
+providers:
+  - name: multi-cloud-failover
+    type: file
+    updateIntervalSeconds: 30
+    allowUiUpdates: false
+    options:
+      path: /opt/mcf/dashboards
+```
+
+Trong `observability/compose.yaml`, cấu hình `volumes` của service `grafana` như sau.
+
+```yaml
+    volumes:
+      - ./grafana/datasources:/etc/grafana/provisioning/datasources:ro
+      - ./grafana/providers:/etc/grafana/provisioning/dashboards:ro
+      - ./grafana/dashboards:/opt/mcf/dashboards:ro
+      - grafana_data:/var/lib/grafana
+```
+
+Grafana nạp provider khi khởi động và đọc JSON từ thư mục được mount. JSON là nơi lưu cấu hình dashboard và Grafana kiểm tra thay đổi trên đĩa mỗi 30 giây.
+
+```bash
+docker compose -f observability/compose.yaml config --quiet \
+  && docker compose -f observability/compose.yaml up -d
+docker compose -f observability/compose.yaml ps
+docker compose -f observability/compose.yaml logs --tail 80 grafana
+```
+
+Lần kiểm tra ghi nhận cả ba container đang chạy, file provider và dashboard có mặt trong container Grafana, API health báo database `ok` và log startup báo hoàn tất provisioning. File dashboard chứa ba panel `Liveness`, `Database — Writer and WAL Streaming` và `HTTPS Probe Duration`.
+
+Để kiểm tra riêng dashboard từ trình duyệt đã đăng nhập Grafana, lấy UID từ URL sau `/d/`, mở `/api/dashboards/uid/<UID>` trên Grafana và kiểm tra `meta.provisioned` là `true`.

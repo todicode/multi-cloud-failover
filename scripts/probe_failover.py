@@ -18,10 +18,23 @@ import httpx
 
 
 def tick(client, base, run_id, seq):
-    row = {"at": datetime.now(timezone.utc).isoformat(timespec="milliseconds"), "seq": seq,
-           "read_status": "", "read_ms": "", "write_status": "", "write_ms": "", "served_by": "", "error": ""}
-    for name, call in (("read", lambda: client.get(base + "/version")),
-                       ("write", lambda: client.post(base + "/api/ping", json={"run_id": run_id, "seq": seq}))):
+    row = {
+        "at": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
+          "seq": seq,
+           "read_status": "",
+           "read_ms": "",
+           "write_status": "",
+           "write_ms": "",
+           "served_by": "",
+           "error": ""
+    }
+    for name, call in (
+        ("read", lambda: client.get(base + "/version")),
+        ("write", lambda: client.post(
+            base + "/api/ping",
+            json={"run_id": run_id, "seq": seq}
+        ))
+   ):
         started = time.perf_counter()
         try:
             response = call()
@@ -58,24 +71,60 @@ def percentile(values, fraction):
 
 
 def summarize(rows, base, run_id):
-    summary = {"run_id": run_id, "ticks": len(rows)}
+    summary = {
+        "run_id": run_id,
+        "ticks": len(rows)
+    }
+
     for name in ("read", "write"):
-        ok = [r for r in rows if r[f"{name}_status"] == 200]
+        ok = [
+            r for r in rows
+            if r[f"{name}_status"] == 200
+        ]
+
         summary[name] = {
             "error_percent": round(100 * (len(rows) - len(ok)) / len(rows), 1) if rows else None,
             "p50_ms": percentile([r[f"{name}_ms"] for r in ok], .5),
             "p95_ms": percentile([r[f"{name}_ms"] for r in ok], .95),
-            "outages": [{"from": s.isoformat(timespec="milliseconds"), "to": e.isoformat(timespec="milliseconds") if e else None, "seconds": d}
-                        for s, e, d in outages(rows, f"{name}_status")],
+            "outages": [
+                {
+                    "from": s.isoformat(timespec="milliseconds"),
+                    "to": e.isoformat(timespec="milliseconds")
+                        if e else None,
+                        "seconds": d
+                }
+                for s, e, d in outages(rows, f"{name}_status")
+            ],
         }
-    summary["served_by"] = sorted({r["served_by"] for r in rows if r["served_by"]})
-    acked = {r["seq"] for r in rows if r["write_status"] == 200}
+    summary["served_by"] = sorted({
+        r["served_by"] for r in rows
+        if r["served_by"]
+    })
+
+    acked = {
+        r["seq"] for r in rows
+        if r["write_status"] == 200
+    }
     try:
-        response = httpx.get(f"{base}/api/ping/{run_id}", timeout=5, trust_env=False)
+        response = httpx.get(
+            f"{base}/api/ping/{run_id}",
+            timeout=5,
+            trust_env=False
+        )
+
         response.raise_for_status()
-        stored = {p["seq"] for p in response.json()["pings"]}
+        stored = {
+            p["seq"] for p
+            in response.json()["pings"]
+        }
         lost = sorted(acked - stored)
-        summary["lost_writes"] = {"acknowledged": len(acked), "missing_after_run": len(lost), "seqs": lost}
+
+        summary["lost_writes"] = {
+            "acknowledged": len(acked),
+              "missing_after_run": len(lost),
+              "seqs": lost
+        }
+
     except (httpx.HTTPError, KeyError, ValueError) as error:
         summary["lost_writes"] = {"error": f"could not verify: {type(error).__name__}"}
     return summary
@@ -107,20 +156,35 @@ def main():
                 started = time.monotonic()
                 rows.append(tick(client, base, args.run_id, seq))
                 row = rows[-1]
-                print(f"{row['at']} seq={seq} read={row['read_status']} write={row['write_status']} by={row['served_by'] or '-'} {row['error']}")
+                print(
+                    f"{row['at']} seq={seq} "
+                    f"read={row['read_status']} "
+                    f"write={row['write_status']} "
+                    f"by={row['served_by'] or '-'} "
+                    f"{row['error']}"
+                )
                 seq += 1
                 time.sleep(max(0, args.interval - (time.monotonic() - started)))
     except KeyboardInterrupt:
         pass
     if not rows:
         return
-    with Path(args.out).open("w", newline="", encoding="utf-8") as file:
+    with Path(args.out).open(
+        "w",
+        newline="",
+        encoding="utf-8"
+    ) as file:
         writer = csv.DictWriter(file, fieldnames=list(rows[0]))
         writer.writeheader()
         writer.writerows(rows)
     summary = summarize(rows, base, args.run_id)
     summary["connection_mode"] = connection_mode
-    Path(args.out).with_suffix(".summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
+    Path(args.out).with_suffix(
+        ".summary.json"
+    ).write_text(
+        json.dumps(summary, indent=2),
+        encoding="utf-8"
+    )
     print(json.dumps(summary, indent=2))
 
 
